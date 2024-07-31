@@ -1,0 +1,338 @@
+use simd_itertools::PositionSimd;
+use std::ops::Range;
+use std::sync::atomic::AtomicU32;
+use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::FileExt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+};
+
+use memmap::{MmapMut, MmapOptions};
+
+use crate::hashing::{PartedHash, SecretKey, INVALID_SIG};
+use crate::Result;
+
+//
+// these numbers were chosen according to the simulation, as they allow for 90% utilization of the shard with
+// virtually zero chance of in-row collisions and "smallish" shard size: shards start at 384KB and
+// can hold 32K entries, and since we're limited at 4GB file sizes, we can key-value pairs of up to 128KB
+// (keys and values are limited to 64KB each anyway)
+//
+// other good combinations are 32/512, 32/1024, 64/256, 64/1024, 128/512, 256/256
+//
+pub(crate) const NUM_ROWS: usize = 64;
+pub(crate) const ROW_WIDTH: usize = 512;
+
+#[repr(C)]
+pub(crate) struct ShardRow {
+    pub signatures: [u32; ROW_WIDTH],
+    pub offsets_and_sizes: [u64; ROW_WIDTH], // | key_size: 16 | val_size: 16 | file_offset: 32 |
+}
+
+#[repr(C, align(4096))]
+pub(crate) struct PageAligned<T>(pub T);
+
+#[repr(C)]
+pub(crate) struct ShardHeader {
+    pub num_inserted: AtomicU64,
+    pub num_deleted: AtomicU64,
+    pub wasted_bytes: AtomicU64,
+    pub write_offset: AtomicU32,
+    pub rows: PageAligned<[ShardRow; NUM_ROWS]>,
+}
+
+const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
+const _: () = assert!(HEADER_SIZE % 4096 == 0);
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub dir_path: PathBuf,
+    pub max_shard_size: u32,
+    pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
+    pub secret_key: SecretKey,
+}
+
+#[derive(Debug)]
+pub(crate) enum InsertStatus {
+    Added,
+    Replaced,
+    CompactionNeeded(u32),
+    SplitNeeded,
+}
+
+pub(crate) struct ByHashIterator<'a> {
+    shard: &'a Shard,
+    _guard: RwLockReadGuard<'a, ()>,
+    row: &'a ShardRow,
+    signature: u32,
+    start_idx: usize,
+}
+
+impl<'a> Iterator for ByHashIterator<'a> {
+    type Item = Result<Entry>;
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(idx) = self.row.signatures[self.start_idx..]
+            .iter()
+            .position_simd(self.signature)
+        {
+            self.start_idx = idx + 1;
+            return Some(self.shard.read_kv(self.row.offsets_and_sizes[idx]));
+        }
+        None
+    }
+}
+
+pub(crate) struct Entry {
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
+}
+impl Entry {
+    fn len(&self) -> usize {
+        self.key.len() + self.val.len()
+    }
+}
+
+pub(crate) struct EntryRef<'a> {
+    pub key: &'a [u8],
+    pub val: &'a [u8],
+}
+
+impl<'a> EntryRef<'a> {
+    fn len(&self) -> usize {
+        self.key.len() + self.val.len()
+    }
+    pub fn from_entry(entry: &'a Entry) -> Self {
+        Self {
+            key: &entry.key,
+            val: &entry.val,
+        }
+    }
+}
+
+pub(crate) struct Shard {
+    pub(crate) span: Range<u32>,
+    file: File,
+    config: Arc<Config>,
+    #[allow(dead_code)]
+    mmap: MmapMut, // needed to prevent it from dropping
+    pub(crate) header: &'static mut ShardHeader,
+    pub(crate) row_locks: Vec<RwLock<()>>,
+}
+
+impl Shard {
+    pub(crate) fn open(
+        filename: PathBuf,
+        span: Range<u32>,
+        truncate: bool,
+        config: Arc<Config>,
+    ) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(truncate)
+            .open(&filename)?;
+        let md = file.metadata()?;
+        if md.len() < HEADER_SIZE {
+            file.set_len(0)?;
+            file.set_len(HEADER_SIZE)?;
+        }
+
+        let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
+
+        let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
+        let mut row_locks = vec![];
+        for _ in 0..NUM_ROWS {
+            row_locks.push(RwLock::new(()));
+        }
+
+        Ok(Self {
+            file,
+            config,
+            span,
+            mmap,
+            header,
+            row_locks,
+        })
+    }
+
+    // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
+    pub(crate) fn read_kv(&self, offset_and_size: u64) -> Result<Entry> {
+        let klen = (offset_and_size >> 48) as usize;
+        let vlen = ((offset_and_size >> 32) & 0xffff) as usize;
+        let offset = (offset_and_size as u32) as u64;
+
+        let mut buf = vec![0u8; klen + vlen];
+        self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
+
+        let val = buf[klen..klen + vlen].to_owned();
+        buf.truncate(klen);
+
+        Ok(Entry { key: buf, val })
+    }
+
+    // writing doesn't require holding any locks since we write with an offset
+    fn write_kv(&self, entry: &EntryRef) -> Result<u64> {
+        let mut buf = vec![0u8; entry.len()];
+        buf[..entry.key.len()].copy_from_slice(entry.key);
+        buf[entry.key.len()..].copy_from_slice(entry.val);
+
+        // atomically allocate some area. it may leak if the IO below fails or if we crash before updating the
+        // offsets_and_size array, but we're okay with leaks
+        let write_offset = self
+            .header
+            .write_offset
+            .fetch_add(buf.len() as u32, Ordering::SeqCst) as u64;
+
+        // now writing can be non-atomic (pwrite)
+        self.file.write_all_at(&buf, HEADER_SIZE + write_offset)?;
+
+        Ok(((entry.key.len() as u64) << 48) | ((entry.val.len() as u64) << 32) | write_offset)
+    }
+
+    pub(crate) fn read_at(
+        &self,
+        row_idx: usize,
+        entry_idx: usize,
+    ) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+        let _guard = self.row_locks[row_idx].read().unwrap();
+        let row = &self.header.rows.0[row_idx];
+        if row.signatures[entry_idx] != INVALID_SIG {
+            Some(
+                self.read_kv(row.offsets_and_sizes[entry_idx])
+                    .map(|entry| (entry.key, entry.val)),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<Entry>> + 'b {
+        self.header.rows.0.iter().flat_map(|row| {
+            row.signatures
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &sig)| (sig != INVALID_SIG).then_some(idx))
+                .map(|idx| self.read_kv(row.offsets_and_sizes[idx]))
+        })
+    }
+
+    pub(crate) fn iter_by_hash<'a>(&'a self, ph: PartedHash) -> ByHashIterator<'a> {
+        let row_idx = (ph.row_selector as usize) % NUM_ROWS;
+        let guard = self.row_locks[row_idx].read().unwrap();
+        let row = &self.header.rows.0[row_idx];
+        ByHashIterator {
+            shard: &self,
+            _guard: guard,
+            row,
+            signature: ph.signature,
+            start_idx: 0,
+        }
+    }
+
+    pub(crate) fn get(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        for res in self.iter_by_hash(ph) {
+            let entry = res?;
+            if entry.key == key {
+                return Ok(Some(entry.val));
+            }
+        }
+        Ok(None)
+    }
+
+    fn try_replace(&self, row: &mut ShardRow, ph: PartedHash, entry: &EntryRef) -> Result<bool> {
+        let mut start = 0;
+        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
+            let curr_entry = self.read_kv(row.offsets_and_sizes[idx])?;
+            if entry.key == curr_entry.key {
+                // optimization
+                if entry.val == curr_entry.val {
+                    return Ok(true);
+                }
+
+                row.offsets_and_sizes[idx] = self.write_kv(entry)?;
+                self.header
+                    .wasted_bytes
+                    .fetch_add(curr_entry.len() as u64, Ordering::SeqCst);
+
+                return Ok(true);
+            }
+            start = idx + 1;
+        }
+        Ok(false)
+    }
+
+    fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
+        let row_idx = (ph.row_selector as usize) % NUM_ROWS;
+        let guard = self.row_locks[row_idx].write().unwrap();
+        // this is safe because we hold a write lock on the row. the row sits in an mmap, so it can't be
+        // owned by the lock itself
+        #[allow(invalid_reference_casting)]
+        let row =
+            unsafe { &mut *(&self.header.rows.0[row_idx] as *const ShardRow as *mut ShardRow) };
+        (guard, row)
+    }
+
+    pub(crate) fn insert(&self, ph: PartedHash, entry: &EntryRef) -> Result<InsertStatus> {
+        if self.header.write_offset.load(Ordering::Relaxed) as u64 + entry.len() as u64
+            > self.config.max_shard_size as u64
+        {
+            if self.header.wasted_bytes.load(Ordering::Relaxed)
+                > self.config.min_compaction_threashold as u64
+            {
+                return Ok(InsertStatus::CompactionNeeded(
+                    self.header.write_offset.load(Ordering::Relaxed),
+                ));
+            } else {
+                return Ok(InsertStatus::SplitNeeded);
+            }
+        }
+
+        // maybe do the write before taking the row lock?
+
+        // see if we replace an existing key
+        let (_guard, row) = self.get_row_mut(ph);
+
+        if self.try_replace(row, ph, entry)? {
+            return Ok(InsertStatus::Replaced);
+        }
+
+        // find an empty slot
+        if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
+            let new_off = self.write_kv(entry)?;
+
+            row.signatures[idx] = ph.signature;
+            row.offsets_and_sizes[idx] = new_off;
+            self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
+            Ok(InsertStatus::Added)
+        } else {
+            // no room in this row, must split
+            Ok(InsertStatus::SplitNeeded)
+        }
+    }
+
+    pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let (_guard, row) = self.get_row_mut(ph);
+        let mut start = 0;
+        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
+            let entry = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == entry.key {
+                row.signatures[idx] = INVALID_SIG;
+                // we managed to remove this key
+                self.header.num_deleted.fetch_add(1, Ordering::Relaxed);
+                self.header
+                    .wasted_bytes
+                    .fetch_add(entry.len() as u64, Ordering::Relaxed);
+                return Ok(Some(entry.val));
+            }
+            start = idx + 1;
+        }
+
+        Ok(None)
+    }
+}
