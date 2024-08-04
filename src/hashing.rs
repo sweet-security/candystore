@@ -7,9 +7,13 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy)]
 pub struct SecretKey([u8; 16]);
 
+/// A struct that represents a "nonce" for seeding the hash function (keyed hash).
+/// Keeping it secret is only meaningful if you're concerned with DoS attacks
 impl SecretKey {
     pub const LEN: usize = size_of::<Self>();
 
+    /// Construct a SecretKey from the given byte buffer (must be 16 bytes in length)
+    ///
     pub fn new<B: AsRef<[u8]> + ?Sized>(key: &B) -> Result<Self> {
         let key = key.as_ref();
         if key.len() != Self::LEN {

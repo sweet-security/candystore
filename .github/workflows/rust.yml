@@ -19,4 +19,8 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --release --verbose
+      run: cargo test --release --verbose -- --nocapture
+    - name: Run simple example
+      run: cargo run --example simple
+    - name: Run multithreaded example
+      run: cargo run --example multithreaded

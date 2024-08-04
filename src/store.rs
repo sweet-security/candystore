@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ops::Bound,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, RwLock,
@@ -15,6 +16,7 @@ use crate::{
 };
 use crate::{shard::EntryRef, Config, Result};
 
+/// Stats from VickyStore, mainly useful for debugging
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Stats {
     pub num_entries: usize,
@@ -22,15 +24,20 @@ pub struct Stats {
     pub num_compactions: usize,
 }
 
+/// The VickyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
 pub struct VickyStore {
     shards: RwLock<BTreeMap<u32, Shard>>,
     config: Arc<Config>,
+    dir_path: PathBuf,
     // stats
     num_entries: AtomicUsize,
     num_compactions: AtomicUsize,
     num_splits: AtomicUsize,
 }
 
+/// An iterator over a VickyStore. Note that it's safe to modify (insert/delete) keys while iterating,
+/// but the results of the iteration may or may not include these changes. This is considered a
+/// well-defined behavior of the store.
 pub struct VickyStoreIterator<'a> {
     db: &'a VickyStore,
     shard_idx: u32,
@@ -48,12 +55,15 @@ impl<'a> VickyStoreIterator<'a> {
         }
     }
 
+    /// Returns the cookie of the next item in the store. This can be used later to construct an iterator
+    /// that starts at the given point.
     pub fn cookie(&self) -> u64 {
         ((self.shard_idx as u64 & 0xffff) << 32)
             | ((self.row_idx as u64 & 0xffff) << 16)
             | (self.entry_idx as u64 & 0xffff)
     }
 
+    // Constructs an iterator starting at the given cookie
     pub fn from_cookie(db: &'a VickyStore, cookie: u64) -> Self {
         Self {
             db,
@@ -102,19 +112,23 @@ impl<'a> Iterator for VickyStoreIterator<'a> {
 impl VickyStore {
     const END_OF_SHARDS: u32 = 1u32 << 16;
 
-    pub fn open(config: Config) -> Result<Self> {
+    /// Opens or creates a new VickyStore.
+    /// * dir_path - the directory where shards will be kept
+    /// * config - the configuration options for the store
+    pub fn open(dir_path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let mut shards: BTreeMap<u32, Shard> = BTreeMap::new();
         let config = Arc::new(config);
+        let dir_path: PathBuf = dir_path.as_ref().into();
 
-        std::fs::create_dir_all(&config.dir_path)?;
-        Self::load_existing_dir(config.clone(), &mut shards)?;
-
+        std::fs::create_dir_all(&dir_path)?;
+        Self::load_existing_dir(&dir_path, &config, &mut shards)?;
         if shards.is_empty() {
-            Self::create_first_shards(&config, &mut shards)?
+            Self::create_first_shards(&dir_path, &config, &mut shards)?;
         }
 
         Ok(Self {
             config,
+            dir_path,
             shards: RwLock::new(shards),
             num_entries: 0.into(),
             num_compactions: 0.into(),
@@ -122,8 +136,12 @@ impl VickyStore {
         })
     }
 
-    fn load_existing_dir(config: Arc<Config>, shards: &mut BTreeMap<u32, Shard>) -> Result<()> {
-        for res in std::fs::read_dir(&config.dir_path)? {
+    fn load_existing_dir(
+        dir_path: &PathBuf,
+        config: &Arc<Config>,
+        shards: &mut BTreeMap<u32, Shard>,
+    ) -> Result<()> {
+        for res in std::fs::read_dir(&dir_path)? {
             let entry = res?;
             let filename = entry.file_name();
             let Some(filename) = filename.to_str() else {
@@ -163,7 +181,7 @@ impl VickyStore {
                     continue;
                 } else {
                     // remove existing one
-                    std::fs::remove_file(config.dir_path.join(format!(
+                    std::fs::remove_file(dir_path.join(format!(
                         "shard_{:04x}-{:04x}",
                         existing.span.start, existing.span.end
                     )))?;
@@ -193,7 +211,7 @@ impl VickyStore {
             }
         }
         for (start, end) in to_remove {
-            let bottomfile = config.dir_path.join(format!("shard_{start:04x}-{end:04x}"));
+            let bottomfile = dir_path.join(format!("shard_{start:04x}-{end:04x}"));
             std::fs::remove_file(bottomfile)?;
             shards.remove(&end);
         }
@@ -201,7 +219,11 @@ impl VickyStore {
         Ok(())
     }
 
-    fn create_first_shards(config: &Arc<Config>, shards: &mut BTreeMap<u32, Shard>) -> Result<()> {
+    fn create_first_shards(
+        dir_path: &PathBuf,
+        config: &Arc<Config>,
+        shards: &mut BTreeMap<u32, Shard>,
+    ) -> Result<()> {
         let shards_needed = (config.expected_number_of_keys / Shard::EXPECTED_CAPACITY).max(1);
         let step = Self::END_OF_SHARDS / 2u32.pow(shards_needed.ilog2());
 
@@ -211,9 +233,7 @@ impl VickyStore {
             shards.insert(
                 Self::END_OF_SHARDS,
                 Shard::open(
-                    config
-                        .dir_path
-                        .join(format!("shard_{:04x}-{:04x}", start, end)),
+                    dir_path.join(format!("shard_{:04x}-{:04x}", start, end)),
                     0..Self::END_OF_SHARDS,
                     false,
                     config.clone(),
@@ -225,6 +245,8 @@ impl VickyStore {
         Ok(())
     }
 
+    /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
+    /// The data is fully-owned, no references are returned.
     pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
@@ -253,11 +275,11 @@ impl VickyStore {
         }
 
         let removed_shard = guard.remove(&shard_end).unwrap();
-        let orig_filename = self.config.dir_path.join(format!(
+        let orig_filename = self.dir_path.join(format!(
             "shard_{:04x}-{:04x}",
             removed_shard.span.start, removed_shard.span.end
         ));
-        let tmpfile = self.config.dir_path.join(format!(
+        let tmpfile = self.dir_path.join(format!(
             "compact_{:04x}-{:04x}",
             removed_shard.span.start, removed_shard.span.end
         ));
@@ -294,11 +316,9 @@ impl VickyStore {
         let removed_shard = guard.remove(&shard_end).unwrap();
 
         let bottomfile = self
-            .config
             .dir_path
             .join(format!("bottom_{:04x}-{:04x}", shard_start, midpoint));
         let topfile = self
-            .config
             .dir_path
             .join(format!("top_{:04x}-{:04x}", midpoint, shard_end));
 
@@ -333,19 +353,16 @@ impl VickyStore {
         // delete the partial ones
         std::fs::rename(
             bottomfile,
-            self.config
-                .dir_path
+            self.dir_path
                 .join(format!("shard_{:04x}-{:04x}", shard_start, midpoint)),
         )?;
         std::fs::rename(
             topfile,
-            self.config
-                .dir_path
+            self.dir_path
                 .join(format!("shard_{:04x}-{:04x}", midpoint, shard_end)),
         )?;
         std::fs::remove_file(
-            self.config
-                .dir_path
+            self.dir_path
                 .join(format!("shard_{:04x}-{:04x}", shard_start, shard_end)),
         )
         .unwrap();
@@ -400,6 +417,23 @@ impl VickyStore {
         }
     }
 
+    /// Attempts for sync all in-memory changes of all shards to disk. Concurrent changes are allowed while
+    /// flushing, and may result in partially-sync'ed store. Use sparingly, as this is a costly operaton.
+    pub fn flush(&self) -> Result<()> {
+        let guard = self.shards.read().unwrap();
+        for (_, shard) in guard.iter() {
+            shard.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Inserts a key-value pair, creating it or replacing an existing pair. Note that if the program crashed
+    /// while or "right after" this operation, or if the operating system is unable to flush the page cache,
+    /// you may lose some data. However, you will still be in a consistent state, where you will get a previous
+    /// version of the state.
+    ///
+    /// While this method is O(1) amortized, every so often it will trigger either a shard compaction or a
+    /// shard split, which requires rewriting the whole shard.
     pub fn insert<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
@@ -413,12 +447,13 @@ impl VickyStore {
         self._insert(ph, entry)
     }
 
-    // Modify an existing entry in-place, instead of creating a version. Note that the key must exist
-    // and `patch.len() + patch_offset` must be less than or equal to the current value's length.
-    // This method is guaranteed to never trigger a split or a compaction
-    //
-    // This is not crash-safe as it overwrite existing data, and thus may produce inconsistent results
-    // on crashes (part old data, part new data)
+    /// Modifies an existing entry in-place, instead of creating a version. Note that the key must exist
+    /// and `patch.len() + patch_offset` must be less than or equal to the current value's length.
+    ///
+    /// This is operation is NOT crash-safe as it overwrites existing data, and thus may produce inconsistent
+    /// results on crashes (reading part old data, part new data).
+    ///
+    /// This method will never trigger a shard split or a shard compaction.
     pub fn modify_inplace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
@@ -438,6 +473,8 @@ impl VickyStore {
             .modify_inplace(ph, key, patch, patch_offset)
     }
 
+    /// Removes a key-value pair from the store, returning `None` if the key did not exist,
+    /// or `Some(old_value)` if it did
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
@@ -456,6 +493,8 @@ impl VickyStore {
         Ok(val)
     }
 
+    /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and
+    /// are not persisted, so closing and opening the store will reset the stats.
     pub fn stats(&self) -> Stats {
         Stats {
             num_entries: self.num_entries.load(Ordering::Acquire),
@@ -464,18 +503,22 @@ impl VickyStore {
         }
     }
 
+    /// Returns an iterator over the whole store
     pub fn iter(&self) -> VickyStoreIterator {
         VickyStoreIterator::new(self)
     }
 
+    /// Returns an iterator starting from the specified cookie (obtained from `get_cookie` of a
+    /// previously created `VickyStoreIterator`
     pub fn iter_from_cookie(&self, cookie: u64) -> VickyStoreIterator {
         VickyStoreIterator::from_cookie(self, cookie)
     }
 
+    /// Clears the store (erasing all keys)
     pub fn clear(&self) -> Result<()> {
         let mut guard = self.shards.write().unwrap();
 
-        for res in std::fs::read_dir(&self.config.dir_path)? {
+        for res in std::fs::read_dir(&self.dir_path)? {
             let entry = res?;
             let filename = entry.file_name();
             let Some(filename) = filename.to_str() else {
@@ -501,7 +544,7 @@ impl VickyStore {
         self.num_splits.store(0, Ordering::Relaxed);
 
         guard.clear();
-        Self::create_first_shards(&self.config, &mut guard)?;
+        Self::create_first_shards(&self.dir_path, &self.config, &mut guard)?;
 
         Ok(())
     }

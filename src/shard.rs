@@ -155,6 +155,12 @@ impl Shard {
         })
     }
 
+    pub(crate) fn flush(&self) -> Result<()> {
+        //self.mmap.flush()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     #[inline]
     fn extract_offset_and_size(offset_and_size: u64) -> (usize, usize, u64) {
         let klen = (offset_and_size >> 48) as usize;
