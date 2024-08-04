@@ -150,8 +150,8 @@ impl Shard {
             .open(&filename)?;
         let md = file.metadata()?;
         if md.len() < HEADER_SIZE {
-            file.set_len(0)?;
-            file.set_len(HEADER_SIZE)?;
+            // when creating, set the file's length so that we won't need to extend it every time we write
+            file.set_len(HEADER_SIZE + config.max_shard_size as u64)?;
         }
 
         let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
