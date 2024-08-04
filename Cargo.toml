@@ -2,6 +2,9 @@
 name = "vicky-store"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+keywords = ["key-value", "persistent", "store"]
+description = "A lean, efficient and fast peristent in-process key-value store"
 
 [dependencies]
 memmap = "0.7.0"

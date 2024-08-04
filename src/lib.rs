@@ -4,9 +4,9 @@ mod hashing;
 mod shard;
 mod store;
 
-use std::fmt::{Display, Formatter};
 pub use hashing::SecretKey;
 pub use shard::Config;
+use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
 
 #[derive(Debug)]
@@ -14,6 +14,7 @@ pub enum Error {
     WrongSecretKeyLength,
     KeyTooLong,
     ValueTooLong,
+    KeyNotFound,
     IOError(std::io::Error),
 }
 
@@ -28,6 +29,7 @@ impl Display for Error {
         match self {
             Error::WrongSecretKeyLength => write!(f, "wrong secret length"),
             Error::KeyTooLong => write!(f, "key too long"),
+            Error::KeyNotFound => write!(f, "key not found"),
             Error::ValueTooLong => write!(f, "value too long"),
             Error::IOError(err) => write!(f, "IO error: {err}"),
         }

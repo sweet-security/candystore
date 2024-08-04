@@ -15,7 +15,7 @@ use std::{
 use memmap::{MmapMut, MmapOptions};
 
 use crate::hashing::{PartedHash, SecretKey, INVALID_SIG};
-use crate::Result;
+use crate::{Error, Result};
 
 //
 // these numbers were chosen according to the simulation, as they allow for 90% utilization of the shard with
@@ -55,6 +55,17 @@ pub struct Config {
     pub max_shard_size: u32,
     pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
     pub secret_key: SecretKey,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dir_path: PathBuf::new(),
+            max_shard_size: 64 * 1024 * 1024,
+            min_compaction_threashold: 8 * 1024 * 1024,
+            secret_key: SecretKey::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -161,11 +172,17 @@ impl Shard {
         })
     }
 
-    // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
-    pub(crate) fn read_kv(&self, offset_and_size: u64) -> Result<Entry> {
+    #[inline]
+    fn extract_offset_and_size(offset_and_size: u64) -> (usize, usize, u64) {
         let klen = (offset_and_size >> 48) as usize;
         let vlen = ((offset_and_size >> 32) & 0xffff) as usize;
         let offset = (offset_and_size as u32) as u64;
+        (klen, vlen, offset)
+    }
+
+    // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
+    pub(crate) fn read_kv(&self, offset_and_size: u64) -> Result<Entry> {
+        let (klen, vlen, offset) = Self::extract_offset_and_size(offset_and_size);
 
         let mut buf = vec![0u8; klen + vlen];
         self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
@@ -306,14 +323,47 @@ impl Shard {
         if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
             let new_off = self.write_kv(entry)?;
 
-            row.signatures[idx] = ph.signature;
             row.offsets_and_sizes[idx] = new_off;
+            std::sync::atomic::fence(Ordering::SeqCst);
+            row.signatures[idx] = ph.signature;
             self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
             Ok(InsertStatus::Added)
         } else {
             // no room in this row, must split
             Ok(InsertStatus::SplitNeeded)
         }
+    }
+
+    // this is NOT crash safe (may produce inconsistent results)
+    pub(crate) fn modify_inplace(
+        &self,
+        ph: PartedHash,
+        key: &[u8],
+        patch: &[u8],
+        patch_offset: usize,
+    ) -> Result<()> {
+        let (_guard, row) = self.get_row_mut(ph);
+
+        let mut start = 0;
+        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
+            let curr_entry = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == curr_entry.key {
+                let (klen, vlen, offset) =
+                    Self::extract_offset_and_size(row.offsets_and_sizes[idx]);
+                if patch_offset + patch.len() > vlen as usize {
+                    return Err(Error::ValueTooLong);
+                }
+
+                self.file.write_all_at(
+                    patch,
+                    HEADER_SIZE + offset + klen as u64 + patch_offset as u64,
+                )?;
+
+                return Ok(());
+            }
+            start = idx + 1;
+        }
+        Err(Error::KeyNotFound)
     }
 
     pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {

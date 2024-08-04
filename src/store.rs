@@ -405,6 +405,31 @@ impl VickyStore {
         self._insert(ph, entry)
     }
 
+    // Modify an existing entry in-place, instead of creating a version. Note that the key must exist
+    // and `patch.len() + patch_offset` must be less than or equal to the current value's length.
+    // This method is guaranteed to never trigger a split or a compaction
+    //
+    // This is not crash-safe as it overwrite existing data, and thus may produce inconsistent results
+    // on crashes (part old data, part new data)
+    pub fn modify_inplace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        patch: &B2,
+        patch_offset: usize,
+    ) -> Result<()> {
+        let key = key.as_ref();
+        let patch = patch.as_ref();
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        self.shards
+            .read()
+            .unwrap()
+            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .peek_next()
+            .unwrap()
+            .1
+            .modify_inplace(ph, key, patch, patch_offset)
+    }
+
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);

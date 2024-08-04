@@ -4,7 +4,7 @@ use std::{
 };
 
 use rand::random;
-use vicky_store::{Config, Result, SecretKey, Stats, VickyStore};
+use vicky_store::{Config, Error, Result, SecretKey, Stats, VickyStore};
 
 fn run_in_tempdir(f: impl FnOnce(&str) -> Result<()>) -> Result<()> {
     let rand: u64 = random();
@@ -255,6 +255,38 @@ fn test_multithreaded() -> Result<()> {
             );
             db.clear()?;
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn test_modify_inplace() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(Config {
+            dir_path: dir.into(),
+            max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
+            min_compaction_threashold: 10 * 1024,
+            secret_key: SecretKey::new("very very secret")?,
+        })?);
+
+        db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+
+        assert!(matches!(
+            db.modify_inplace("zzz", "bbb", 7),
+            Err(Error::KeyNotFound)
+        ));
+
+        assert!(matches!(
+            db.modify_inplace("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 7),
+            Err(Error::ValueTooLong)
+        ));
+
+        db.modify_inplace("aaa", "bbb", 7)?;
+        assert_eq!(
+            db.get("aaa")?,
+            Some("aaaaaaabbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        );
+
         Ok(())
     })
 }
