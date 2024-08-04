@@ -4,6 +4,7 @@ mod hashing;
 mod shard;
 mod store;
 
+use std::fmt::{Display, Formatter};
 pub use hashing::SecretKey;
 pub use shard::Config;
 pub use store::{Stats, VickyStore};
@@ -21,5 +22,18 @@ impl From<std::io::Error> for Error {
         Self::IOError(value)
     }
 }
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            Error::WrongSecretKeyLength => write!(f, "wrong secret length"),
+            Error::KeyTooLong => write!(f, "key too long"),
+            Error::ValueTooLong => write!(f, "value too long"),
+            Error::IOError(err) => write!(f, "IO error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
