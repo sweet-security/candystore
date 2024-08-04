@@ -10,10 +10,10 @@ use std::{
 use crate::{hashing::PartedHash, shard::InsertStatus};
 use crate::{
     hashing::USER_NAMESPACE,
-    shard::{Config, Shard, NUM_ROWS, ROW_WIDTH},
+    shard::{Shard, NUM_ROWS, ROW_WIDTH},
     Error,
 };
-use crate::{shard::EntryRef, Result};
+use crate::{shard::EntryRef, Config, Result};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Stats {
@@ -110,7 +110,7 @@ impl VickyStore {
         Self::load_existing_dir(config.clone(), &mut shards)?;
 
         if shards.is_empty() {
-            Self::create_first_shard(&config, &mut shards)?
+            Self::create_first_shards(&config, &mut shards)?
         }
 
         Ok(Self {
@@ -201,18 +201,26 @@ impl VickyStore {
         Ok(())
     }
 
-    fn create_first_shard(config: &Arc<Config>, shards: &mut BTreeMap<u32, Shard>) -> Result<()> {
-        shards.insert(
-            Self::END_OF_SHARDS,
-            Shard::open(
-                config
-                    .dir_path
-                    .join(format!("shard_{:04x}-{:04x}", 0, Self::END_OF_SHARDS)),
-                0..Self::END_OF_SHARDS,
-                false,
-                config.clone(),
-            )?,
-        );
+    fn create_first_shards(config: &Arc<Config>, shards: &mut BTreeMap<u32, Shard>) -> Result<()> {
+        let shards_needed = (config.expected_number_of_keys / Shard::EXPECTED_CAPACITY).max(1);
+        let step = Self::END_OF_SHARDS / 2u32.pow(shards_needed.ilog2());
+
+        let mut start = 0;
+        while start < Self::END_OF_SHARDS {
+            let end = start + step;
+            shards.insert(
+                Self::END_OF_SHARDS,
+                Shard::open(
+                    config
+                        .dir_path
+                        .join(format!("shard_{:04x}-{:04x}", start, end)),
+                    0..Self::END_OF_SHARDS,
+                    false,
+                    config.clone(),
+                )?,
+            );
+            start = end;
+        }
 
         Ok(())
     }
@@ -493,7 +501,7 @@ impl VickyStore {
         self.num_splits.store(0, Ordering::Relaxed);
 
         guard.clear();
-        Self::create_first_shard(&self.config, &mut guard)?;
+        Self::create_first_shards(&self.config, &mut guard)?;
 
         Ok(())
     }

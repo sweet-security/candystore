@@ -7,11 +7,11 @@ The algorithm is straight forward:
   by 16 bits of "row selector", followed by 32 bits of "signature".
 * The shard selector selects a shard, which maps to a file in a directory.
 * At first, we have a shard that covers the range `[0..65535]`, so all shard selectors map to the same file.
-* When the file grows too big, or contains too many keys, it undergoes a split operatio, where the keys are 
-  split into a bottom-half and a top-half: shard `[0..65535]` is split into `[0..32767]` and `[32768..65535]`, and 
+* When the file grows too big, or contains too many keys, it undergoes a split operation, where the keys are 
+  split into a bottom-half and a top-half: shard `[0..65535]` gets split into `[0..32767]` and `[32768..65535]`, and 
   the keys are divided according to their shard selector. This process repeats as needed.
-* Inside a shard, we have a header table made of rows, each being made of signatures. The row selector selects 
-  the key's row, and within the row we use SIMD operations for match for the signature very quickly. This 
+* Inside a shard, we have a header table made of rows, each being an array of signatures. The row selector selects 
+  the key's row, and within the row we use SIMD operations for matching the signature very quickly. This 
   part of the file is kept mmap'ed.
 * Once we find the correct entry, we get its data offset in the file and read it. 
   

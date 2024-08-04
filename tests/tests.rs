@@ -27,6 +27,7 @@ fn test_logic() -> Result<()> {
             max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
             min_compaction_threashold: 10 * 1024,
             secret_key: SecretKey::new("very very secret")?,
+            ..Default::default()
         })?);
 
         assert!(db.get("my name")?.is_none());
@@ -129,6 +130,7 @@ fn test_loading() -> Result<()> {
             max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
             min_compaction_threashold: 10 * 1024,
             secret_key: SecretKey::new("very very secret")?,
+            ..Default::default()
         };
 
         {
@@ -200,6 +202,7 @@ fn test_multithreaded() -> Result<()> {
                 max_shard_size: 20 * 1024,
                 min_compaction_threashold: 10 * 1024,
                 secret_key: SecretKey::new("very very secret")?,
+                ..Default::default()
             })?);
 
             const NUM_ITEMS: usize = 10_000;
@@ -267,6 +270,7 @@ fn test_modify_inplace() -> Result<()> {
             max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
             min_compaction_threashold: 10 * 1024,
             secret_key: SecretKey::new("very very secret")?,
+            ..Default::default()
         })?);
 
         db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
@@ -286,6 +290,30 @@ fn test_modify_inplace() -> Result<()> {
             db.get("aaa")?,
             Some("aaaaaaabbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_pre_split() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(Config {
+            dir_path: dir.into(),
+            max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
+            min_compaction_threashold: 10 * 1024,
+            secret_key: SecretKey::new("very very secret")?,
+            expected_number_of_keys: 1_000_000,
+        })?);
+
+        db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+
+        let files = std::fs::read_dir(&dir)?
+            .map(|res| res.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|filename| filename.starts_with("shard_"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(files.len(), 32);
 
         Ok(())
     })

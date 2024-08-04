@@ -14,8 +14,8 @@ use std::{
 
 use memmap::{MmapMut, MmapOptions};
 
-use crate::hashing::{PartedHash, SecretKey, INVALID_SIG};
-use crate::{Error, Result};
+use crate::hashing::{PartedHash, INVALID_SIG};
+use crate::{Config, Error, Result};
 
 //
 // these numbers were chosen according to the simulation, as they allow for 90% utilization of the shard with
@@ -48,25 +48,6 @@ pub(crate) struct ShardHeader {
 
 const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
 const _: () = assert!(HEADER_SIZE % 4096 == 0);
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub dir_path: PathBuf,
-    pub max_shard_size: u32,
-    pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
-    pub secret_key: SecretKey,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            dir_path: PathBuf::new(),
-            max_shard_size: 64 * 1024 * 1024,
-            min_compaction_threashold: 8 * 1024 * 1024,
-            secret_key: SecretKey::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub(crate) enum InsertStatus {
@@ -136,6 +117,8 @@ pub(crate) struct Shard {
 }
 
 impl Shard {
+    pub(crate) const EXPECTED_CAPACITY: usize = (NUM_ROWS * ROW_WIDTH * 9) / 10; // ~ 29,500
+
     pub(crate) fn open(
         filename: PathBuf,
         span: Range<u32>,
