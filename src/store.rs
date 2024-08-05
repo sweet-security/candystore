@@ -289,11 +289,7 @@ impl VickyStore {
         Ok(())
     }
 
-    pub(crate) fn get_internal<B: AsRef<[u8]> + ?Sized>(
-        &self,
-        ph: PartedHash,
-        key: &B,
-    ) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<(Vec<u8>, Vec<u8>)>> {
         self.shards
             .read()
             .unwrap()
@@ -301,7 +297,19 @@ impl VickyStore {
             .peek_next()
             .unwrap()
             .1
-            .get(ph, key.as_ref())
+            .iter_by_hash(ph)
+            .collect::<Vec<_>>()
+    }
+
+    pub(crate) fn get_internal(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.shards
+            .read()
+            .unwrap()
+            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .peek_next()
+            .unwrap()
+            .1
+            .get(ph, key)
     }
 
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
