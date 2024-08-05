@@ -2,7 +2,7 @@ use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
 use crate::hashing::{PartedHash, USER_NAMESPACE};
-use crate::shard::{InsertStatus, Shard};
+use crate::shard::{InsertMode, InsertStatus, Shard};
 use crate::store::VickyStore;
 use crate::{Result, VickyError};
 
@@ -44,7 +44,7 @@ impl VickyStore {
             // XXX: this will not work with namespaces
             let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
 
-            let status = compacted_shard.insert(ph, &k, &v)?;
+            let status = compacted_shard.insert(ph, &k, &v, InsertMode::Overwrite)?;
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
 
@@ -88,9 +88,9 @@ impl VickyStore {
 
             let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
             let status = if (ph.shard_selector as u32) < midpoint {
-                bottom_shard.insert(ph, &k, &v)?
+                bottom_shard.insert(ph, &k, &v, InsertMode::Overwrite)?
             } else {
-                top_shard.insert(ph, &k, &v)?
+                top_shard.insert(ph, &k, &v, InsertMode::Overwrite)?
             };
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
@@ -126,6 +126,7 @@ impl VickyStore {
         ph: PartedHash,
         key: &[u8],
         val: &[u8],
+        mode: InsertMode,
     ) -> Result<(InsertStatus, u32, u32)> {
         let guard = self.shards.read().unwrap();
         let cursor = guard.lower_bound(Bound::Excluded(&(ph.shard_selector as u32)));
@@ -134,12 +135,18 @@ impl VickyStore {
             .map(|(&shard_start, _)| shard_start)
             .unwrap_or(0);
         let (shard_end, shard) = cursor.peek_next().unwrap();
-        let status = shard.insert(ph, key, val)?;
+        let status = shard.insert(ph, key, val, mode)?;
 
         Ok((status, shard_start, *shard_end))
     }
 
-    pub(crate) fn insert_internal(&self, ph: PartedHash, key: &[u8], val: &[u8]) -> Result<()> {
+    pub(crate) fn insert_internal(
+        &self,
+        ph: PartedHash,
+        key: &[u8],
+        val: &[u8],
+        mode: InsertMode,
+    ) -> Result<Option<Vec<u8>>> {
         if key.len() > u16::MAX as usize {
             return Err(Box::new(VickyError::KeyTooLong));
         }
@@ -148,15 +155,18 @@ impl VickyStore {
         }
 
         loop {
-            let (status, shard_start, shard_end) = self.try_insert(ph, key, val)?;
+            let (status, shard_start, shard_end) = self.try_insert(ph, key, val, mode)?;
 
             match status {
                 InsertStatus::Added => {
                     self.num_entries.fetch_add(1, Ordering::SeqCst);
-                    return Ok(());
+                    return Ok(None);
                 }
                 InsertStatus::Replaced => {
-                    return Ok(());
+                    return Ok(None);
+                }
+                InsertStatus::AlreadyExists(existing_val) => {
+                    return Ok(Some(existing_val));
                 }
                 InsertStatus::CompactionNeeded(write_offset) => {
                     self.compact(shard_end, write_offset)?;
@@ -183,7 +193,24 @@ impl VickyStore {
         val: &B2,
     ) -> Result<()> {
         let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
-        self.insert_internal(ph, key.as_ref(), val.as_ref())
+        self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Overwrite)?;
+        Ok(())
+    }
+
+    /// Gets the value of an entry or inserts the given default value. If the value existed, returns `Some(value)`.
+    /// If the value was created by this operation, `None`` is returned
+    pub fn get_or_insert_default<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        default_val: &B2,
+    ) -> Result<Option<Vec<u8>>> {
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        self.insert_internal(
+            ph,
+            key.as_ref(),
+            default_val.as_ref(),
+            InsertMode::GetOrInsert,
+        )
     }
 
     /// Modifies an existing entry in-place, instead of creating a version. Note that the key must exist

@@ -1,6 +1,6 @@
 mod common;
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use vicky_store::{Config, Result, Stats, VickyStore};
 
@@ -9,18 +9,21 @@ use crate::common::{run_in_tempdir, LONG_VAL};
 #[test]
 fn test_logic() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(
+        let db = VickyStore::open(
             dir,
             Config {
                 max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
                 min_compaction_threashold: 10 * 1024,
                 ..Default::default()
             },
-        )?);
+        )?;
 
         assert!(db.get("my name")?.is_none());
         db.insert("my_name", "inigo montoya")?;
         db.insert("your_name", "dread pirate robert")?;
+
+        assert!(db.contains("my_name")?);
+        assert!(!db.contains("My NaMe")?);
 
         assert_eq!(db.get("my_name")?, Some("inigo montoya".into()));
         assert_eq!(db.get("your_name")?, Some("dread pirate robert".into()));

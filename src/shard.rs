@@ -55,6 +55,13 @@ pub(crate) enum InsertStatus {
     Replaced,
     CompactionNeeded(u32),
     SplitNeeded,
+    AlreadyExists(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InsertMode {
+    Overwrite,
+    GetOrInsert,
 }
 
 pub(crate) struct ByHashIterator<'a> {
@@ -225,26 +232,32 @@ impl Shard {
         ph: PartedHash,
         key: &[u8],
         val: &[u8],
-    ) -> Result<bool> {
+        mode: InsertMode,
+    ) -> Result<(bool, Option<Vec<u8>>)> {
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
             let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
-                // optimization
-                if val == v {
-                    return Ok(true);
+                match mode {
+                    InsertMode::GetOrInsert => {
+                        // no-op, key already exists
+                        return Ok((true, Some(v)));
+                    }
+                    InsertMode::Overwrite => {
+                        // optimization
+                        if val != v {
+                            row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
+                            self.header
+                                .wasted_bytes
+                                .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
+                        }
+                        return Ok((true, None));
+                    }
                 }
-
-                row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
-                self.header
-                    .wasted_bytes
-                    .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
-
-                return Ok(true);
             }
             start = idx + 1;
         }
-        Ok(false)
+        Ok((false, None))
     }
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
@@ -258,7 +271,13 @@ impl Shard {
         (guard, row)
     }
 
-    pub(crate) fn insert(&self, ph: PartedHash, key: &[u8], val: &[u8]) -> Result<InsertStatus> {
+    pub(crate) fn insert(
+        &self,
+        ph: PartedHash,
+        key: &[u8],
+        val: &[u8],
+        mode: InsertMode,
+    ) -> Result<InsertStatus> {
         if self.header.write_offset.load(Ordering::Relaxed) as u64 + (key.len() + val.len()) as u64
             > self.config.max_shard_size as u64
         {
@@ -278,8 +297,13 @@ impl Shard {
         // see if we replace an existing key
         let (_guard, row) = self.get_row_mut(ph);
 
-        if self.try_replace(row, ph, key, val)? {
-            return Ok(InsertStatus::Replaced);
+        let (found, existing_val) = self.try_replace(row, ph, key, val, mode)?;
+        if found {
+            if let Some(existing_val) = existing_val {
+                return Ok(InsertStatus::AlreadyExists(existing_val));
+            } else {
+                return Ok(InsertStatus::Replaced);
+            }
         }
 
         // find an empty slot

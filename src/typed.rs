@@ -89,6 +89,12 @@ where
         self.store.insert(&kbytes, &vbytes)
     }
 
+    pub fn get_or_insert_default(&self, k: K, v: V) -> Result<Option<Vec<u8>>> {
+        let kbytes = Self::make_key(&k);
+        let vbytes = v.to_bytes::<LE>();
+        self.store.get_or_insert_default(&kbytes, &vbytes)
+    }
+
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,

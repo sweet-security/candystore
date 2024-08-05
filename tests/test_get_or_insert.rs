@@ -5,7 +5,7 @@ use vicky_store::{Config, Result, VickyStore};
 use crate::common::run_in_tempdir;
 
 #[test]
-fn test_pre_split() -> Result<()> {
+fn test_get_or_insert_default() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = VickyStore::open(
             dir,
@@ -17,14 +17,17 @@ fn test_pre_split() -> Result<()> {
             },
         )?;
 
-        db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+        db.insert("aaa", "1111")?;
+        assert_eq!(
+            db.get_or_insert_default("aaa", "2222")?,
+            Some("1111".into())
+        );
 
-        let files = std::fs::read_dir(&dir)?
-            .map(|res| res.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|filename| filename.starts_with("shard_"))
-            .collect::<Vec<_>>();
-
-        assert_eq!(files.len(), 32);
+        assert_eq!(db.get_or_insert_default("bbbb", "2222")?, None);
+        assert_eq!(
+            db.get_or_insert_default("bbbb", "3333")?,
+            Some("2222".into())
+        );
 
         Ok(())
     })
