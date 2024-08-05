@@ -15,6 +15,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "databuf"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1ad1d99bee317a8dac0b7cd86896c5a5f24307009292985dabbf3e412c8b9d"
+dependencies = [
+ "databuf-derive",
+]
+
+[[package]]
+name = "databuf-derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04040c9fc8fcb4084222a26c99faf5b3014772a6115e076b7a50fe49bf25d0ea"
+dependencies = [
+ "databuf_derive_impl",
+]
+
+[[package]]
+name = "databuf_derive_impl"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf656eb071fe87d23716f933788a35a8ad6baa6fdbf66a67a261dbd3f9dc81a"
+dependencies = [
+ "quote2",
+ "syn",
+]
+
+[[package]]
 name = "either"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -83,6 +111,23 @@ checksum = "0fa76aaf39101c457836aec0ce2316dbdc3ab723cdda1c6bd4e6ad4208acaca7"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "quote2"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "970573b86f7e5795c8c6c50c56ef602368593f0687188da27fd489a59e253630"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "quote2-macros",
+]
+
+[[package]]
+name = "quote2-macros"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f4b89c37b2d870a28629ad20da669bb0e7d7214878d0d5111b304aa466e1977"
 
 [[package]]
 name = "rand"
@@ -158,6 +203,7 @@ checksum = "3354b9ac3fae1ff6755cb6db53683adb661634f67557942dea4facebec0fee4b"
 name = "vicky-store"
 version = "0.1.0"
 dependencies = [
+ "databuf",
  "memmap",
  "rand",
  "simd-itertools",

@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use vicky_store::{Config, Error, Result, VickyStore};
+use vicky_store::{Config, Result, VickyStore};
 
 use crate::common::run_in_tempdir;
 
@@ -20,15 +20,17 @@ fn test_modify_inplace() -> Result<()> {
 
         db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
-        assert!(matches!(
-            db.modify_inplace("zzz", "bbb", 7),
-            Err(Error::KeyNotFound)
-        ));
+        assert_eq!(
+            db.modify_inplace("zzz", "bbb", 7).unwrap_err().to_string(),
+            "key not found"
+        );
 
-        assert!(matches!(
-            db.modify_inplace("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 7),
-            Err(Error::ValueTooLong)
-        ));
+        assert_eq!(
+            db.modify_inplace("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 7)
+                .unwrap_err()
+                .to_string(),
+            "value too long",
+        );
 
         db.modify_inplace("aaa", "bbb", 7)?;
         assert_eq!(

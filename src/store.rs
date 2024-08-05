@@ -8,13 +8,12 @@ use std::{
     },
 };
 
-use crate::{hashing::PartedHash, shard::InsertStatus};
+use crate::{hashing::PartedHash, shard::InsertStatus, VickyError};
 use crate::{
     hashing::USER_NAMESPACE,
     shard::{Shard, NUM_ROWS, ROW_WIDTH},
-    Error,
 };
-use crate::{shard::EntryRef, Config, Result};
+use crate::{Config, Result};
 
 /// Stats from VickyStore, mainly useful for debugging
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -27,7 +26,7 @@ pub struct Stats {
 /// The VickyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
 pub struct VickyStore {
     shards: RwLock<BTreeMap<u32, Shard>>,
-    config: Arc<Config>,
+    pub(crate) config: Arc<Config>,
     dir_path: PathBuf,
     // stats
     num_entries: AtomicUsize,
@@ -245,11 +244,11 @@ impl VickyStore {
         Ok(())
     }
 
-    /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
-    /// The data is fully-owned, no references are returned.
-    pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+    pub(crate) fn get_internal<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        ph: PartedHash,
+        key: &B,
+    ) -> Result<Option<Vec<u8>>> {
         self.shards
             .read()
             .unwrap()
@@ -257,7 +256,20 @@ impl VickyStore {
             .peek_next()
             .unwrap()
             .1
-            .get(ph, key)
+            .get(ph, key.as_ref())
+    }
+
+    /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
+    /// The data is fully-owned, no references are returned.
+    pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        self.get_internal(ph, key.as_ref())
+    }
+
+    /// Checks whether the given key exists in the store
+    pub fn contains<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<bool> {
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        Ok(self.get_internal(ph, key.as_ref())?.is_some())
     }
 
     fn compact(&self, shard_end: u32, write_offset: u32) -> Result<bool> {
@@ -293,10 +305,11 @@ impl VickyStore {
         self.num_compactions.fetch_add(1, Ordering::SeqCst);
 
         for res in removed_shard.unlocked_iter() {
-            let entry = res?;
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &entry.key);
+            let (k, v) = res?;
+            // XXX: this will not work with namespaces
+            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
 
-            let status = compacted_shard.insert(ph, &EntryRef::from_entry(&entry))?;
+            let status = compacted_shard.insert(ph, &k, &v)?;
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
 
@@ -336,13 +349,13 @@ impl VickyStore {
         )?;
 
         for res in removed_shard.unlocked_iter() {
-            let entry = res?;
+            let (k, v) = res?;
 
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &entry.key);
+            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
             let status = if (ph.shard_selector as u32) < midpoint {
-                bottom_shard.insert(ph, &EntryRef::from_entry(&entry))?
+                bottom_shard.insert(ph, &k, &v)?
             } else {
-                top_shard.insert(ph, &EntryRef::from_entry(&entry))?
+                top_shard.insert(ph, &k, &v)?
             };
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
@@ -373,7 +386,12 @@ impl VickyStore {
         Ok(true)
     }
 
-    fn try_insert(&self, ph: PartedHash, entry: &EntryRef) -> Result<(InsertStatus, u32, u32)> {
+    fn try_insert(
+        &self,
+        ph: PartedHash,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<(InsertStatus, u32, u32)> {
         let guard = self.shards.read().unwrap();
         let cursor = guard.lower_bound(Bound::Excluded(&(ph.shard_selector as u32)));
         let shard_start = cursor
@@ -381,21 +399,21 @@ impl VickyStore {
             .map(|(&shard_start, _)| shard_start)
             .unwrap_or(0);
         let (shard_end, shard) = cursor.peek_next().unwrap();
-        let status = shard.insert(ph, entry)?;
+        let status = shard.insert(ph, key, val)?;
 
         Ok((status, shard_start, *shard_end))
     }
 
-    fn _insert(&self, ph: PartedHash, entry: EntryRef) -> Result<()> {
-        if entry.key.len() > u16::MAX as usize {
-            return Err(Error::KeyTooLong);
+    pub(crate) fn insert_internal(&self, ph: PartedHash, key: &[u8], val: &[u8]) -> Result<()> {
+        if key.len() > u16::MAX as usize {
+            return Err(Box::new(VickyError::KeyTooLong));
         }
-        if entry.val.len() > u16::MAX as usize {
-            return Err(Error::ValueTooLong);
+        if val.len() > u16::MAX as usize {
+            return Err(Box::new(VickyError::ValueTooLong));
         }
 
         loop {
-            let (status, shard_start, shard_end) = self.try_insert(ph, &entry)?;
+            let (status, shard_start, shard_end) = self.try_insert(ph, key, val)?;
 
             match status {
                 InsertStatus::Added => {
@@ -439,12 +457,8 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<()> {
-        let entry = EntryRef {
-            key: key.as_ref(),
-            val: val.as_ref(),
-        };
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, entry.key);
-        self._insert(ph, entry)
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        self.insert_internal(ph, key.as_ref(), val.as_ref())
     }
 
     /// Modifies an existing entry in-place, instead of creating a version. Note that the key must exist
@@ -473,11 +487,7 @@ impl VickyStore {
             .modify_inplace(ph, key, patch, patch_offset)
     }
 
-    /// Removes a key-value pair from the store, returning `None` if the key did not exist,
-    /// or `Some(old_value)` if it did
-    pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+    pub(crate) fn remove_internal(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let val = self
             .shards
             .read()
@@ -491,6 +501,14 @@ impl VickyStore {
             self.num_entries.fetch_sub(1, Ordering::SeqCst);
         }
         Ok(val)
+    }
+
+    /// Removes a key-value pair from the store, returning `None` if the key did not exist,
+    /// or `Some(old_value)` if it did
+    pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
+        let key = key.as_ref();
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        self.remove_internal(ph, key)
     }
 
     /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and

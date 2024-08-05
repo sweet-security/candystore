@@ -15,7 +15,7 @@ use std::{
 use memmap::{MmapMut, MmapOptions};
 
 use crate::hashing::{PartedHash, INVALID_SIG};
-use crate::{Config, Error, Result};
+use crate::{Config, Result, VickyError};
 
 //
 // these numbers were chosen according to the simulation, as they allow for 90% utilization of the shard with
@@ -65,6 +65,8 @@ pub(crate) struct ByHashIterator<'a> {
     start_idx: usize,
 }
 
+type Entry = (Vec<u8>, Vec<u8>);
+
 impl<'a> Iterator for ByHashIterator<'a> {
     type Item = Result<Entry>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -76,33 +78,6 @@ impl<'a> Iterator for ByHashIterator<'a> {
             return Some(self.shard.read_kv(self.row.offsets_and_sizes[idx]));
         }
         None
-    }
-}
-
-pub(crate) struct Entry {
-    pub key: Vec<u8>,
-    pub val: Vec<u8>,
-}
-impl Entry {
-    fn len(&self) -> usize {
-        self.key.len() + self.val.len()
-    }
-}
-
-pub(crate) struct EntryRef<'a> {
-    pub key: &'a [u8],
-    pub val: &'a [u8],
-}
-
-impl<'a> EntryRef<'a> {
-    fn len(&self) -> usize {
-        self.key.len() + self.val.len()
-    }
-    pub fn from_entry(entry: &'a Entry) -> Self {
-        Self {
-            key: &entry.key,
-            val: &entry.val,
-        }
     }
 }
 
@@ -179,14 +154,14 @@ impl Shard {
         let val = buf[klen..klen + vlen].to_owned();
         buf.truncate(klen);
 
-        Ok(Entry { key: buf, val })
+        Ok((buf, val))
     }
 
     // writing doesn't require holding any locks since we write with an offset
-    fn write_kv(&self, entry: &EntryRef) -> Result<u64> {
-        let mut buf = vec![0u8; entry.len()];
-        buf[..entry.key.len()].copy_from_slice(entry.key);
-        buf[entry.key.len()..].copy_from_slice(entry.val);
+    fn write_kv(&self, key: &[u8], val: &[u8]) -> Result<u64> {
+        let mut buf = vec![0u8; key.len() + val.len()];
+        buf[..key.len()].copy_from_slice(key);
+        buf[key.len()..].copy_from_slice(val);
 
         // atomically allocate some area. it may leak if the IO below fails or if we crash before updating the
         // offsets_and_size array, but we're okay with leaks
@@ -198,21 +173,14 @@ impl Shard {
         // now writing can be non-atomic (pwrite)
         self.file.write_all_at(&buf, HEADER_SIZE + write_offset)?;
 
-        Ok(((entry.key.len() as u64) << 48) | ((entry.val.len() as u64) << 32) | write_offset)
+        Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
     }
 
-    pub(crate) fn read_at(
-        &self,
-        row_idx: usize,
-        entry_idx: usize,
-    ) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<Entry>> {
         let _guard = self.row_locks[row_idx].read().unwrap();
         let row = &self.header.rows.0[row_idx];
         if row.signatures[entry_idx] != INVALID_SIG {
-            Some(
-                self.read_kv(row.offsets_and_sizes[entry_idx])
-                    .map(|entry| (entry.key, entry.val)),
-            )
+            Some(self.read_kv(row.offsets_and_sizes[entry_idx]))
         } else {
             None
         }
@@ -243,28 +211,34 @@ impl Shard {
 
     pub(crate) fn get(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
         for res in self.iter_by_hash(ph) {
-            let entry = res?;
-            if entry.key == key {
-                return Ok(Some(entry.val));
+            let (k, v) = res?;
+            if key == k {
+                return Ok(Some(v));
             }
         }
         Ok(None)
     }
 
-    fn try_replace(&self, row: &mut ShardRow, ph: PartedHash, entry: &EntryRef) -> Result<bool> {
+    fn try_replace(
+        &self,
+        row: &mut ShardRow,
+        ph: PartedHash,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<bool> {
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
-            let curr_entry = self.read_kv(row.offsets_and_sizes[idx])?;
-            if entry.key == curr_entry.key {
+            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == k {
                 // optimization
-                if entry.val == curr_entry.val {
+                if val == v {
                     return Ok(true);
                 }
 
-                row.offsets_and_sizes[idx] = self.write_kv(entry)?;
+                row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
                 self.header
                     .wasted_bytes
-                    .fetch_add(curr_entry.len() as u64, Ordering::SeqCst);
+                    .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
 
                 return Ok(true);
             }
@@ -284,8 +258,8 @@ impl Shard {
         (guard, row)
     }
 
-    pub(crate) fn insert(&self, ph: PartedHash, entry: &EntryRef) -> Result<InsertStatus> {
-        if self.header.write_offset.load(Ordering::Relaxed) as u64 + entry.len() as u64
+    pub(crate) fn insert(&self, ph: PartedHash, key: &[u8], val: &[u8]) -> Result<InsertStatus> {
+        if self.header.write_offset.load(Ordering::Relaxed) as u64 + (key.len() + val.len()) as u64
             > self.config.max_shard_size as u64
         {
             if self.header.wasted_bytes.load(Ordering::Relaxed)
@@ -304,13 +278,13 @@ impl Shard {
         // see if we replace an existing key
         let (_guard, row) = self.get_row_mut(ph);
 
-        if self.try_replace(row, ph, entry)? {
+        if self.try_replace(row, ph, key, val)? {
             return Ok(InsertStatus::Replaced);
         }
 
         // find an empty slot
         if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
-            let new_off = self.write_kv(entry)?;
+            let new_off = self.write_kv(key, val)?;
 
             row.offsets_and_sizes[idx] = new_off;
             std::sync::atomic::fence(Ordering::SeqCst);
@@ -335,12 +309,12 @@ impl Shard {
 
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
-            let curr_entry = self.read_kv(row.offsets_and_sizes[idx])?;
-            if key == curr_entry.key {
+            let (k, _) = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == k {
                 let (klen, vlen, offset) =
                     Self::extract_offset_and_size(row.offsets_and_sizes[idx]);
                 if patch_offset + patch.len() > vlen as usize {
-                    return Err(Error::ValueTooLong);
+                    return Err(Box::new(VickyError::ValueTooLong));
                 }
 
                 self.file.write_all_at(
@@ -352,22 +326,22 @@ impl Shard {
             }
             start = idx + 1;
         }
-        Err(Error::KeyNotFound)
+        Err(Box::new(VickyError::KeyNotFound))
     }
 
     pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (_guard, row) = self.get_row_mut(ph);
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
-            let entry = self.read_kv(row.offsets_and_sizes[idx])?;
-            if key == entry.key {
+            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == k {
                 row.signatures[idx] = INVALID_SIG;
                 // we managed to remove this key
                 self.header.num_deleted.fetch_add(1, Ordering::Relaxed);
                 self.header
                     .wasted_bytes
-                    .fetch_add(entry.len() as u64, Ordering::Relaxed);
-                return Ok(Some(entry.val));
+                    .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
+                return Ok(Some(v));
             }
             start = idx + 1;
         }

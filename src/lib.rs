@@ -3,41 +3,37 @@
 mod hashing;
 mod shard;
 mod store;
+mod typed;
 
 pub use hashing::SecretKey;
 use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
+pub use typed::{VickyTypedKey, VickyTypedStore};
 
 #[derive(Debug)]
-pub enum Error {
+pub enum VickyError {
     WrongSecretKeyLength,
     KeyTooLong,
     ValueTooLong,
     KeyNotFound,
-    IOError(std::io::Error),
 }
 
-impl From<std::io::Error> for Error {
-    fn from(value: std::io::Error) -> Self {
-        Self::IOError(value)
-    }
-}
-
-impl Display for Error {
+impl Display for VickyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            Error::WrongSecretKeyLength => write!(f, "wrong secret length"),
-            Error::KeyTooLong => write!(f, "key too long"),
-            Error::KeyNotFound => write!(f, "key not found"),
-            Error::ValueTooLong => write!(f, "value too long"),
-            Error::IOError(err) => write!(f, "IO error: {err}"),
+            Self::WrongSecretKeyLength => write!(f, "wrong secret length"),
+            Self::KeyTooLong => write!(f, "key too long"),
+            Self::KeyNotFound => write!(f, "key not found"),
+            Self::ValueTooLong => write!(f, "value too long"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for VickyError {}
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// It is an alias for a boxed [std::error::Error].
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The configuration options for VickyStore. Comes with sane defaults, feel free to use them
 #[derive(Debug, Clone)]
