@@ -23,7 +23,7 @@ pub enum VickyError {
 impl Display for VickyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            Self::WrongHashSeedLength => write!(f, "wrong shash seed length"),
+            Self::WrongHashSeedLength => write!(f, "wrong hash seed length"),
             Self::KeyTooLong => write!(f, "key too long"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong => write!(f, "value too long"),

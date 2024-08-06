@@ -1,6 +1,7 @@
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
+    hashing::TYPED_NAMESPACE,
     insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus},
     VickyStore,
 };
@@ -60,8 +61,10 @@ where
     where
         K: Borrow<Q>,
     {
-        let mut kbytes = k.to_bytes::<LE>();
-        kbytes.extend_from_slice(&K::TYPE_ID.to_le_bytes()[..]);
+        let mut kbytes = vec![];
+        kbytes.extend_from_slice(&k.to_bytes::<LE>());
+        kbytes.extend_from_slice(&K::TYPE_ID.to_le_bytes());
+        kbytes.extend_from_slice(TYPED_NAMESPACE);
         kbytes
     }
 
@@ -69,7 +72,7 @@ where
     where
         K: Borrow<Q>,
     {
-        self.store.contains(&Self::make_key(k))
+        Ok(self.store.get_raw(&Self::make_key(k))?.is_some())
     }
 
     pub fn get<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
@@ -77,7 +80,7 @@ where
         K: Borrow<Q>,
     {
         let kbytes = Self::make_key(k);
-        let vbytes = self.store.get(&kbytes)?;
+        let vbytes = self.store.get_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
             let val = V::from_bytes::<LE>(&vbytes)?;
             Ok(Some(val))
@@ -89,19 +92,19 @@ where
     pub fn replace(&self, k: K, v: V) -> Result<ReplaceStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.replace(&kbytes, &vbytes)
+        self.store.replace_raw(&kbytes, &vbytes)
     }
 
     pub fn set(&self, k: K, v: V) -> Result<SetStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.set(&kbytes, &vbytes)
+        self.store.set_raw(&kbytes, &vbytes)
     }
 
     pub fn get_or_create(&self, k: K, v: V) -> Result<GetOrCreateStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.get_or_create(&kbytes, &vbytes)
+        self.store.get_or_create_raw(&kbytes, &vbytes)
     }
 
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
@@ -109,7 +112,7 @@ where
         K: Borrow<Q>,
     {
         let kbytes = Self::make_key(k);
-        let vbytes = self.store.remove(&kbytes)?;
+        let vbytes = self.store.remove_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
             let val = V::from_bytes::<LE>(&vbytes)?;
             Ok(Some(val))

@@ -96,8 +96,19 @@ impl<'a> Iterator for VickyStoreIterator<'a> {
                     }
                 }
 
-                if kvres.is_some() {
-                    return kvres;
+                if let Some(res) = kvres {
+                    match res {
+                        Ok((mut k, v)) => {
+                            // filter anything other than USER_NAMESPACE
+                            if k.ends_with(USER_NAMESPACE) {
+                                k.truncate(k.len() - USER_NAMESPACE.len());
+                                return Some(Ok((k, v)));
+                            }
+                        }
+                        Err(e) => {
+                            return Some(Err(e));
+                        }
+                    }
                 }
                 if should_break {
                     break;
@@ -289,6 +300,12 @@ impl VickyStore {
         Ok(())
     }
 
+    pub(crate) fn make_user_key(&self, key: &[u8]) -> Vec<u8> {
+        let mut full_key = key.to_owned();
+        full_key.extend_from_slice(USER_NAMESPACE);
+        full_key
+    }
+
     #[allow(dead_code)]
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<(Vec<u8>, Vec<u8>)>> {
         self.shards
@@ -302,7 +319,8 @@ impl VickyStore {
             .collect::<Vec<_>>()
     }
 
-    pub(crate) fn get_internal(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let ph = PartedHash::new(&self.config.hash_seed, full_key);
         self.shards
             .read()
             .unwrap()
@@ -310,23 +328,23 @@ impl VickyStore {
             .peek_next()
             .unwrap()
             .1
-            .get(ph, key)
+            .get(ph, &full_key)
     }
 
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
     /// The data is fully-owned, no references are returned.
     pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
-        self.get_internal(ph, key.as_ref())
+        self.get_raw(&self.make_user_key(key.as_ref()))
     }
 
     /// Checks whether the given key exists in the store
     pub fn contains<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<bool> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
-        Ok(self.get_internal(ph, key.as_ref())?.is_some())
+        Ok(self.get_raw(&self.make_user_key(key.as_ref()))?.is_some())
     }
 
-    pub(crate) fn remove_internal(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn remove_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let ph = PartedHash::new(&self.config.hash_seed, full_key);
+
         let val = self
             .shards
             .read()
@@ -335,7 +353,7 @@ impl VickyStore {
             .peek_next()
             .unwrap()
             .1
-            .remove(ph, key)?;
+            .remove(ph, &full_key)?;
         if val.is_some() {
             self.num_entries.fetch_sub(1, Ordering::SeqCst);
         }
@@ -345,9 +363,7 @@ impl VickyStore {
     /// Removes a key-value pair from the store, returning `None` if the key did not exist,
     /// or `Some(old_value)` if it did
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let key = key.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
-        self.remove_internal(ph, key)
+        self.remove_raw(&self.make_user_key(key.as_ref()))
     }
 
     /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and

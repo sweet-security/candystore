@@ -1,6 +1,4 @@
-use std::hash::Hasher;
-
-use siphasher::sip128::{Hash128, Hasher128, SipHasher24};
+use siphasher::sip128::{Hash128, SipHasher24};
 
 use crate::{Result, VickyError};
 
@@ -33,13 +31,16 @@ pub(crate) struct PartedHash {
 
 pub(crate) const INVALID_SIG: u32 = 0;
 
-pub(crate) const USER_NAMESPACE: u8 = 1;
-//pub(crate) const TYPED_NAMESPACE: u8 = 2;
-//pub(crate) const XUSER_NAMESPACE: &[u8] = &[1];
+pub(crate) const USER_NAMESPACE: &[u8] = &[1];
+pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 
 impl PartedHash {
     #[allow(dead_code)]
     pub const LEN: usize = size_of::<u64>();
+
+    pub fn new(seed: &HashSeed, buf: &[u8]) -> Self {
+        Self::from_hash(SipHasher24::new_with_key(&seed.0).hash(buf))
+    }
 
     fn from_hash(h: Hash128) -> Self {
         let mut signature = h.h1 as u32;
@@ -58,31 +59,14 @@ impl PartedHash {
             signature,
         }
     }
-    pub fn from_buffer(namespace: u8, seed: &HashSeed, buf: &[u8]) -> Self {
-        // maybe use blake3?
-        let mut hasher = SipHasher24::new_with_key(&seed.0);
-        hasher.write_u8(namespace);
-        hasher.write(buf);
-        Self::from_hash(hasher.finish128())
-    }
-    pub fn from_buffers(seed: &HashSeed, bufs: &[&[u8]]) -> Self {
-        // maybe use blake3?
-        let mut hasher = SipHasher24::new_with_key(&seed.0);
-        for buf in bufs {
-            hasher.write(buf);
-        }
-        Self::from_hash(hasher.finish128())
-    }
 
-    // pub fn builder(seed: &HashSeed) -> PartedHashBuilder {
-    //     PartedHashBuilder(SipHasher24::new_with_key(&seed.0))
-    // }
     #[cfg(test)]
     pub fn to_u64(&self) -> u64 {
         ((self.shard_selector as u64) << 48)
             | ((self.row_selector as u64) << 32)
             | (self.signature as u64)
     }
+
     // pub fn from_u64(val: u64) -> Self {
     //     Self {
     //         shard_selector: (val >> 48) as u16,
@@ -100,54 +84,17 @@ impl PartedHash {
     // }
 }
 
-// pub(crate) struct PartedHashBuilder(SipHasher24);
-
-// impl PartedHashBuilder {
-//     pub fn write(mut self, bytes: &[u8]) -> Self {
-//         self.0.write(bytes);
-//         self
-//     }
-//     pub fn write_parted_hash(mut self, v: PartedHash) -> Self {
-//         self.0.write_u64(v.to_u64());
-//         self
-//     }
-//     pub fn write_u64(mut self, v: u64) -> Self {
-//         self.0.write_u64(v);
-//         self
-//     }
-//     pub fn write_u32(mut self, v: u32) -> Self {
-//         self.0.write_u32(v);
-//         self
-//     }
-//     pub fn write_u8(mut self, v: u8) -> Self {
-//         self.0.write_u8(v);
-//         self
-//     }
-//     pub fn finish(self) -> PartedHash {
-//         PartedHash::from_hash(self.0.finish128())
-//     }
-// }
-
 #[test]
 fn test_parted_hash() -> Result<()> {
     HashSeed::new("1234").expect_err("shouldn't work");
     HashSeed::new("12341234123412341").expect_err("shouldn't work");
 
-    let key = HashSeed::new("aaaabbbbccccdddd")?;
+    let seed = HashSeed::new("aaaabbbbccccdddd")?;
 
     assert_eq!(
-        PartedHash::from_buffer(USER_NAMESPACE, &key, b"hello world").to_u64(),
-        12143172433256666175,
+        PartedHash::new(&seed, b"hello world").to_u64(),
+        13445180190757400308,
     );
-
-    // assert_eq!(
-    //     PartedHash::builder(&key)
-    //         .write_u8(USER_NAMESPACE)
-    //         .write(b"hello world")
-    //         .finish()
-    //         .to_u64(),
-    //     12143172433256666175,
-    // );
 
     Ok(())
 }

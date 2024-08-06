@@ -279,14 +279,24 @@ impl Shard {
         (guard, row)
     }
 
-    pub(crate) fn insert(
+    /*pub(crate) fn insert_multikey(
         &self,
-        ph: PartedHash,
-        key: &[u8],
+        keys: &[&[u8]],
         val: &[u8],
         mode: InsertMode,
     ) -> Result<InsertStatus> {
-        if self.header.write_offset.load(Ordering::Relaxed) as u64 + (key.len() + val.len()) as u64
+        self.insert_fullkey(ph, &full_key, val, mode)
+    }*/
+
+    pub(crate) fn insert(
+        &self,
+        ph: PartedHash,
+        full_key: &[u8],
+        val: &[u8],
+        mode: InsertMode,
+    ) -> Result<InsertStatus> {
+        if self.header.write_offset.load(Ordering::Relaxed) as u64
+            + (full_key.len() + val.len()) as u64
             > self.config.max_shard_size as u64
         {
             if self.header.wasted_bytes.load(Ordering::Relaxed)
@@ -305,7 +315,7 @@ impl Shard {
         // see if we replace an existing key
         let (_guard, row) = self.get_row_mut(ph);
 
-        match self.try_replace(row, ph, key, val, mode)? {
+        match self.try_replace(row, ph, &full_key, val, mode)? {
             TryReplaceStatus::KeyDoesNotExist => {
                 if matches!(mode, InsertMode::Replace) {
                     return Ok(InsertStatus::KeyDoesNotExist);
@@ -313,7 +323,7 @@ impl Shard {
 
                 // find an empty slot
                 if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
-                    let new_off = self.write_kv(key, val)?;
+                    let new_off = self.write_kv(&full_key, val)?;
 
                     // we don't want a reorder to happen here - first write the offset, then the signature
                     row.offsets_and_sizes[idx] = new_off;

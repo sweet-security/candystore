@@ -1,7 +1,7 @@
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
-use crate::hashing::{PartedHash, USER_NAMESPACE};
+use crate::hashing::PartedHash;
 use crate::shard::{InsertMode, InsertStatus, Shard};
 use crate::store::VickyStore;
 use crate::{Result, VickyError, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
@@ -86,9 +86,7 @@ impl VickyStore {
 
         for res in removed_shard.unlocked_iter() {
             let (k, v) = res?;
-            // XXX: this will not work with namespaces
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, &k);
-
+            let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
@@ -131,7 +129,7 @@ impl VickyStore {
         for res in removed_shard.unlocked_iter() {
             let (k, v) = res?;
 
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, &k);
+            let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = if (ph.shard_selector as u32) < midpoint {
                 bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
             } else {
@@ -187,12 +185,13 @@ impl VickyStore {
 
     pub(crate) fn insert_internal(
         &self,
-        ph: PartedHash,
-        key: &[u8],
+        full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
     ) -> Result<Option<Vec<u8>>> {
-        if key.len() > MAX_TOTAL_KEY_SIZE as usize {
+        let ph = PartedHash::new(&self.config.hash_seed, full_key);
+
+        if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
             return Err(Box::new(VickyError::KeyTooLong));
         }
         if val.len() > MAX_VALUE_SIZE as usize {
@@ -200,7 +199,7 @@ impl VickyStore {
         }
 
         loop {
-            let (status, shard_start, shard_end) = self.try_insert(ph, key, val, mode)?;
+            let (status, shard_start, shard_end) = self.try_insert(ph, &full_key, val, mode)?;
 
             match status {
                 InsertStatus::Added => {
@@ -228,6 +227,14 @@ impl VickyStore {
         }
     }
 
+    pub fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
+        if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Set)? {
+            Ok(SetStatus::PrevValue(prev))
+        } else {
+            Ok(SetStatus::CreatedNew)
+        }
+    }
+
     /// Inserts a key-value pair, creating it or replacing an existing pair. Note that if the program crashed
     /// while or "right after" this operation, or if the operating system is unable to flush the page cache,
     /// you may lose some data. However, you will still be in a consistent state, where you will get a previous
@@ -241,11 +248,14 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<SetStatus> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
-        if let Some(prev) = self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Set)? {
-            Ok(SetStatus::PrevValue(prev))
+        self.set_raw(&self.make_user_key(key.as_ref()), val.as_ref())
+    }
+
+    pub fn replace_raw(&self, full_key: &[u8], val: &[u8]) -> Result<ReplaceStatus> {
+        if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Replace)? {
+            Ok(ReplaceStatus::PrevValue(prev))
         } else {
-            Ok(SetStatus::CreatedNew)
+            Ok(ReplaceStatus::DoesNotExist)
         }
     }
 
@@ -259,13 +269,19 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<ReplaceStatus> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
-        if let Some(prev) =
-            self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Replace)?
-        {
-            Ok(ReplaceStatus::PrevValue(prev))
+        self.replace_raw(&self.make_user_key(key.as_ref()), val.as_ref())
+    }
+
+    pub fn get_or_create_raw(
+        &self,
+        full_key: &[u8],
+        default_val: &[u8],
+    ) -> Result<GetOrCreateStatus> {
+        let res = self.insert_internal(&full_key, default_val, InsertMode::GetOrCreate)?;
+        if let Some(prev) = res {
+            Ok(GetOrCreateStatus::ExistingValue(prev))
         } else {
-            Ok(ReplaceStatus::DoesNotExist)
+            Ok(GetOrCreateStatus::CreatedNew(default_val.to_owned()))
         }
     }
 
@@ -280,15 +296,25 @@ impl VickyStore {
         key: &B1,
         default_val: &B2,
     ) -> Result<GetOrCreateStatus> {
-        let key = key.as_ref();
-        let default_val = default_val.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
-        let res = self.insert_internal(ph, key, default_val, InsertMode::GetOrCreate)?;
-        if let Some(prev) = res {
-            Ok(GetOrCreateStatus::ExistingValue(prev))
-        } else {
-            Ok(GetOrCreateStatus::CreatedNew(default_val.to_owned()))
-        }
+        self.get_or_create_raw(&self.make_user_key(key.as_ref()), default_val.as_ref())
+    }
+
+    pub(crate) fn modify_inplace_raw(
+        &self,
+        full_key: &[u8],
+        patch: &[u8],
+        patch_offset: usize,
+        expected: Option<&[u8]>,
+    ) -> Result<bool> {
+        let ph = PartedHash::new(&self.config.hash_seed, &full_key);
+        self.shards
+            .read()
+            .unwrap()
+            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .peek_next()
+            .unwrap()
+            .1
+            .modify_inplace(ph, full_key, patch, patch_offset, expected)
     }
 
     /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist
@@ -305,16 +331,11 @@ impl VickyStore {
         patch_offset: usize,
         expected: Option<&B2>,
     ) -> Result<bool> {
-        let key = key.as_ref();
-        let patch = patch.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
-        self.shards
-            .read()
-            .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
-            .peek_next()
-            .unwrap()
-            .1
-            .modify_inplace(ph, key, patch, patch_offset, expected.map(|b| b.as_ref()))
+        self.modify_inplace_raw(
+            &self.make_user_key(key.as_ref()),
+            patch.as_ref(),
+            patch_offset,
+            expected.map(|b| b.as_ref()),
+        )
     }
 }
