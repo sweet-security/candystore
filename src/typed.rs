@@ -1,8 +1,8 @@
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
-    hashing::TYPED_NAMESPACE,
     insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus},
+    store::TYPED_NAMESPACE,
     VickyStore,
 };
 

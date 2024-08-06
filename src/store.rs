@@ -8,12 +8,12 @@ use std::{
     },
 };
 
-use crate::hashing::PartedHash;
-use crate::{
-    hashing::USER_NAMESPACE,
-    shard::{Shard, NUM_ROWS, ROW_WIDTH},
-};
+use crate::shard::{Shard, NUM_ROWS, ROW_WIDTH};
+use crate::{hashing::PartedHash, shard::KVPair};
 use crate::{Config, Result};
+
+pub(crate) const USER_NAMESPACE: &[u8] = &[1];
+pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 
 /// Stats from VickyStore, mainly useful for debugging
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -74,7 +74,7 @@ impl<'a> VickyStoreIterator<'a> {
 }
 
 impl<'a> Iterator for VickyStoreIterator<'a> {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let guard = self.db.shards.read().unwrap();
@@ -307,7 +307,7 @@ impl VickyStore {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<KVPair>> {
         self.shards
             .read()
             .unwrap()

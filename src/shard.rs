@@ -74,10 +74,10 @@ pub(crate) struct ByHashIterator<'a> {
     start_idx: usize,
 }
 
-type Entry = (Vec<u8>, Vec<u8>);
+pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 
 impl<'a> Iterator for ByHashIterator<'a> {
-    type Item = Result<Entry>;
+    type Item = Result<KVPair>;
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(idx) = self.row.signatures[self.start_idx..]
             .iter()
@@ -151,16 +151,22 @@ impl Shard {
         Ok(())
     }
 
+    // #[inline]
+    // fn is_special_offset(offset_and_size: u64) -> bool {
+    //     (offset_and_size >> 62) != 0
+    // }
+
     #[inline]
     fn extract_offset_and_size(offset_and_size: u64) -> (usize, usize, u64) {
         let klen = (offset_and_size >> 48) as usize;
+        debug_assert_eq!(klen >> 14, 0, "attempting to read a special key");
         let vlen = ((offset_and_size >> 32) & 0xffff) as usize;
         let offset = (offset_and_size as u32) as u64;
         (klen, vlen, offset)
     }
 
     // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
-    pub(crate) fn read_kv(&self, offset_and_size: u64) -> Result<Entry> {
+    fn read_kv(&self, offset_and_size: u64) -> Result<KVPair> {
         let (klen, vlen, offset) = Self::extract_offset_and_size(offset_and_size);
 
         let mut buf = vec![0u8; klen + vlen];
@@ -191,7 +197,7 @@ impl Shard {
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
     }
 
-    pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<Entry>> {
+    pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<KVPair>> {
         let _guard = self.row_locks[row_idx].read().unwrap();
         let row = &self.header.rows.0[row_idx];
         if row.signatures[entry_idx] != INVALID_SIG {
@@ -201,13 +207,15 @@ impl Shard {
         }
     }
 
-    pub(crate) fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<Entry>> + 'b {
+    pub(crate) fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
         self.header.rows.0.iter().flat_map(|row| {
-            row.signatures
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, &sig)| (sig != INVALID_SIG).then_some(idx))
-                .map(|idx| self.read_kv(row.offsets_and_sizes[idx]))
+            row.signatures.iter().enumerate().filter_map(|(idx, &sig)| {
+                if sig == INVALID_SIG {
+                    None
+                } else {
+                    Some(self.read_kv(row.offsets_and_sizes[idx]))
+                }
+            })
         })
     }
 
@@ -278,15 +286,6 @@ impl Shard {
             unsafe { &mut *(&self.header.rows.0[row_idx] as *const ShardRow as *mut ShardRow) };
         (guard, row)
     }
-
-    /*pub(crate) fn insert_multikey(
-        &self,
-        keys: &[&[u8]],
-        val: &[u8],
-        mode: InsertMode,
-    ) -> Result<InsertStatus> {
-        self.insert_fullkey(ph, &full_key, val, mode)
-    }*/
 
     pub(crate) fn insert(
         &self,
