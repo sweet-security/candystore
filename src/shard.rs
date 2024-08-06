@@ -340,12 +340,13 @@ impl Shard {
         key: &[u8],
         patch: &[u8],
         patch_offset: usize,
-    ) -> Result<()> {
+        expected: Option<&[u8]>,
+    ) -> Result<bool> {
         let (_guard, row) = self.get_row_mut(ph);
 
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
-            let (k, _) = self.read_kv(row.offsets_and_sizes[idx])?;
+            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
                 let (klen, vlen, offset) =
                     Self::extract_offset_and_size(row.offsets_and_sizes[idx]);
@@ -353,12 +354,18 @@ impl Shard {
                     return Err(Box::new(VickyError::ValueTooLong));
                 }
 
+                if let Some(expected) = expected {
+                    if &v[patch_offset..patch_offset + patch.len()] != expected {
+                        return Ok(false);
+                    }
+                }
+
                 self.file.write_all_at(
                     patch,
                     HEADER_SIZE + offset + klen as u64 + patch_offset as u64,
                 )?;
 
-                return Ok(());
+                return Ok(true);
             }
             start = idx + 1;
         }

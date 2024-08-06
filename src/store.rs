@@ -316,13 +316,13 @@ impl VickyStore {
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
     /// The data is fully-owned, no references are returned.
     pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
         self.get_internal(ph, key.as_ref())
     }
 
     /// Checks whether the given key exists in the store
     pub fn contains<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<bool> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
         Ok(self.get_internal(ph, key.as_ref())?.is_some())
     }
 
@@ -346,7 +346,7 @@ impl VickyStore {
     /// or `Some(old_value)` if it did
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
         self.remove_internal(ph, key)
     }
 

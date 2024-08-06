@@ -19,21 +19,40 @@ fn test_modify_inplace() -> Result<()> {
         db.set("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
         assert_eq!(
-            db.modify_inplace("zzz", "bbb", 7).unwrap_err().to_string(),
+            db.modify_inplace("zzz", "bbb", 7, None)
+                .unwrap_err()
+                .to_string(),
             "key not found"
         );
 
         assert_eq!(
-            db.modify_inplace("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 7)
-                .unwrap_err()
-                .to_string(),
+            db.modify_inplace(
+                "aaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                7,
+                None
+            )
+            .unwrap_err()
+            .to_string(),
             "value too long",
         );
 
-        db.modify_inplace("aaa", "bbb", 7)?;
+        assert!(db.modify_inplace("aaa", "bbb", 7, None)?);
         assert_eq!(
             db.get("aaa")?,
             Some("aaaaaaabbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        );
+
+        assert!(db.modify_inplace("aaa", "ccc", 10, Some("aaa"))?);
+        assert_eq!(
+            db.get("aaa")?,
+            Some("aaaaaaabbbcccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        );
+
+        assert!(!db.modify_inplace("aaa", "ddd", 10, Some("aaa"))?);
+        assert_eq!(
+            db.get("aaa")?,
+            Some("aaaaaaabbbcccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
 
         Ok(())

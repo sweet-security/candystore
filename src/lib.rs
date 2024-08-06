@@ -6,7 +6,7 @@ mod shard;
 mod store;
 mod typed;
 
-pub use hashing::SecretKey;
+pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
@@ -14,7 +14,7 @@ pub use typed::{VickyTypedKey, VickyTypedStore};
 
 #[derive(Debug)]
 pub enum VickyError {
-    WrongSecretKeyLength,
+    WrongHashSeedLength,
     KeyTooLong,
     ValueTooLong,
     KeyNotFound,
@@ -23,7 +23,7 @@ pub enum VickyError {
 impl Display for VickyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            Self::WrongSecretKeyLength => write!(f, "wrong secret length"),
+            Self::WrongHashSeedLength => write!(f, "wrong shash seed length"),
             Self::KeyTooLong => write!(f, "key too long"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong => write!(f, "value too long"),
@@ -42,7 +42,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Config {
     pub max_shard_size: u32, // we don't want huge shards, because splitting would be expensive
     pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
-    pub secret_key: SecretKey, // just some entropy, not so important unless you fear DoS
+    pub hash_seed: HashSeed, // just some entropy, not so important unless you fear DoS
     pub expected_number_of_keys: usize, // hint for creating number of shards accordingly)
 }
 
@@ -51,8 +51,16 @@ impl Default for Config {
         Self {
             max_shard_size: 64 * 1024 * 1024,
             min_compaction_threashold: 8 * 1024 * 1024,
-            secret_key: SecretKey::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
+            hash_seed: HashSeed::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
             expected_number_of_keys: 0,
         }
     }
 }
+
+pub(crate) const MAX_TOTAL_KEY_SIZE: usize = 0x3fff; // 14 bits
+pub(crate) const NAMESPACING_RESERVED_SIZE: usize = 0xff;
+pub const MAX_KEY_SIZE: usize = MAX_TOTAL_KEY_SIZE - NAMESPACING_RESERVED_SIZE;
+pub const MAX_VALUE_SIZE: usize = 0xffff;
+
+const _: () = assert!(MAX_KEY_SIZE <= u16::MAX as usize);
+const _: () = assert!(MAX_VALUE_SIZE <= u16::MAX as usize);

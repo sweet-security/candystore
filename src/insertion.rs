@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::hashing::{PartedHash, USER_NAMESPACE};
 use crate::shard::{InsertMode, InsertStatus, Shard};
 use crate::store::VickyStore;
-use crate::{Result, VickyError};
+use crate::{Result, VickyError, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplaceStatus {
@@ -43,10 +43,10 @@ impl GetOrCreateStatus {
     pub fn already_exists(&self) -> bool {
         matches!(*self, Self::ExistingValue(_))
     }
-    pub fn value(&self) -> &[u8] {
+    pub fn value(self) -> Vec<u8> {
         match self {
-            Self::CreatedNew(val) => &val,
-            Self::ExistingValue(val) => &val,
+            Self::CreatedNew(val) => val,
+            Self::ExistingValue(val) => val,
         }
     }
 }
@@ -87,7 +87,7 @@ impl VickyStore {
         for res in removed_shard.unlocked_iter() {
             let (k, v) = res?;
             // XXX: this will not work with namespaces
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
+            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, &k);
 
             let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
@@ -131,7 +131,7 @@ impl VickyStore {
         for res in removed_shard.unlocked_iter() {
             let (k, v) = res?;
 
-            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
+            let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, &k);
             let status = if (ph.shard_selector as u32) < midpoint {
                 bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
             } else {
@@ -192,10 +192,10 @@ impl VickyStore {
         val: &[u8],
         mode: InsertMode,
     ) -> Result<Option<Vec<u8>>> {
-        if key.len() > u16::MAX as usize {
+        if key.len() > MAX_TOTAL_KEY_SIZE as usize {
             return Err(Box::new(VickyError::KeyTooLong));
         }
-        if val.len() > u16::MAX as usize {
+        if val.len() > MAX_VALUE_SIZE as usize {
             return Err(Box::new(VickyError::ValueTooLong));
         }
 
@@ -241,7 +241,7 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<SetStatus> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
         if let Some(prev) = self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Set)? {
             Ok(SetStatus::PrevValue(prev))
         } else {
@@ -259,7 +259,7 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<ReplaceStatus> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key.as_ref());
         if let Some(prev) =
             self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Replace)?
         {
@@ -282,7 +282,7 @@ impl VickyStore {
     ) -> Result<GetOrCreateStatus> {
         let key = key.as_ref();
         let default_val = default_val.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
         let res = self.insert_internal(ph, key, default_val, InsertMode::GetOrCreate)?;
         if let Some(prev) = res {
             Ok(GetOrCreateStatus::ExistingValue(prev))
@@ -303,10 +303,11 @@ impl VickyStore {
         key: &B1,
         patch: &B2,
         patch_offset: usize,
-    ) -> Result<()> {
+        expected: Option<&B2>,
+    ) -> Result<bool> {
         let key = key.as_ref();
         let patch = patch.as_ref();
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.hash_seed, key);
         self.shards
             .read()
             .unwrap()
@@ -314,6 +315,6 @@ impl VickyStore {
             .peek_next()
             .unwrap()
             .1
-            .modify_inplace(ph, key, patch, patch_offset)
+            .modify_inplace(ph, key, patch, patch_offset, expected.map(|b| b.as_ref()))
     }
 }
