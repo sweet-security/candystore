@@ -32,7 +32,7 @@ fn test_typed() -> Result<()> {
         let db = Arc::new(VickyStore::open(dir, Config::default())?);
 
         let typed = VickyTypedStore::<MyKey, MyVal>::new(db.clone());
-        typed.insert(
+        typed.set(
             MyKey {
                 x: 12,
                 y: 34,
@@ -99,8 +99,8 @@ fn test_typed() -> Result<()> {
 
         // two typed-stores can co-exist on the same underlying store
         let typed2 = VickyTypedStore::<String, Vec<u32>>::new(db);
-        typed2.insert("hello".into(), vec![1, 2, 3])?;
-        typed2.insert("world".into(), vec![4, 5, 6, 7])?;
+        typed2.set("hello".into(), vec![1, 2, 3])?;
+        typed2.set("world".into(), vec![4, 5, 6, 7])?;
 
         assert_eq!(typed2.get("hello").unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(typed2.get("world").unwrap(), Some(vec![4, 5, 6, 7]));

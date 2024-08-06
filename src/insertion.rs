@@ -6,6 +6,51 @@ use crate::shard::{InsertMode, InsertStatus, Shard};
 use crate::store::VickyStore;
 use crate::{Result, VickyError};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceStatus {
+    PrevValue(Vec<u8>),
+    DoesNotExist,
+}
+impl ReplaceStatus {
+    pub fn was_replaced(&self) -> bool {
+        matches!(*self, Self::PrevValue(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetStatus {
+    PrevValue(Vec<u8>),
+    CreatedNew,
+}
+impl SetStatus {
+    pub fn was_created(&self) -> bool {
+        matches!(*self, Self::CreatedNew)
+    }
+    pub fn was_replaced(&self) -> bool {
+        matches!(*self, Self::PrevValue(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetOrCreateStatus {
+    ExistingValue(Vec<u8>),
+    CreatedNew(Vec<u8>),
+}
+impl GetOrCreateStatus {
+    pub fn was_created(&self) -> bool {
+        matches!(*self, Self::CreatedNew(_))
+    }
+    pub fn already_exists(&self) -> bool {
+        matches!(*self, Self::ExistingValue(_))
+    }
+    pub fn value(&self) -> &[u8] {
+        match self {
+            Self::CreatedNew(val) => &val,
+            Self::ExistingValue(val) => &val,
+        }
+    }
+}
+
 impl VickyStore {
     fn compact(&self, shard_end: u32, write_offset: u32) -> Result<bool> {
         let mut guard = self.shards.write().unwrap();
@@ -44,7 +89,7 @@ impl VickyStore {
             // XXX: this will not work with namespaces
             let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
 
-            let status = compacted_shard.insert(ph, &k, &v, InsertMode::Overwrite)?;
+            let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
 
@@ -88,9 +133,9 @@ impl VickyStore {
 
             let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, &k);
             let status = if (ph.shard_selector as u32) < midpoint {
-                bottom_shard.insert(ph, &k, &v, InsertMode::Overwrite)?
+                bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
             } else {
-                top_shard.insert(ph, &k, &v, InsertMode::Overwrite)?
+                top_shard.insert(ph, &k, &v, InsertMode::Set)?
             };
             assert!(matches!(status, InsertStatus::Added), "{status:?}");
         }
@@ -162,8 +207,11 @@ impl VickyStore {
                     self.num_entries.fetch_add(1, Ordering::SeqCst);
                     return Ok(None);
                 }
-                InsertStatus::Replaced => {
+                InsertStatus::KeyDoesNotExist => {
                     return Ok(None);
+                }
+                InsertStatus::Replaced(existing_val) => {
+                    return Ok(Some(existing_val));
                 }
                 InsertStatus::AlreadyExists(existing_val) => {
                     return Ok(Some(existing_val));
@@ -186,34 +234,64 @@ impl VickyStore {
     /// version of the state.
     ///
     /// While this method is O(1) amortized, every so often it will trigger either a shard compaction or a
-    /// shard split, which requires rewriting the whole shard.
-    pub fn insert<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    /// shard split, which requires rewriting the whole shard. However, unlike LSM trees, this operation is
+    /// constant in size
+    pub fn set<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
         val: &B2,
-    ) -> Result<()> {
+    ) -> Result<SetStatus> {
         let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
-        self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Overwrite)?;
-        Ok(())
+        if let Some(prev) = self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Set)? {
+            Ok(SetStatus::PrevValue(prev))
+        } else {
+            Ok(SetStatus::CreatedNew)
+        }
     }
 
-    /// Gets the value of an entry or inserts the given default value. If the value existed, returns `Some(value)`.
-    /// If the value was created by this operation, `None`` is returned
-    pub fn get_or_insert_default<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    /// Replaces the value of an existing key with a new value. If the key existed, returns
+    /// `PrevValue(value)` with its old value, and if it did not, returns `DoesNotExist` but
+    /// does not create the key.
+    ///
+    /// See `set` for more details
+    pub fn replace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        val: &B2,
+    ) -> Result<ReplaceStatus> {
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
+        if let Some(prev) =
+            self.insert_internal(ph, key.as_ref(), val.as_ref(), InsertMode::Replace)?
+        {
+            Ok(ReplaceStatus::PrevValue(prev))
+        } else {
+            Ok(ReplaceStatus::DoesNotExist)
+        }
+    }
+
+    /// Gets the value of the given key or creates it with the given default value. If the key did not exist,
+    /// returns `CreatedNew(default_val)`, and if it did, returns `ExistingValue(value)`.
+    /// This is done atomically, so it can be used to create a key only if it did not exist before,
+    /// like `open` with `O_EXCL`.
+    ///
+    /// See `set` for more details
+    pub fn get_or_create<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
         default_val: &B2,
-    ) -> Result<Option<Vec<u8>>> {
-        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key.as_ref());
-        self.insert_internal(
-            ph,
-            key.as_ref(),
-            default_val.as_ref(),
-            InsertMode::GetOrInsert,
-        )
+    ) -> Result<GetOrCreateStatus> {
+        let key = key.as_ref();
+        let default_val = default_val.as_ref();
+        let ph = PartedHash::from_buffer(USER_NAMESPACE, &self.config.secret_key, key);
+        let res = self.insert_internal(ph, key, default_val, InsertMode::GetOrCreate)?;
+        if let Some(prev) = res {
+            Ok(GetOrCreateStatus::ExistingValue(prev))
+        } else {
+            Ok(GetOrCreateStatus::CreatedNew(default_val.to_owned()))
+        }
     }
 
-    /// Modifies an existing entry in-place, instead of creating a version. Note that the key must exist
+    /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist
     /// and `patch.len() + patch_offset` must be less than or equal to the current value's length.
     ///
     /// This is operation is NOT crash-safe as it overwrites existing data, and thus may produce inconsistent

@@ -19,15 +19,15 @@ fn test_logic() -> Result<()> {
         )?;
 
         assert!(db.get("my name")?.is_none());
-        db.insert("my_name", "inigo montoya")?;
-        db.insert("your_name", "dread pirate robert")?;
+        db.set("my_name", "inigo montoya")?;
+        db.set("your_name", "dread pirate robert")?;
 
         assert!(db.contains("my_name")?);
         assert!(!db.contains("My NaMe")?);
 
         assert_eq!(db.get("my_name")?, Some("inigo montoya".into()));
         assert_eq!(db.get("your_name")?, Some("dread pirate robert".into()));
-        db.insert("your_name", "vizzini")?;
+        db.set("your_name", "vizzini")?;
         assert_eq!(db.get("your_name")?, Some("vizzini".into()));
         assert_eq!(db.remove("my_name")?, Some("inigo montoya".into()));
         assert!(db.remove("my_name")?.is_none());
@@ -39,7 +39,7 @@ fn test_logic() -> Result<()> {
         assert_eq!(stats.num_splits, 0);
 
         for _ in 0..1000 {
-            db.insert(
+            db.set(
                 "a very long keyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
                 LONG_VAL,
             )?;
@@ -54,7 +54,7 @@ fn test_logic() -> Result<()> {
         assert_eq!(stats.num_splits, 0);
 
         for i in 0..1000 {
-            db.insert(&format!("unique key {i}"), LONG_VAL)?;
+            db.set(&format!("unique key {i}"), LONG_VAL)?;
         }
 
         let stats2 = db.stats();
@@ -76,7 +76,7 @@ fn test_logic() -> Result<()> {
         );
 
         for i in 0..1000 {
-            db.insert(&format!("unique key {i}"), LONG_VAL)?;
+            db.set(&format!("unique key {i}"), LONG_VAL)?;
         }
 
         let mut all_keys = HashSet::new();

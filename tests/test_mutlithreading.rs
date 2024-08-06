@@ -33,7 +33,7 @@ fn test_multithreaded() -> Result<()> {
                     let value = format!("data{thid}");
                     for i in 0..NUM_ITEMS {
                         let key = format!("key{i}");
-                        db.insert(&key, &value)?;
+                        db.set(&key, &value)?;
 
                         if random::<f32>() > 0.8 {
                             if db.remove(&key)?.is_some() {

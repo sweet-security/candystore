@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let db1 = db.clone();
     let h1 = std::thread::spawn(move || -> Result<()> {
         for i in 0..100 {
-            db1.insert(&format!("key{i}"), "thread 1")?;
+            db1.set(&format!("key{i}"), "thread 1")?;
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     let db2 = db.clone();
     let h2 = std::thread::spawn(move || -> Result<()> {
         for i in 0..100 {
-            db2.insert(&format!("key{i}"), "thread 2")?;
+            db2.set(&format!("key{i}"), "thread 2")?;
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())

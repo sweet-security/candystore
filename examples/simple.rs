@@ -11,7 +11,7 @@ fn main() -> Result<()> {
 
     println!("{:?}", db.get("mykey")?); // None
 
-    db.insert("mykey", "myval")?;
+    db.set("mykey", "myval")?;
     println!("{:?}", db.get("mykey")?); // Some([109, 121, 118, 97, 108])
 
     println!("{:?}", db.remove("mykey")?); // Some([109, 121, 118, 97, 108])
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     println!("{:?}", db.get("mykey")?); // None
 
     for i in 0..10 {
-        db.insert(&format!("mykey{i}"), &format!("myval{i}"))?;
+        db.set(&format!("mykey{i}"), &format!("myval{i}"))?;
     }
     for res in db.iter() {
         let (k, v) = res?;

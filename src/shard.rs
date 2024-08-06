@@ -52,7 +52,8 @@ const _: () = assert!(HEADER_SIZE % 4096 == 0);
 #[derive(Debug)]
 pub(crate) enum InsertStatus {
     Added,
-    Replaced,
+    Replaced(Vec<u8>),
+    KeyDoesNotExist,
     CompactionNeeded(u32),
     SplitNeeded,
     AlreadyExists(Vec<u8>),
@@ -60,8 +61,9 @@ pub(crate) enum InsertStatus {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InsertMode {
-    Overwrite,
-    GetOrInsert,
+    Set,
+    Replace,
+    GetOrCreate,
 }
 
 pub(crate) struct ByHashIterator<'a> {
@@ -96,6 +98,12 @@ pub(crate) struct Shard {
     mmap: MmapMut, // needed to prevent it from dropping
     pub(crate) header: &'static mut ShardHeader,
     pub(crate) row_locks: Vec<RwLock<()>>,
+}
+
+enum TryReplaceStatus {
+    KeyDoesNotExist,
+    KeyExistsNotReplaced(Vec<u8>),
+    KeyExistsReplaced(Vec<u8>),
 }
 
 impl Shard {
@@ -233,17 +241,17 @@ impl Shard {
         key: &[u8],
         val: &[u8],
         mode: InsertMode,
-    ) -> Result<(bool, Option<Vec<u8>>)> {
+    ) -> Result<TryReplaceStatus> {
         let mut start = 0;
         while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
             let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
                 match mode {
-                    InsertMode::GetOrInsert => {
+                    InsertMode::GetOrCreate => {
                         // no-op, key already exists
-                        return Ok((true, Some(v)));
+                        return Ok(TryReplaceStatus::KeyExistsNotReplaced(v));
                     }
-                    InsertMode::Overwrite => {
+                    InsertMode::Set | InsertMode::Replace => {
                         // optimization
                         if val != v {
                             row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
@@ -251,13 +259,13 @@ impl Shard {
                                 .wasted_bytes
                                 .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
                         }
-                        return Ok((true, None));
+                        return Ok(TryReplaceStatus::KeyExistsReplaced(v));
                     }
                 }
             }
             start = idx + 1;
         }
-        Ok((false, None))
+        Ok(TryReplaceStatus::KeyDoesNotExist)
     }
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
@@ -297,27 +305,31 @@ impl Shard {
         // see if we replace an existing key
         let (_guard, row) = self.get_row_mut(ph);
 
-        let (found, existing_val) = self.try_replace(row, ph, key, val, mode)?;
-        if found {
-            if let Some(existing_val) = existing_val {
-                return Ok(InsertStatus::AlreadyExists(existing_val));
-            } else {
-                return Ok(InsertStatus::Replaced);
+        match self.try_replace(row, ph, key, val, mode)? {
+            TryReplaceStatus::KeyDoesNotExist => {
+                if matches!(mode, InsertMode::Replace) {
+                    return Ok(InsertStatus::KeyDoesNotExist);
+                }
+
+                // find an empty slot
+                if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
+                    let new_off = self.write_kv(key, val)?;
+
+                    // we don't want a reorder to happen here - first write the offset, then the signature
+                    row.offsets_and_sizes[idx] = new_off;
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    row.signatures[idx] = ph.signature;
+                    self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
+                    Ok(InsertStatus::Added)
+                } else {
+                    // no room in this row, must split
+                    Ok(InsertStatus::SplitNeeded)
+                }
             }
-        }
-
-        // find an empty slot
-        if let Some(idx) = row.signatures.iter().position_simd(INVALID_SIG) {
-            let new_off = self.write_kv(key, val)?;
-
-            row.offsets_and_sizes[idx] = new_off;
-            std::sync::atomic::fence(Ordering::SeqCst);
-            row.signatures[idx] = ph.signature;
-            self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
-            Ok(InsertStatus::Added)
-        } else {
-            // no room in this row, must split
-            Ok(InsertStatus::SplitNeeded)
+            TryReplaceStatus::KeyExistsNotReplaced(existing) => {
+                Ok(InsertStatus::AlreadyExists(existing))
+            }
+            TryReplaceStatus::KeyExistsReplaced(existing) => Ok(InsertStatus::Replaced(existing)),
         }
     }
 

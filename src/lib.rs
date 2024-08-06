@@ -1,12 +1,13 @@
 #![feature(btree_cursors)]
 
 mod hashing;
-mod insert;
+mod insertion;
 mod shard;
 mod store;
 mod typed;
 
 pub use hashing::SecretKey;
+pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
 pub use typed::{VickyTypedKey, VickyTypedStore};

@@ -17,7 +17,7 @@ fn test_loading() -> Result<()> {
             let db = VickyStore::open(dir, config.clone())?;
 
             for i in 0..1000 {
-                db.insert(&format!("unique key {i}"), LONG_VAL)?;
+                db.set(&format!("unique key {i}"), LONG_VAL)?;
             }
 
             assert!(db.stats().num_splits > 1);

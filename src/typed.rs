@@ -1,6 +1,9 @@
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
-use crate::VickyStore;
+use crate::{
+    insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus},
+    VickyStore,
+};
 
 use databuf::{config::num::LE, DecodeOwned, Encode, Result};
 
@@ -83,16 +86,22 @@ where
         }
     }
 
-    pub fn insert(&self, k: K, v: V) -> Result<()> {
+    pub fn replace(&self, k: K, v: V) -> Result<ReplaceStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.insert(&kbytes, &vbytes)
+        self.store.replace(&kbytes, &vbytes)
     }
 
-    pub fn get_or_insert_default(&self, k: K, v: V) -> Result<Option<Vec<u8>>> {
+    pub fn set(&self, k: K, v: V) -> Result<SetStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.get_or_insert_default(&kbytes, &vbytes)
+        self.store.set(&kbytes, &vbytes)
+    }
+
+    pub fn get_or_create(&self, k: K, v: V) -> Result<GetOrCreateStatus> {
+        let kbytes = Self::make_key(&k);
+        let vbytes = v.to_bytes::<LE>();
+        self.store.get_or_create(&kbytes, &vbytes)
     }
 
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>

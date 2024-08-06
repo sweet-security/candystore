@@ -37,6 +37,7 @@ pub(crate) const USER_NAMESPACE: u8 = 1;
 //pub(crate) const TYPED_NAMESPACE: u8 = 2;
 
 impl PartedHash {
+    #[allow(dead_code)]
     pub const LEN: usize = size_of::<u64>();
 
     fn from_hash(h: Hash128) -> Self {
@@ -69,11 +70,13 @@ impl PartedHash {
         PartedHashBuilder(SipHasher24::new_with_key(&key.0))
     }
 
+    #[allow(dead_code)]
     pub fn to_u64(&self) -> u64 {
         ((self.shard_selector as u64) << 48)
             | ((self.row_selector as u64) << 32)
             | (self.signature as u64)
     }
+    #[allow(dead_code)]
     pub fn from_u64(val: u64) -> Self {
         Self {
             shard_selector: (val >> 48) as u16,
@@ -82,9 +85,11 @@ impl PartedHash {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_bytes(&self) -> [u8; Self::LEN] {
         self.to_u64().to_le_bytes()
     }
+    #[allow(dead_code)]
     pub fn from_bytes(b: &[u8]) -> Self {
         assert_eq!(b.len(), Self::LEN);
         let buf: [u8; 8] = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];

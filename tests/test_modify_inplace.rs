@@ -16,7 +16,7 @@ fn test_modify_inplace() -> Result<()> {
             },
         )?;
 
-        db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+        db.set("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
         assert_eq!(
             db.modify_inplace("zzz", "bbb", 7).unwrap_err().to_string(),

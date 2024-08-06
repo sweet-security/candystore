@@ -289,6 +289,7 @@ impl VickyStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<(Vec<u8>, Vec<u8>)>> {
         self.shards
             .read()

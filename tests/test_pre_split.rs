@@ -17,7 +17,7 @@ fn test_pre_split() -> Result<()> {
             },
         )?;
 
-        db.insert("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+        db.set("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
         let files = std::fs::read_dir(&dir)?
             .map(|res| res.unwrap().file_name().to_string_lossy().to_string())
