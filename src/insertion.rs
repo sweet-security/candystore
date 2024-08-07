@@ -130,7 +130,7 @@ impl VickyStore {
             let (k, v) = res?;
 
             let ph = PartedHash::new(&self.config.hash_seed, &k);
-            let status = if (ph.shard_selector as u32) < midpoint {
+            let status = if (ph.shard_selector() as u32) < midpoint {
                 bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
             } else {
                 top_shard.insert(ph, &k, &v, InsertMode::Set)?
@@ -172,7 +172,7 @@ impl VickyStore {
         mode: InsertMode,
     ) -> Result<(InsertStatus, u32, u32)> {
         let guard = self.shards.read().unwrap();
-        let cursor = guard.lower_bound(Bound::Excluded(&(ph.shard_selector as u32)));
+        let cursor = guard.lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)));
         let shard_start = cursor
             .peek_prev()
             .map(|(&shard_start, _)| shard_start)

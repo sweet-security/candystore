@@ -14,6 +14,8 @@ use crate::{Config, Result};
 
 pub(crate) const USER_NAMESPACE: &[u8] = &[1];
 pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
+pub(crate) const COLL_NAMESPACE: &[u8] = &[3];
+pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 
 /// Stats from VickyStore, mainly useful for debugging
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -306,12 +308,11 @@ impl VickyStore {
         full_key
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<KVPair>> {
         self.shards
             .read()
             .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
             .1
@@ -333,7 +334,7 @@ impl VickyStore {
         self.shards
             .read()
             .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
             .1
@@ -345,7 +346,7 @@ impl VickyStore {
         self.shards
             .read()
             .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
             .1
@@ -370,7 +371,7 @@ impl VickyStore {
             .shards
             .read()
             .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
             .1

@@ -226,14 +226,14 @@ impl Shard {
     }
 
     pub(crate) fn iter_by_hash<'a>(&'a self, ph: PartedHash) -> ByHashIterator<'a> {
-        let row_idx = (ph.row_selector as usize) % NUM_ROWS;
+        let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
         let guard = self.row_locks[row_idx].read().unwrap();
         let row = &self.header.rows.0[row_idx];
         ByHashIterator {
             shard: &self,
             _guard: guard,
             row,
-            signature: ph.signature,
+            signature: ph.signature(),
             start_idx: 0,
         }
     }
@@ -257,7 +257,7 @@ impl Shard {
         mode: InsertMode,
     ) -> Result<TryReplaceStatus> {
         let mut start = 0;
-        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
+        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
             let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
                 match mode {
@@ -283,7 +283,7 @@ impl Shard {
     }
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
-        let row_idx = (ph.row_selector as usize) % NUM_ROWS;
+        let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
         let guard = self.row_locks[row_idx].write().unwrap();
         // this is safe because we hold a write lock on the row. the row sits in an mmap, so it can't be
         // owned by the lock itself
@@ -329,7 +329,7 @@ impl Shard {
                     // we don't want a reorder to happen here - first write the offset, then the signature
                     row.offsets_and_sizes[idx] = new_off;
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    row.signatures[idx] = ph.signature;
+                    row.signatures[idx] = ph.signature();
                     self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
                     Ok(InsertStatus::Added)
                 } else {
@@ -369,7 +369,7 @@ impl Shard {
         let (_guard, row) = self.get_row_mut(ph);
 
         let mut start = 0;
-        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature) {
+        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
             let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
                 return func(&self, row, ph, Some((idx, k, v)));

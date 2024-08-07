@@ -5,7 +5,7 @@ use vicky_store::{Config, GetOrCreateStatus, Result, SetStatus, VickyStore};
 use crate::common::run_in_tempdir;
 
 #[test]
-fn test_get_or_insert_default() -> Result<()> {
+fn test_atomics() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = VickyStore::open(dir, Config::default())?;
 

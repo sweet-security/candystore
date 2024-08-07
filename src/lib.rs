@@ -1,5 +1,6 @@
 #![feature(btree_cursors)]
 
+mod collections;
 mod hashing;
 mod insertion;
 mod shard;
