@@ -299,6 +299,7 @@ impl VickyStore {
         self.get_or_create_raw(&self.make_user_key(key.as_ref()), default_val.as_ref())
     }
 
+    // this is NOT crash safe (may produce inconsistent results)
     pub(crate) fn modify_inplace_raw(
         &self,
         full_key: &[u8],
@@ -306,15 +307,25 @@ impl VickyStore {
         patch_offset: usize,
         expected: Option<&[u8]>,
     ) -> Result<bool> {
-        let ph = PartedHash::new(&self.config.hash_seed, &full_key);
-        self.shards
-            .read()
-            .unwrap()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
-            .peek_next()
-            .unwrap()
-            .1
-            .modify_inplace(ph, full_key, patch, patch_offset, expected)
+        self.operate_on_key_mut(full_key, |shard, row, _ph, idx_kv| {
+            let Some((idx, _k, v)) = idx_kv else {
+                return Err(Box::new(VickyError::KeyNotFound));
+            };
+
+            let (klen, vlen, offset) = Shard::extract_offset_and_size(row.offsets_and_sizes[idx]);
+            if patch_offset + patch.len() > vlen as usize {
+                return Err(Box::new(VickyError::ValueTooLong));
+            }
+
+            if let Some(expected) = expected {
+                if &v[patch_offset..patch_offset + patch.len()] != expected {
+                    return Ok(false);
+                }
+            }
+
+            shard.write_raw(patch, offset + klen as u64 + patch_offset as u64)?;
+            Ok(true)
+        })
     }
 
     /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist

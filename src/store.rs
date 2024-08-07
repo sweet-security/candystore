@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use crate::shard::{Shard, NUM_ROWS, ROW_WIDTH};
+use crate::shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH};
 use crate::{hashing::PartedHash, shard::KVPair};
 use crate::{Config, Result};
 
@@ -317,6 +317,27 @@ impl VickyStore {
             .1
             .iter_by_hash(ph)
             .collect::<Vec<_>>()
+    }
+
+    pub(crate) fn operate_on_key_mut<T>(
+        &self,
+        key: &[u8],
+        func: impl FnOnce(
+            &Shard,
+            &mut ShardRow,
+            PartedHash,
+            Option<(usize, Vec<u8>, Vec<u8>)>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let ph = PartedHash::new(&self.config.hash_seed, key);
+        self.shards
+            .read()
+            .unwrap()
+            .lower_bound(Bound::Excluded(&(ph.shard_selector as u32)))
+            .peek_next()
+            .unwrap()
+            .1
+            .operate_on_key_mut(ph, key, func)
     }
 
     pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
