@@ -1,6 +1,6 @@
 mod common;
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 
 use vicky_store::{Config, Result, VickyStore, VickyTypedCollection};
 
@@ -108,6 +108,80 @@ fn test_typed_collections() -> Result<()> {
             .map(|res| res.unwrap().1)
             .collect::<Vec<_>>();
         assert_eq!(items, vec![2005, 2009, 2008]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_collections_multithreading() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+
+        let removed = Arc::new(AtomicUsize::new(0));
+        let created = Arc::new(AtomicUsize::new(0));
+        let gotten = Arc::new(AtomicUsize::new(0));
+        let replaced = Arc::new(AtomicUsize::new(0));
+
+        let num_thds = 10;
+        let num_iters = 1000;
+
+        let mut handles = vec![];
+        for thd in 0..num_thds {
+            let db = db.clone();
+            let removed = removed.clone();
+            let created = created.clone();
+            let replaced = replaced.clone();
+            let gotten = gotten.clone();
+            let h = std::thread::spawn(move || {
+                for _ in 0..num_iters {
+                    let idx1: u8 = rand::random();
+                    if db
+                        .set_in_collection("xxx", &format!("key{idx1}"), &format!("val-{thd}"))?
+                        .was_created()
+                    {
+                        created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        replaced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+
+                    std::thread::yield_now();
+
+                    let idx2: u8 = rand::random();
+                    if let Some(v) = db.get_from_collection("xxx", &format!("key{idx2}"))? {
+                        assert!(v.starts_with(b"val-"));
+                        gotten.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+
+                    std::thread::yield_now();
+                    let idx3: u8 = rand::random();
+                    if db
+                        .remove_from_collection("xxx", &format!("key{idx3}"))?
+                        .is_some()
+                    {
+                        removed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    std::thread::yield_now();
+                }
+                Result::<()>::Ok(())
+            });
+            handles.push(h);
+        }
+
+        for h in handles {
+            h.join().unwrap()?;
+        }
+
+        let reamining = db.iter_collection("xxx").count();
+        let created = created.load(std::sync::atomic::Ordering::SeqCst);
+        let replaced = replaced.load(std::sync::atomic::Ordering::SeqCst);
+        let removed = removed.load(std::sync::atomic::Ordering::SeqCst);
+        let gotten = gotten.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(created - removed, reamining);
+        assert_eq!(created + replaced, num_iters * num_thds);
+
+        println!("created={created} replaced={replaced} removed={removed} gotten={gotten} reamining={reamining}");
 
         Ok(())
     })

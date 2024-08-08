@@ -256,7 +256,7 @@ impl VickyStore {
         }
     }
 
-    pub fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
+    pub(crate) fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
         if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Set)? {
             Ok(SetStatus::PrevValue(prev))
         } else {
