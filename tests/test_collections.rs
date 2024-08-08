@@ -2,7 +2,9 @@ mod common;
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use vicky_store::{Config, Result, VickyStore, VickyTypedCollection};
+use vicky_store::{
+    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedCollection,
+};
 
 use crate::common::run_in_tempdir;
 
@@ -182,6 +184,47 @@ fn test_collections_multithreading() -> Result<()> {
         assert_eq!(created + replaced, num_iters * num_thds);
 
         println!("created={created} replaced={replaced} removed={removed} gotten={gotten} reamining={reamining}");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_collections_atomics() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = VickyStore::open(dir, Config::default())?;
+
+        assert_eq!(
+            db.get_or_create_in_collection("xxx", "yyy", "1")?,
+            GetOrCreateStatus::CreatedNew("1".into())
+        );
+
+        assert_eq!(
+            db.get_or_create_in_collection("xxx", "yyy", "2")?,
+            GetOrCreateStatus::ExistingValue("1".into())
+        );
+
+        assert_eq!(
+            db.replace_in_collection("xxx", "yyy", "3")?,
+            ReplaceStatus::PrevValue("1".into())
+        );
+
+        assert_eq!(
+            db.replace_in_collection("xxx", "zzz", "3")?,
+            ReplaceStatus::DoesNotExist
+        );
+
+        assert_eq!(
+            db.get_or_create_in_collection("xxx", "yyy", "7")?,
+            GetOrCreateStatus::ExistingValue("3".into())
+        );
+
+        assert_eq!(
+            db.set_in_collection("xxx", "yyy", "4")?,
+            SetStatus::PrevValue("3".into())
+        );
+
+        assert_eq!(db.get_from_collection("xxx", "yyy")?, Some("4".into()));
 
         Ok(())
     })

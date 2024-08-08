@@ -2,9 +2,9 @@ use std::sync::MutexGuard;
 
 use crate::{
     hashing::PartedHash,
-    shard::KVPair,
+    shard::{InsertMode, KVPair},
     store::{ITEM_NAMESPACE, LIST_NAMESPACE},
-    GetOrCreateStatus, ModifyStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
+    GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
 };
 
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
@@ -69,7 +69,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
             Ok(kv) => kv,
         };
         let Some((mut k, mut v)) = kv else {
-            return Some(Err(Box::new(VickyError::BrokenList)));
+            return Some(Err(Box::new(VickyError::CorruptedLinkedList)));
         };
         k.truncate(k.len() - ITEM_SUFFIX_LEN);
         let chain = chain_of(&v);
@@ -118,36 +118,43 @@ impl VickyStore {
         Ok(None)
     }
 
-    pub fn set_in_collection<
-        B1: AsRef<[u8]> + ?Sized,
-        B2: AsRef<[u8]> + ?Sized,
-        B3: AsRef<[u8]> + ?Sized,
-    >(
+    fn _insert_to_collection(
         &self,
-        coll_key: &B1,
-        item_key: &B2,
-        val: &B3,
+        coll_key: &[u8],
+        item_key: &[u8],
+        val: &[u8],
+        mode: InsertMode,
     ) -> Result<SetStatus> {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
-        let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
+        let (coll_ph, coll_key) = self.make_coll_key(coll_key);
+        let (item_ph, item_key) = self.make_item_key(coll_ph, item_key);
 
         let _guard = self.lock_collection(coll_ph);
 
         // if the item already exists, it means it belongs to this list. we just need to update the value and
         // keep the existing chain part
-        if let Some(old_val) = self.get_raw(&item_key)? {
+        if let Some(mut old_val) = self.get_raw(&item_key)? {
+            if matches!(mode, InsertMode::GetOrCreate) {
+                // don't replace the existing value
+                old_val.truncate(old_val.len() - size_of::<Chain>());
+                return Ok(SetStatus::PrevValue(old_val));
+            }
+
             let mut new_val = val.as_ref().to_owned();
             new_val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
             match self.replace_raw(&item_key, &new_val)? {
                 ReplaceStatus::DoesNotExist => {
-                    // another thread deleted this entry, but that's acceptable
-                    return Ok(SetStatus::CreatedNew);
+                    return Err(Box::new(VickyError::CorruptedLinkedList));
                 }
                 ReplaceStatus::PrevValue(mut v) => {
                     v.truncate(v.len() - size_of::<Chain>());
                     return Ok(SetStatus::PrevValue(v));
                 }
             }
+        }
+
+        if matches!(mode, InsertMode::Replace) {
+            // not allowed to create
+            return Ok(SetStatus::CreatedNew);
         }
 
         // item does not exist, and the list itself might also not exist. get or create the list
@@ -175,15 +182,15 @@ impl VickyStore {
 
         // the list already existed, which means we need to read the last element (tail) and update its pointers
         let Some((last_k, last_v)) = self._get_from_collection(coll_ph, curr_list.tail)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
 
-        //  list [h  t]                \\         list [h  t]
+        //  list [h  t]                           list [h  t]
         //        |  \_____             \\              |  \________________
         //        |        \             \\             |                   \
         //       item1     item2         //            item1     item2      item3
         //        n---------^ n--X      //              n---------^ n--------^ n--X
-        //    X__p \________p          //           X__p \________p \_________p
+        //    X__p \________p                       X__p \________p \_________p
 
         let mut last_chain = chain_of(&last_v);
         last_chain.next = item_ph;
@@ -201,35 +208,92 @@ impl VickyStore {
         // first create the new item, then update last_k, then update the list
 
         if self.set_raw(&item_key, &this_val)?.was_replaced() {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
-        match self.modify_inplace_raw(
-            &last_k,
-            bytes_of(&last_chain),
-            last_v.len() - size_of::<Chain>(),
-            Some(&last_v[last_v.len() - size_of::<Chain>()..]),
-        )? {
-            ModifyStatus::DoesNotExist => return Err(Box::new(VickyError::BrokenList)),
-            ModifyStatus::PrevValue(_) => {}     // success
-            ModifyStatus::ValueMismatch(_) => {} // retry
-            ModifyStatus::ValueTooLong(_, _, _) => return Err(Box::new(VickyError::BrokenList)),
-            ModifyStatus::WrongLength(_, _) => return Err(Box::new(VickyError::BrokenList)),
+        if !self
+            .modify_inplace_raw(
+                &last_k,
+                bytes_of(&last_chain),
+                last_v.len() - size_of::<Chain>(),
+                Some(&last_v[last_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
-        match self.modify_inplace_raw(
-            &coll_key,
-            bytes_of(&new_list),
-            0,
-            Some(bytes_of(&curr_list)),
+        if !self
+            .modify_inplace_raw(
+                &coll_key,
+                bytes_of(&new_list),
+                0,
+                Some(bytes_of(&curr_list)),
+            )?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::CorruptedLinkedList));
+        }
+        Ok(SetStatus::CreatedNew)
+    }
+
+    pub fn set_in_collection<
+        B1: AsRef<[u8]> + ?Sized,
+        B2: AsRef<[u8]> + ?Sized,
+        B3: AsRef<[u8]> + ?Sized,
+    >(
+        &self,
+        coll_key: &B1,
+        item_key: &B2,
+        val: &B3,
+    ) -> Result<SetStatus> {
+        self._insert_to_collection(
+            coll_key.as_ref(),
+            item_key.as_ref(),
+            val.as_ref(),
+            InsertMode::Set,
+        )
+    }
+
+    pub fn replace_in_collection<
+        B1: AsRef<[u8]> + ?Sized,
+        B2: AsRef<[u8]> + ?Sized,
+        B3: AsRef<[u8]> + ?Sized,
+    >(
+        &self,
+        coll_key: &B1,
+        item_key: &B2,
+        val: &B3,
+    ) -> Result<ReplaceStatus> {
+        match self._insert_to_collection(
+            coll_key.as_ref(),
+            item_key.as_ref(),
+            val.as_ref(),
+            InsertMode::Replace,
         )? {
-            ModifyStatus::DoesNotExist => return Err(Box::new(VickyError::BrokenList)),
-            ModifyStatus::PrevValue(_) => {
-                return Ok(SetStatus::CreatedNew);
-            }
-            ModifyStatus::ValueMismatch(_) => return Err(Box::new(VickyError::BrokenList)),
-            ModifyStatus::ValueTooLong(_, _, _) => return Err(Box::new(VickyError::BrokenList)),
-            ModifyStatus::WrongLength(_, _) => return Err(Box::new(VickyError::BrokenList)),
+            SetStatus::CreatedNew => Ok(ReplaceStatus::DoesNotExist),
+            SetStatus::PrevValue(v) => Ok(ReplaceStatus::PrevValue(v)),
+        }
+    }
+
+    pub fn get_or_create_in_collection<
+        B1: AsRef<[u8]> + ?Sized,
+        B2: AsRef<[u8]> + ?Sized,
+        B3: AsRef<[u8]> + ?Sized,
+    >(
+        &self,
+        coll_key: &B1,
+        item_key: &B2,
+        val: &B3,
+    ) -> Result<GetOrCreateStatus> {
+        match self._insert_to_collection(
+            coll_key.as_ref(),
+            item_key.as_ref(),
+            val.as_ref(),
+            InsertMode::GetOrCreate,
+        )? {
+            SetStatus::CreatedNew => Ok(GetOrCreateStatus::CreatedNew(val.as_ref().to_owned())),
+            SetStatus::PrevValue(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
         }
     }
 
@@ -280,14 +344,14 @@ impl VickyStore {
         list.tail = chain.prev;
 
         let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
         let mut prev_chain = chain_of(&prev_v);
@@ -319,14 +383,14 @@ impl VickyStore {
         list.head = chain.next;
 
         let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
         let mut next_chain = chain_of(&next_v);
@@ -340,7 +404,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
         self.remove_raw(&item_key)?;
@@ -362,17 +426,17 @@ impl VickyStore {
         assert_ne!(chain.prev, PartedHash::INVALID);
 
         let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
         let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
         let mut prev_chain = chain_of(&prev_v);
@@ -389,7 +453,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
         if !self
             .modify_inplace_raw(
@@ -400,7 +464,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         }
 
         self.remove_raw(&item_key)?;
@@ -422,7 +486,7 @@ impl VickyStore {
         };
 
         let Some(list_buf) = self.get_raw(&coll_key)? else {
-            return Err(Box::new(VickyError::BrokenList));
+            return Err(Box::new(VickyError::CorruptedLinkedList));
         };
         let mut list = *from_bytes::<LinkedList>(&list_buf);
         let chain = chain_of(&v);

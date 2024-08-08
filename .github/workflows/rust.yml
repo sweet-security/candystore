@@ -24,3 +24,7 @@ jobs:
       run: cargo run --example simple
     - name: Run multithreaded example
       run: cargo run --example multithreaded
+    - name: Run collections example
+      run: cargo run --example collections
+    - name: Run typed example
+      run: cargo run --example typed
