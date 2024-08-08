@@ -2,6 +2,54 @@
 A pure rust implementation of a fast, persistent, in-process key-value store, that relies on a novel sharding 
 mechanism. 
 
+## Overview
+```
++----------+----------+-----------------------+      The key is hashed, producing a 64 bit number
+|  shard   |   row    |       signature       |      - The 16 MSB bits select the shard 
+| selector | selector |                       |      - The following 16 bits select the row in 
+|   (16)   |   (16)   |         (32)          |        the shard
++----------+----------+-----------------------+      - The remaining 32 bits serve as a signature    
+    |            |         |                           matched against the signature array within
+    \___________ | _______ |____________________       the selected row using SIMD. The row also
+   ______________/         |                    \      stores the file offset and entry size
+  /                        |                     |
+  |    ___________________ | _______ shard file [n..m) ______________________________
+  |   /                    |                                                         \
+  |   |     rows           \_________                                                |
+  |   |   .------.                   \                                               |
+  |   |   |  0   |                   |                                               |
+  |   |   |______|     ___________________-_-_______                                 |
+  |   |   |  1   |    |  0  |  1  |  2  |     | 511 |                                |
+  |   |   |______|    |_____|_____|_____|     |_____|  _____ 32 bit signature        |
+  +-----> |  2   |--> | sig | sig | sig | ... | sig | /                              |
+      |   |______|    |_____|_____|_____|     |_____|                                |
+      |   |      |    | off | off | off |     | off |                                |
+      |   \   .  \    |_____|_____|_____|_-_-_|_____| \_____ file offset             |
+      |   /   .  /                                           and entry size          |
+      |   \   .  \                                                                   |
+      |   |______|                                                                   |
+      |   |  63  |                                                                   |
+      |   |______|                                                                   |
+      \______________________________________________________________________________/
+```
+
+
+When a shard file gets too big, or when one of its rows becomes full, it undergoes a split.
+This operation takes all entries and splits them into a bottom half and a top half (of roughly
+equal sizes). So if the file covered shards [0-65536), after the split we have two files,
+one covering [0-32768) and the other covering [32768-65536). This process repeats as needed,
+and essentially builds a tree of shard files.
+
+```
+           [0-65536)
+          /         \
+         /           \
+        [0-32768)    [32768-65536)
+       /         \
+      /           \
+    [0-16384)      [16384-32768)  
+```
+
 ## Example
 ```rust
 use vicky_store::{Config, Result, VickyStore};
@@ -62,8 +110,8 @@ The algorithm is straight forward:
   
 The default parameters (chosen by simulations) are shards with 64 rows, each with 512 entries. The chances 
 of collisions with these parameters are minimal, and they allow for ~90% utilization of the shard, while
-having relatively small header tables (32K entries, taking up 384KB). With the expected 90% utilization, it means
-you should be able to hold 29K keys per shard.
+having relatively small header tables (32K entries, taking up 384KB). With the expected 90% utilization, 
+you should be expect to hold 29K keys per shard.
 
 The concept can be extended to a distributed database, by adding a layer of master-shards that select a 
 server, followed by the normal sharding mechanism described above.
