@@ -8,7 +8,7 @@ mod store;
 mod typed;
 
 pub use hashing::HashSeed;
-pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
+pub use insertion::{GetOrCreateStatus, ModifyStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
 pub use typed::{VickyTypedKey, VickyTypedStore};
@@ -45,6 +45,7 @@ pub struct Config {
     pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
     pub hash_seed: HashSeed, // just some entropy, not so important unless you fear DoS
     pub expected_number_of_keys: usize, // hint for creating number of shards accordingly)
+    pub merge_small_shards: bool, // whether or not to merge small shards when items are removed
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             min_compaction_threashold: 8 * 1024 * 1024,
             hash_seed: HashSeed::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
             expected_number_of_keys: 0,
+            merge_small_shards: false,
         }
     }
 }

@@ -15,6 +15,35 @@ impl ReplaceStatus {
     pub fn was_replaced(&self) -> bool {
         matches!(*self, Self::PrevValue(_))
     }
+    pub fn is_key_missing(&self) -> bool {
+        matches!(*self, Self::DoesNotExist)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModifyStatus {
+    PrevValue(Vec<u8>),
+    DoesNotExist,
+    WrongLength(usize, usize),
+    ValueTooLong(usize, usize, usize),
+    ValueMismatch(Vec<u8>),
+}
+impl ModifyStatus {
+    pub fn was_replaced(&self) -> bool {
+        matches!(*self, Self::PrevValue(_))
+    }
+    pub fn is_mismatch(&self) -> bool {
+        matches!(*self, Self::ValueMismatch(_))
+    }
+    pub fn is_too_long(&self) -> bool {
+        matches!(*self, Self::ValueTooLong(_, _, _))
+    }
+    pub fn is_wrong_length(&self) -> bool {
+        matches!(*self, Self::WrongLength(_, _))
+    }
+    pub fn is_key_missing(&self) -> bool {
+        matches!(*self, Self::DoesNotExist)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,25 +335,25 @@ impl VickyStore {
         patch: &[u8],
         patch_offset: usize,
         expected: Option<&[u8]>,
-    ) -> Result<bool> {
+    ) -> Result<ModifyStatus> {
         self.operate_on_key_mut(full_key, |shard, row, _ph, idx_kv| {
             let Some((idx, _k, v)) = idx_kv else {
-                return Err(Box::new(VickyError::KeyNotFound));
+                return Ok(ModifyStatus::DoesNotExist);
             };
 
             let (klen, vlen, offset) = Shard::extract_offset_and_size(row.offsets_and_sizes[idx]);
             if patch_offset + patch.len() > vlen as usize {
-                return Err(Box::new(VickyError::ValueTooLong));
+                return Ok(ModifyStatus::ValueTooLong(patch_offset, patch.len(), vlen));
             }
 
             if let Some(expected) = expected {
                 if &v[patch_offset..patch_offset + patch.len()] != expected {
-                    return Ok(false);
+                    return Ok(ModifyStatus::ValueMismatch(v));
                 }
             }
 
             shard.write_raw(patch, offset + klen as u64 + patch_offset as u64)?;
-            Ok(true)
+            Ok(ModifyStatus::PrevValue(v))
         })
     }
 
@@ -341,12 +370,48 @@ impl VickyStore {
         patch: &B2,
         patch_offset: usize,
         expected: Option<&B2>,
-    ) -> Result<bool> {
+    ) -> Result<ModifyStatus> {
         self.modify_inplace_raw(
             &self.make_user_key(key.as_ref()),
             patch.as_ref(),
             patch_offset,
             expected.map(|b| b.as_ref()),
         )
+    }
+
+    pub(crate) fn replace_inplace_raw(
+        &self,
+        full_key: &[u8],
+        new_value: &[u8],
+    ) -> Result<ModifyStatus> {
+        self.operate_on_key_mut(full_key, |shard, row, _ph, idx_kv| {
+            let Some((idx, _k, v)) = idx_kv else {
+                return Ok(ModifyStatus::DoesNotExist);
+            };
+
+            let (klen, vlen, offset) = Shard::extract_offset_and_size(row.offsets_and_sizes[idx]);
+            if new_value.len() != vlen as usize {
+                return Ok(ModifyStatus::WrongLength(new_value.len(), vlen));
+            }
+
+            shard.write_raw(new_value, offset + klen as u64)?;
+            return Ok(ModifyStatus::PrevValue(v));
+        })
+    }
+
+    /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist
+    /// and `new_value.len()` must match exactly the existing value's length. This is mostly useful for binary
+    /// data.
+    ///
+    /// This is operation is NOT crash-safe as it overwrites existing data, and thus may produce inconsistent
+    /// results on crashes (reading part old data, part new data).
+    ///
+    /// This method will never trigger a shard split or a shard compaction.
+    pub fn replace_inplace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        new_value: &B2,
+    ) -> Result<ModifyStatus> {
+        self.replace_inplace_raw(&self.make_user_key(key.as_ref()), new_value.as_ref())
     }
 }

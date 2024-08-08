@@ -1,59 +1,56 @@
 mod common;
 
-use vicky_store::{Config, Result, VickyStore};
+use vicky_store::{Config, ModifyStatus, Result, VickyStore};
 
 use crate::common::run_in_tempdir;
 
 #[test]
 fn test_modify_inplace() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
-            dir,
-            Config {
-                max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
-                min_compaction_threashold: 10 * 1024,
-                ..Default::default()
-            },
-        )?;
+        let db = VickyStore::open(dir, Config::default())?;
 
         db.set("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
-        assert_eq!(
-            db.modify_inplace("zzz", "bbb", 7, None)
-                .unwrap_err()
-                .to_string(),
-            "key not found"
-        );
+        assert!(db.modify_inplace("zzz", "bbb", 7, None)?.is_key_missing());
 
-        assert_eq!(
+        assert!(matches!(
             db.modify_inplace(
                 "aaa",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 7,
                 None
-            )
-            .unwrap_err()
-            .to_string(),
-            "value too long",
-        );
+            )?,
+            ModifyStatus::ValueTooLong(_, _, _)
+        ));
 
-        assert!(db.modify_inplace("aaa", "bbb", 7, None)?);
+        assert!(db.modify_inplace("aaa", "bbb", 7, None)?.was_replaced());
         assert_eq!(
             db.get("aaa")?,
             Some("aaaaaaabbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
 
-        assert!(db.modify_inplace("aaa", "ccc", 10, Some("aaa"))?);
+        assert!(db
+            .modify_inplace("aaa", "ccc", 10, Some("aaa"))?
+            .was_replaced());
         assert_eq!(
             db.get("aaa")?,
             Some("aaaaaaabbbcccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
 
-        assert!(!db.modify_inplace("aaa", "ddd", 10, Some("aaa"))?);
+        assert!(db
+            .modify_inplace("aaa", "ddd", 10, Some("aaa"))?
+            .is_mismatch());
         assert_eq!(
             db.get("aaa")?,
             Some("aaaaaaabbbcccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
         );
+
+        assert!(db.replace_inplace("bbb", "ABCD")?.is_key_missing());
+        db.set("bbb", "ABCD")?;
+        assert!(db.replace_inplace("bbb", "BCDE")?.was_replaced());
+        assert!(db.replace_inplace("bbb", "xyz")?.is_wrong_length());
+        assert!(db.replace_inplace("bbb", "wyxyz")?.is_wrong_length());
+        assert_eq!(db.get("bbb")?, Some("BCDE".into()));
 
         Ok(())
     })

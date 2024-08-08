@@ -3,7 +3,7 @@ use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 use crate::{
     insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus},
     store::TYPED_NAMESPACE,
-    VickyStore,
+    ModifyStatus, VickyStore,
 };
 
 use databuf::{config::num::LE, DecodeOwned, Encode, Result};
@@ -93,6 +93,12 @@ where
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
         self.store.replace_raw(&kbytes, &vbytes)
+    }
+
+    pub fn replace_inplace(&self, k: K, v: V) -> Result<ModifyStatus> {
+        let kbytes = Self::make_key(&k);
+        let vbytes = v.to_bytes::<LE>();
+        self.store.replace_inplace_raw(&kbytes, &vbytes)
     }
 
     pub fn set(&self, k: K, v: V) -> Result<SetStatus> {

@@ -36,7 +36,7 @@ fn test_collections() -> Result<()> {
             db.set_in_collection("mycoll", &format!("key{i}"), &format!("xxx{i}"))?;
         }
         for i in 100..500 {
-            db.set_in_collection("mycoll", &format!("key{i}"), &format!("xxx{i}"))?;
+            db.set_in_collection("mycoll", &format!("key{i}"), &format!("yyy{i}"))?;
         }
         // for i in 800..500 {
         //     db._in_collection("mycoll", &format!("key{i}"), &format!("xxx{i}"))?;
