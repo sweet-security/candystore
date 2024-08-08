@@ -110,7 +110,10 @@ where
     pub fn get_or_create(&self, k: K, v: V) -> Result<GetOrCreateStatus> {
         let kbytes = Self::make_key(&k);
         let vbytes = v.to_bytes::<LE>();
-        self.store.get_or_create_raw(&kbytes, &vbytes)
+        match self.store.get_or_create_raw(&kbytes, &vbytes)? {
+            GetOrCreateStatus::CreatedNew(_) => Ok(GetOrCreateStatus::CreatedNew(vbytes)),
+            v @ GetOrCreateStatus::ExistingValue(_) => Ok(v),
+        }
     }
 
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>

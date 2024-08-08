@@ -292,7 +292,7 @@ impl VickyStore {
     /// `PrevValue(value)` with its old value, and if it did not, returns `DoesNotExist` but
     /// does not create the key.
     ///
-    /// See `set` for more details
+    /// See [Self::set] for more details
     pub fn replace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
@@ -310,7 +310,7 @@ impl VickyStore {
         if let Some(prev) = res {
             Ok(GetOrCreateStatus::ExistingValue(prev))
         } else {
-            Ok(GetOrCreateStatus::CreatedNew(default_val.to_owned()))
+            Ok(GetOrCreateStatus::CreatedNew(vec![]))
         }
     }
 
@@ -319,13 +319,18 @@ impl VickyStore {
     /// This is done atomically, so it can be used to create a key only if it did not exist before,
     /// like `open` with `O_EXCL`.
     ///
-    /// See `set` for more details
+    /// See [Self::set] for more details
     pub fn get_or_create<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
         default_val: &B2,
     ) -> Result<GetOrCreateStatus> {
-        self.get_or_create_raw(&self.make_user_key(key.as_ref()), default_val.as_ref())
+        match self.get_or_create_raw(&self.make_user_key(key.as_ref()), default_val.as_ref())? {
+            GetOrCreateStatus::CreatedNew(_) => Ok(GetOrCreateStatus::CreatedNew(
+                default_val.as_ref().to_owned(),
+            )),
+            v @ GetOrCreateStatus::ExistingValue(_) => Ok(v),
+        }
     }
 
     // this is NOT crash safe (may produce inconsistent results)

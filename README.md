@@ -62,10 +62,8 @@ server, followed by the normal sharding mechanism described above.
 * Requires nightly (for `simd_itertools` and BTree cursors), uses very little `unsafe` (required due to `mmap`)
 
 ## Roadmap
-* Add key-prefixes which can be used to implement grouping of keys into "families", i.e. lightweight indexing
-  by storing their parted-hash with an "anti collision" in a modifiable entry
 * Distributed protocol based on file locks (meant to run on a shared network folder)
-* Add some schema-like features, maybe using rkyv
 * Add generations as an adapter on top, so that older generations are compacted into exponentially larger 
   time spans. It's an alternative to TTL, and amortizes the number of times an entry will move around as the 
   dataset grows.
+* Maybe add Arithmethid coding/Huffman coding as a cheap compression for the keys and values

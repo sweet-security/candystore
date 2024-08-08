@@ -13,7 +13,7 @@ enum SetCollStatus {
     BlockMissing,
 }
 
-const NUM_HASHES_IN_BLOCK: usize = 512;
+const NUM_HASHES_IN_BLOCK: usize = 256;
 const COLLECTION_BLOCK: &[u8] = &[0u8; NUM_HASHES_IN_BLOCK * PartedHash::LEN];
 
 pub struct CollectionIterator<'a> {
@@ -76,7 +76,9 @@ impl<'a> Iterator for CollectionIterator<'a> {
 // * hold number of added entries, so we could start at the right block
 // * add number removed entries, and trigger compaction when this number gets to 0.5 of added entries
 // * maybe find a way to store these counters in an mmap?
-// * think of a way to create virtual-shards (same algorithm but use an underlying store instead of a file)
+// * may represent the block as "row" that covers a range of hashes. we begin with just one row and when
+//   it gets full, we split it into [0..2^31), [2^31..2^32)
+// * alternatively, hold a back-pointer from the entry to the block
 
 impl VickyStore {
     fn make_coll_key(&self, coll_key: &[u8]) -> (PartedHash, Vec<u8>) {
@@ -103,7 +105,15 @@ impl VickyStore {
         suffix
     }
 
-    fn _add_to_collection(&self, mut coll_key: Vec<u8>, item_ph: PartedHash) -> Result<()> {
+    fn _add_to_collection(&self, mut coll_key: Vec<u8>, item_ph: PartedHash) -> Result<u32> {
+        // the first block ("master block") is special:
+        // * the first entry holds the number of blocks in this collection
+        // * the second entry is made of two u32's, the lower one specified the number of items added
+        //   and the higher one, the number of items removed. the collection's len = added - removed.
+        //   when `removed > added / 2` we should trigger compaction
+
+        let master_coll_key = coll_key.clone();
+
         let block_idx_offset = coll_key.len() - (size_of::<u32>() + ITEM_NAMESPACE.len());
         let mut block_idx = 0u32;
         loop {
@@ -116,7 +126,15 @@ impl VickyStore {
                     let entries = unsafe {
                         std::slice::from_raw_parts(v.as_ptr() as *const u64, NUM_HASHES_IN_BLOCK)
                     };
-                    if let Some(free_idx) = entries.iter().position_simd(0u64) {
+
+                    let mut start = 0;
+                    if block_idx == 0 {
+                        block_idx = entries[0] as u32;
+                        start = 2;
+                    }
+
+                    let start = if block_idx == 0 { 1 } else { 0 };
+                    if let Some(free_idx) = entries[start..].iter().position_simd(0u64) {
                         let (klen, vlen, offset) =
                             Shard::extract_offset_and_size(row.offsets_and_sizes[row_idx]);
                         assert!(free_idx * PartedHash::LEN < vlen, "free_idx={free_idx}");
@@ -142,11 +160,12 @@ impl VickyStore {
                 }
                 SetCollStatus::BlockMissing => {
                     self.get_or_create_raw(&coll_key, COLLECTION_BLOCK)?;
+                    //self.modify_inplace_raw(&master_coll_key, patch, 0, Some(&0u32.to_le_bytes()))?;
                 }
             }
         }
 
-        Ok(())
+        Ok(0u32)
     }
 
     pub fn set_in_collection<
@@ -162,11 +181,17 @@ impl VickyStore {
         let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
         let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
 
-        let res = self.set_raw(&item_key, val.as_ref())?;
-        if res.was_created() {
-            self._add_to_collection(coll_key, item_ph)?;
+        // XXX: add a lock table so two threads won't insert the same item at the same time
+
+        let mut val = val.as_ref().to_owned();
+
+        if let Some(curr_buf) = self.get(&item_key)? {
+            val.extend_from_slice(&curr_buf[curr_buf.len() - size_of::<u32>()..]);
+        } else {
+            let block_idx = self._add_to_collection(coll_key, item_ph)?;
+            val.extend_from_slice(&block_idx.to_le_bytes());
         }
-        Ok(res)
+        self.set_raw(&item_key, val.as_ref())
     }
 
     pub fn replace_in_collection<
@@ -220,7 +245,7 @@ impl VickyStore {
         coll_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        let (coll_ph, mut coll_key) = self.make_coll_key(coll_key.as_ref());
+        /*let (coll_ph, mut coll_key) = self.make_coll_key(coll_key.as_ref());
         let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
 
         let Some(res) = self.remove_raw(&item_key)? else {
@@ -259,7 +284,8 @@ impl VickyStore {
             }
         }
 
-        Ok(Some(res))
+        Ok(Some(res))*/
+        Ok(None)
     }
 
     pub fn iter_collection<'a, B: AsRef<[u8]> + ?Sized>(
