@@ -3,28 +3,33 @@ A pure rust implementation of a fast, persistent, in-process key-value store, th
 mechanism. 
 
 ## Overview
+Being a hash-table, the key is hashed, producing a 64 bit number. The 16 most significant bits select 
+the *shard*, followed by 16 bits selecting the *row* in the shard, and the remaining 32 bits serve as an
+opaque signature. The signature is matched against the signature array within the selected row (using SIMD). 
+The row also stores the file offset of the entry, which is used to retrive the entry's key and value.
+
 ```
-+----------+----------+-----------------------+      The key is hashed, producing a 64 bit number
-|  shard   |   row    |       signature       |      - The 16 MSB bits select the shard 
-| selector | selector |                       |      - The following 16 bits select the row in 
-|   (16)   |   (16)   |         (32)          |        the shard
-+----------+----------+-----------------------+      - The remaining 32 bits serve as a signature    
-    |            |         |                           matched against the signature array within
-    \___________ | _______ |____________________       the selected row using SIMD. The row also
-   ______________/         |                    \      stores the file offset and entry size
++----------+----------+-----------------------+
+|  shard   |   row    |       signature       |
+| selector | selector |                       |
+|   (16)   |   (16)   |         (32)          |
++---|------+-----|----+----|------------------+
+    |            |         |
+    \___________ | _______ | ___________________
+   ______________/         |                    \
   /                        |                     |
   |    ___________________ | _______ shard file [n..m) ______________________________
   |   /                    |                                                         \
   |   |     rows           \_________                                                |
   |   |   .------.                   \                                               |
   |   |   |  0   |                   |                                               |
-  |   |   |______|     ___________________-_-_______                                 |
-  |   |   |  1   |    |  0  |  1  |  2  |     | 511 |                                |
-  |   |   |______|    |_____|_____|_____|     |_____|  _____ 32 bit signature        |
-  +-----> |  2   |--> | sig | sig | sig | ... | sig | /                              |
-      |   |______|    |_____|_____|_____|     |_____|                                |
-      |   |      |    | off | off | off |     | off |                                |
-      |   \   .  \    |_____|_____|_____|_-_-_|_____| \_____ file offset             |
+  |   |   |______|     ___________________/\/\_______                                |
+  |   |   |  1   |    |  0  |  1  |  2  |      | 511 |                               |
+  |   |   |______|    |_____|_____|_____|      |_____|  _____ 32 bit signatur        |
+  +-----> |  2   |--> | sig | sig | sig | ...  | sig | /                             |
+      |   |______|    |_____|_____|_____|      |_____|                               |
+      |   |      |    | off | off | off |      | off |                               |
+      |   \   .  \    |_____|_____|_____|_/\/\_|_____| \_____ file offset            |
       |   /   .  /                                           and entry size          |
       |   \   .  \                                                                   |
       |   |______|                                                                   |
@@ -33,22 +38,44 @@ mechanism.
       \______________________________________________________________________________/
 ```
 
+Each shard is mapped to a shard file, and a shard file can cover a wide range of consecutive shards.
+We begin with a single shard file covering the whole shard span of `[0-65536]`.
 
-When a shard file gets too big, or when one of its rows becomes full, it undergoes a split.
+When a shard file gets too big, or when one of its rows gets full, it undergoes a *split*.
 This operation takes all entries and splits them into a bottom half and a top half (of roughly
-equal sizes). So if the file covered shards [0-65536), after the split we have two files,
-one covering [0-32768) and the other covering [32768-65536). This process repeats as needed,
-and essentially builds a tree of shard files.
+equal sizes). For instance, if the file covered shards `[0-65536)`, after the split we have two files,
+one covering `[0-32768)` and the other covering `[32768-65536)`. This process repeats as needed,
+and essentially builds a tree of shard files. Each file is split independently, and the amount of work
+is constant (unlike LSM trees).
 
 ```
-           [0-65536)
-          /         \
-         /           \
-        [0-32768)    [32768-65536)
-       /         \
-      /           \
-    [0-16384)      [16384-32768)  
+               [0-65536)
+              /         \
+             /           \
+          [0-32768)    [32768-65536)
+         /         \
+        /           \
+    [0-16384)     [16384-32768)  
 ```
+
+The shard file's header (the rows, signatures and file offsets) are kept in an `mmap`, and the rest
+of the file's data is accessed using `pread` and `pwrite`. The file is only ever extended (until either
+a split or *compaction* takes place), so the algorithm is *crash safe*, in the sense that it will always
+return some valid version of a key-value pair, although it might lose unflushed data.
+
+The library puts its faith in the kernel's page cache, and assumes the `mmap` and writes are flushed to
+disk every so often. This allows us to forgo a journal or write-ahead log (WAL).
+
+The default parameters (chosen by simulations) are of shards with 64 rows, each with 512 entries. The chances 
+of collisions with these parameters are minimal, and they allow for ~90% utilization of the shard, while
+requiring relatively small header tables (32K entries, taking up 384KB). With the expected 90% utilization, 
+you should be expect to hold 29.5K keys per shard. For a shardm file of 64MB, that's 0.6% overhead.
+
+Because the data structure is a hash table rather than a search tree, insertion, lookup and removal are 
+all O(1) operations.
+
+The concept can be extended to a distributed database, by adding a layer of master-shards that select a 
+server, followed by the normal sharding mechanism described above.
 
 ## Example
 ```rust
@@ -90,31 +117,9 @@ for res in db.iter_collections("mycoll") {
 * No Write-Ahead Log (WAL) or journalling of any kind
 * Crash safe: you may lose the latest operations, but never be in an inconsistent state
 * Splitting/compaction happens per-shard, so there's no global locking
-* Suitable for both write-heavy/read-heavy workloads
+* Suitable for both write-heavy and read-heavy workloads
 * Concurrent by design (multiple threads getting/setting/removing keys at the same time)
 * The backing store is taken to be an SSD, thus it's not optimized for HDDs
-
-## Algorithm
-The algorithm is straight forward: 
-* A key is hashed, producing 64 bits of hash. The most significant 16 bits are taken to be "shard selector", followed
-  by 16 bits of "row selector", followed by 32 bits of "signature".
-* The shard selector selects a shard, which maps to a file in a directory.
-* At first, we have a shard that covers the range `[0..65535]`, so all shard selectors map to the same file.
-* When the file grows too big, or contains too many keys, it undergoes a split operation, where the keys are 
-  split into a bottom-half and a top-half: shard `[0..65535]` gets split into `[0..32767]` and `[32768..65535]`, and 
-  the keys are divided according to their shard selector. This process repeats as needed.
-* Inside a shard, we have a header table made of rows, each being an array of signatures. The row selector selects 
-  the key's row, and within the row we use SIMD operations for matching the signature very quickly. This 
-  part of the file is kept `mmap`ed.
-* Once we find the correct entry, we get its data offset in the file and read it. 
-  
-The default parameters (chosen by simulations) are shards with 64 rows, each with 512 entries. The chances 
-of collisions with these parameters are minimal, and they allow for ~90% utilization of the shard, while
-having relatively small header tables (32K entries, taking up 384KB). With the expected 90% utilization, 
-you should be expect to hold 29K keys per shard.
-
-The concept can be extended to a distributed database, by adding a layer of master-shards that select a 
-server, followed by the normal sharding mechanism described above.
 
 ## Notes
 * The file format is not yet stable
