@@ -22,6 +22,17 @@ for res in db.iter() {
 }
 
 assert_eq!(db.iter().count(), 0);
+
+db.set_in_collection("mycoll", "key1", "123")?;
+db.set_in_collection("mycoll", "key2", "456")?;
+assert_eq!(db.get_from_collection("mycoll", "key1")?, Some("123".into()));
+
+assert_eq!(db.iter_collections("mycoll").count(), 2);
+
+for res in db.iter_collections("mycoll") {
+    let (k, v) = res?;
+    println!("{k:?} => {v:?}");
+}
 ```
 
 ## Design Goals
