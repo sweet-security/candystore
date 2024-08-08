@@ -1,6 +1,8 @@
 mod common;
 
-use vicky_store::{Config, Result, VickyStore};
+use std::sync::Arc;
+
+use vicky_store::{Config, Result, VickyStore, VickyTypedCollection};
 
 use crate::common::run_in_tempdir;
 
@@ -77,6 +79,35 @@ fn test_collections() -> Result<()> {
         }
 
         assert_eq!(db.iter_collection("xxx").count(), 0);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_typed_collections() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+
+        let typed = VickyTypedCollection::<String, u64, u32>::new(db);
+        typed.set("texas".into(), 108, 2005)?;
+        typed.set("texas".into(), 555, 2006)?;
+        typed.set("texas".into(), 827, 2007)?;
+        typed.set("texas".into(), 123, 2008)?;
+        typed.set("texas".into(), 555, 2009)?;
+
+        assert_eq!(typed.get("texas", &555)?, Some(2009));
+        assert_eq!(typed.get("texas", &66666666)?, None);
+
+        assert!(typed.remove("texas", &827)?.is_some());
+        assert!(typed.remove("texas", &827)?.is_none());
+        assert!(typed.remove("texas", &66666666)?.is_none());
+
+        let items = typed
+            .iter("texas")
+            .map(|res| res.unwrap().1)
+            .collect::<Vec<_>>();
+        assert_eq!(items, vec![2005, 2009, 2008]);
 
         Ok(())
     })

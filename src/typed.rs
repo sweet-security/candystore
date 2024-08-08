@@ -38,6 +38,7 @@ typed_builtin!(isize, 13);
 typed_builtin!(char, 14);
 typed_builtin!(String, 15);
 
+#[derive(Clone)]
 pub struct VickyTypedStore<K, V> {
     store: Arc<VickyStore>,
     _k: PhantomData<K>,
@@ -131,12 +132,108 @@ where
     }
 }
 
-impl<K, V> Clone for VickyTypedStore<K, V> {
-    fn clone(&self) -> Self {
+#[derive(Clone)]
+pub struct VickyTypedCollection<C, K, V> {
+    store: Arc<VickyStore>,
+    _c: PhantomData<C>,
+    _k: PhantomData<K>,
+    _v: PhantomData<V>,
+}
+
+impl<C, K, V> VickyTypedCollection<C, K, V>
+where
+    C: VickyTypedKey,
+    K: VickyTypedKey,
+    V: Encode + DecodeOwned,
+{
+    pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
-            store: self.store.clone(),
+            store,
+            _c: PhantomData,
             _k: PhantomData,
             _v: PhantomData,
         }
+    }
+
+    pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        coll_key: &Q1,
+        item_key: &Q2,
+    ) -> Result<bool>
+    where
+        C: Borrow<Q1>,
+        K: Borrow<Q2>,
+    {
+        let coll_key = coll_key.to_bytes::<LE>();
+        let item_key = item_key.to_bytes::<LE>();
+        Ok(self
+            .store
+            .get_from_collection(&coll_key, &item_key)?
+            .is_some())
+    }
+
+    pub fn get<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        coll_key: &Q1,
+        item_key: &Q2,
+    ) -> Result<Option<V>>
+    where
+        C: Borrow<Q1>,
+        K: Borrow<Q2>,
+    {
+        let coll_key = coll_key.to_bytes::<LE>();
+        let item_key = item_key.to_bytes::<LE>();
+        let vbytes = self.store.get_from_collection(&coll_key, &item_key)?;
+        if let Some(vbytes) = vbytes {
+            let val = V::from_bytes::<LE>(&vbytes)?;
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set(&self, coll_key: C, item_key: K, val: V) -> Result<SetStatus> {
+        let coll_key = coll_key.to_bytes::<LE>();
+        let item_key = item_key.to_bytes::<LE>();
+        let val = val.to_bytes::<LE>();
+        self.store.set_in_collection(&coll_key, &item_key, &val)
+    }
+
+    pub fn remove<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        coll_key: &Q1,
+        item_key: &Q2,
+    ) -> Result<Option<V>>
+    where
+        C: Borrow<Q1>,
+        K: Borrow<Q2>,
+    {
+        let coll_key = coll_key.to_bytes::<LE>();
+        let item_key = item_key.to_bytes::<LE>();
+        let vbytes = self.store.remove_from_collection(&coll_key, &item_key)?;
+        if let Some(vbytes) = vbytes {
+            let val = V::from_bytes::<LE>(&vbytes)?;
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn iter<'a, Q: ?Sized + Encode>(
+        &'a self,
+        coll_key: &Q,
+    ) -> impl Iterator<Item = Result<(K, V)>> + 'a
+    where
+        C: Borrow<Q>,
+    {
+        let coll_key = coll_key.to_bytes::<LE>();
+        self.store.iter_collection(&coll_key).map(|res| match res {
+            Err(e) => Err(e),
+            Ok((k, v)) => {
+                let key = K::from_bytes::<LE>(&k)?;
+                let val = V::from_bytes::<LE>(&v)?;
+                Ok((key, val))
+            }
+        })
     }
 }
