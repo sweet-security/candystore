@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -14,7 +14,7 @@ use crate::{Config, Result};
 
 pub(crate) const USER_NAMESPACE: &[u8] = &[1];
 pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
-pub(crate) const COLL_NAMESPACE: &[u8] = &[3];
+pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
 pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 
 /// Stats from VickyStore, mainly useful for debugging
@@ -34,6 +34,8 @@ pub struct VickyStore {
     pub(crate) num_entries: AtomicUsize,
     pub(crate) num_compactions: AtomicUsize,
     pub(crate) num_splits: AtomicUsize,
+    // locks for complicated operations
+    pub(crate) keyed_locks: Vec<Mutex<()>>,
 }
 
 /// An iterator over a VickyStore. Note that it's safe to modify (insert/delete) keys while iterating,
@@ -138,6 +140,11 @@ impl VickyStore {
             Self::create_first_shards(&dir_path, &config, &mut shards)?;
         }
 
+        let mut keyed_locks = vec![];
+        for _ in 0..1024 {
+            keyed_locks.push(Mutex::new(()));
+        }
+
         Ok(Self {
             config,
             dir_path,
@@ -145,6 +152,7 @@ impl VickyStore {
             num_entries: 0.into(),
             num_compactions: 0.into(),
             num_splits: 0.into(),
+            keyed_locks,
         })
     }
 
@@ -309,6 +317,7 @@ impl VickyStore {
     }
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<KVPair>> {
+        assert_ne!(ph, PartedHash::INVALID);
         self.shards
             .read()
             .unwrap()

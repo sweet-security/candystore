@@ -7,6 +7,7 @@ keywords = ["key-value", "persistent", "store"]
 description = "A lean, efficient and fast peristent in-process key-value store"
 
 [dependencies]
+bytemuck = { version = "1.16.3", features = ["derive"] }
 databuf = "0.5.0"
 memmap = "0.7.0"
 simd-itertools = "0.2.3"

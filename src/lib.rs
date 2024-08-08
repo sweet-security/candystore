@@ -19,6 +19,7 @@ pub enum VickyError {
     KeyTooLong,
     ValueTooLong,
     KeyNotFound,
+    BrokenList,
 }
 
 impl Display for VickyError {
@@ -28,6 +29,7 @@ impl Display for VickyError {
             Self::KeyTooLong => write!(f, "key too long"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong => write!(f, "value too long"),
+            Self::BrokenList => write!(f, "broken list"),
         }
     }
 }

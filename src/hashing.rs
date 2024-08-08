@@ -22,13 +22,17 @@ impl HashSeed {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+use bytemuck::{Pod, Zeroable};
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Pod, Zeroable, Hash)]
+#[repr(transparent)]
 pub(crate) struct PartedHash(u64);
 
 pub(crate) const INVALID_SIG: u32 = 0;
 
 impl PartedHash {
     pub const LEN: usize = size_of::<u64>();
+    pub const INVALID: Self = Self(0);
 
     pub fn new(seed: &HashSeed, buf: &[u8]) -> Self {
         Self::from_hash(SipHasher24::new_with_key(&seed.0).hash(buf))
@@ -63,33 +67,36 @@ impl PartedHash {
         Self(shard | row | sig as u64)
     }
 
-    pub fn to_bytes(&self) -> [u8; Self::LEN] {
-        self.0.to_le_bytes()
-    }
-    pub fn as_u64(&self) -> u64 {
+    #[cfg(test)]
+    fn to_u64(&self) -> u64 {
         self.0
     }
-    pub fn from_u64(val: u64) -> Self {
+    #[cfg(test)]
+    fn from_u64(val: u64) -> Self {
         Self(val)
     }
 }
 
 #[test]
 fn test_parted_hash() -> Result<()> {
+    use bytemuck::{bytes_of, from_bytes};
+
     HashSeed::new("12341234123412341").expect_err("shouldn't work");
 
     let seed = HashSeed::new("aaaabbbbccccdddd")?;
 
     let h1 = PartedHash::new(&seed, b"hello world");
-    assert_eq!(h1.as_u64(), 13445180190757400308,);
+    assert_eq!(h1.to_u64(), 13445180190757400308,);
     let h2 = PartedHash::from_u64(13445180190757400308);
     assert_eq!(PartedHash::new(&seed, b"hello world"), h2);
 
     let h3 = PartedHash::from_u64(0x1020304050607080);
     assert_eq!(
-        h3.to_bytes(),
+        bytes_of(&h3),
         [0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10]
     );
+    let h4: PartedHash = *from_bytes(&[0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10]);
+    assert_eq!(h4, h3);
 
     Ok(())
 }

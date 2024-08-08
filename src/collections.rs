@@ -1,171 +1,121 @@
-use simd_itertools::PositionSimd;
+use std::sync::MutexGuard;
 
 use crate::{
-    hashing::{PartedHash, INVALID_SIG},
-    shard::{KVPair, Shard},
-    store::{COLL_NAMESPACE, ITEM_NAMESPACE},
-    GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore,
+    hashing::PartedHash,
+    shard::KVPair,
+    store::{ITEM_NAMESPACE, LIST_NAMESPACE},
+    GetOrCreateStatus, ModifyStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
 };
 
-enum SetCollStatus {
-    Added,
-    BlockFull,
-    BlockMissing,
+use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
+
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct LinkedList {
+    tail: PartedHash,
+    head: PartedHash,
+    len: u64,
 }
 
-const NUM_HASHES_IN_BLOCK: usize = 256;
-const COLLECTION_BLOCK: &[u8] = &[0u8; NUM_HASHES_IN_BLOCK * PartedHash::LEN];
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct Chain {
+    prev: PartedHash,
+    next: PartedHash,
+}
 
-pub struct CollectionIterator<'a> {
+impl Chain {
+    const INVALID: Self = Self {
+        prev: PartedHash::INVALID,
+        next: PartedHash::INVALID,
+    };
+}
+
+const ITEM_SUFFIX_LEN: usize = size_of::<PartedHash>() + ITEM_NAMESPACE.len();
+
+fn chain_of(buf: &[u8]) -> Chain {
+    bytemuck::pod_read_unaligned(&buf[buf.len() - size_of::<Chain>()..])
+}
+
+pub struct LinkedListIterator<'a> {
     store: &'a VickyStore,
-    suffix: [u8; PartedHash::LEN + ITEM_NAMESPACE.len()],
-    block_idx: u32,
     coll_key: Vec<u8>,
-    curr_buf: Option<Vec<u8>>,
-    entry_idx: usize,
+    coll_ph: PartedHash,
+    next_ph: Option<PartedHash>,
 }
 
-impl<'a> Iterator for CollectionIterator<'a> {
+impl<'a> Iterator for LinkedListIterator<'a> {
     type Item = Result<KVPair>;
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.curr_buf.is_none() {
-                self.curr_buf = match self.store.get_raw(&self.coll_key) {
-                    Err(e) => return Some(Err(e)),
-                    Ok(buf) => buf,
-                }
-            }
-            let Some(ref curr_buf) = self.curr_buf else {
+        if self.next_ph.is_none() {
+            let buf = match self.store.get_raw(&self.coll_key) {
+                Ok(buf) => buf,
+                Err(e) => return Some(Err(e)),
+            };
+            let Some(buf) = buf else {
                 return None;
             };
-
-            let entries = unsafe {
-                std::slice::from_raw_parts(curr_buf.as_ptr() as *const u64, NUM_HASHES_IN_BLOCK)
-            };
-            while self.entry_idx < NUM_HASHES_IN_BLOCK {
-                let item_ph = PartedHash::from_u64(entries[self.entry_idx]);
-                self.entry_idx += 1;
-                if item_ph.signature() == INVALID_SIG {
-                    break;
-                }
-
-                for res in self.store.get_by_hash(item_ph) {
-                    let (mut k, v) = match res {
-                        Err(e) => return Some(Err(e)),
-                        Ok(kv) => kv,
-                    };
-                    if k.ends_with(&self.suffix) {
-                        k.truncate(k.len() - self.suffix.len());
-                        return Some(Ok((k, v)));
-                    }
-                }
-            }
-
-            // move to next block
-            self.entry_idx = 0;
-            self.curr_buf = None;
-            self.block_idx += 1;
-            let block_idx_offset = self.coll_key.len() - ITEM_NAMESPACE.len() - size_of::<u32>();
-            self.coll_key[block_idx_offset..block_idx_offset + size_of::<u32>()]
-                .copy_from_slice(&self.block_idx.to_le_bytes());
+            let list = *from_bytes::<LinkedList>(&buf);
+            self.next_ph = Some(list.head);
         }
+        let Some(curr) = self.next_ph else {
+            return None;
+        };
+        if curr == PartedHash::INVALID {
+            return None;
+        }
+        let kv = match self.store._get_from_collection(self.coll_ph, curr) {
+            Err(e) => return Some(Err(e)),
+            Ok(kv) => kv,
+        };
+        let Some((mut k, mut v)) = kv else {
+            return Some(Err(Box::new(VickyError::BrokenList)));
+        };
+        k.truncate(k.len() - ITEM_SUFFIX_LEN);
+        let chain = chain_of(&v);
+        self.next_ph = Some(chain.next);
+        v.truncate(v.len() - size_of::<Chain>());
+
+        Some(Ok((k, v)))
     }
 }
-
-// XXX:
-// * hold number of added entries, so we could start at the right block
-// * add number removed entries, and trigger compaction when this number gets to 0.5 of added entries
-// * maybe find a way to store these counters in an mmap?
-// * may represent the block as "row" that covers a range of hashes. we begin with just one row and when
-//   it gets full, we split it into [0..2^31), [2^31..2^32)
-// * alternatively, hold a back-pointer from the entry to the block
 
 impl VickyStore {
     fn make_coll_key(&self, coll_key: &[u8]) -> (PartedHash, Vec<u8>) {
         let mut full_key = coll_key.to_owned();
-        full_key.extend_from_slice(&0u32.to_le_bytes());
-        full_key.extend_from_slice(COLL_NAMESPACE);
+        full_key.extend_from_slice(LIST_NAMESPACE);
         (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
     }
 
     fn make_item_key(&self, coll_ph: PartedHash, item_key: &[u8]) -> (PartedHash, Vec<u8>) {
         let mut full_key = item_key.to_owned();
-        full_key.extend_from_slice(&coll_ph.to_bytes());
+        full_key.extend_from_slice(bytes_of(&coll_ph));
         full_key.extend_from_slice(ITEM_NAMESPACE);
         (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
     }
 
-    fn make_item_suffix(
-        &self,
-        coll_ph: PartedHash,
-    ) -> [u8; PartedHash::LEN + ITEM_NAMESPACE.len()] {
-        let mut suffix = [0u8; PartedHash::LEN + ITEM_NAMESPACE.len()];
-        suffix[..PartedHash::LEN].copy_from_slice(&coll_ph.to_bytes());
-        suffix[PartedHash::LEN..].copy_from_slice(ITEM_NAMESPACE);
-        suffix
+    fn lock_collection(&self, coll_ph: PartedHash) -> MutexGuard<()> {
+        self.keyed_locks[coll_ph.signature() as usize % self.keyed_locks.len()]
+            .lock()
+            .unwrap()
     }
 
-    fn _add_to_collection(&self, mut coll_key: Vec<u8>, item_ph: PartedHash) -> Result<u32> {
-        // the first block ("master block") is special:
-        // * the first entry holds the number of blocks in this collection
-        // * the second entry is made of two u32's, the lower one specified the number of items added
-        //   and the higher one, the number of items removed. the collection's len = added - removed.
-        //   when `removed > added / 2` we should trigger compaction
+    fn _get_from_collection(
+        &self,
+        coll_ph: PartedHash,
+        item_ph: PartedHash,
+    ) -> Result<Option<KVPair>> {
+        let mut suffix = [0u8; ITEM_SUFFIX_LEN];
+        suffix[0..PartedHash::LEN].copy_from_slice(bytes_of(&coll_ph));
+        suffix[PartedHash::LEN..].copy_from_slice(ITEM_NAMESPACE);
 
-        let master_coll_key = coll_key.clone();
-
-        let block_idx_offset = coll_key.len() - (size_of::<u32>() + ITEM_NAMESPACE.len());
-        let mut block_idx = 0u32;
-        loop {
-            coll_key[block_idx_offset..block_idx_offset + size_of::<u32>()]
-                .copy_from_slice(&block_idx.to_le_bytes());
-
-            let status = self.operate_on_key_mut(&coll_key, |shard, row, _, idx_kv| {
-                if let Some((row_idx, _, v)) = idx_kv {
-                    assert_eq!(v.len(), COLLECTION_BLOCK.len());
-                    let entries = unsafe {
-                        std::slice::from_raw_parts(v.as_ptr() as *const u64, NUM_HASHES_IN_BLOCK)
-                    };
-
-                    let mut start = 0;
-                    if block_idx == 0 {
-                        block_idx = entries[0] as u32;
-                        start = 2;
-                    }
-
-                    let start = if block_idx == 0 { 1 } else { 0 };
-                    if let Some(free_idx) = entries[start..].iter().position_simd(0u64) {
-                        let (klen, vlen, offset) =
-                            Shard::extract_offset_and_size(row.offsets_and_sizes[row_idx]);
-                        assert!(free_idx * PartedHash::LEN < vlen, "free_idx={free_idx}");
-                        shard.write_raw(
-                            &item_ph.to_bytes(),
-                            offset + klen as u64 + (free_idx * PartedHash::LEN) as u64,
-                        )?;
-                        Ok(SetCollStatus::Added)
-                    } else {
-                        Ok(SetCollStatus::BlockFull)
-                    }
-                } else {
-                    Ok(SetCollStatus::BlockMissing)
-                }
-            })?;
-
-            match status {
-                SetCollStatus::Added => {
-                    break;
-                }
-                SetCollStatus::BlockFull => {
-                    block_idx += 1;
-                }
-                SetCollStatus::BlockMissing => {
-                    self.get_or_create_raw(&coll_key, COLLECTION_BLOCK)?;
-                    //self.modify_inplace_raw(&master_coll_key, patch, 0, Some(&0u32.to_le_bytes()))?;
-                }
+        for res in self.get_by_hash(item_ph) {
+            let (k, v) = res?;
+            if k.ends_with(&suffix) {
+                return Ok(Some((k, v)));
             }
         }
-
-        Ok(0u32)
+        Ok(None)
     }
 
     pub fn set_in_collection<
@@ -181,53 +131,106 @@ impl VickyStore {
         let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
         let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
 
-        // XXX: add a lock table so two threads won't insert the same item at the same time
+        let _guard = self.lock_collection(coll_ph);
 
-        let mut val = val.as_ref().to_owned();
-
-        if let Some(curr_buf) = self.get(&item_key)? {
-            val.extend_from_slice(&curr_buf[curr_buf.len() - size_of::<u32>()..]);
-        } else {
-            let block_idx = self._add_to_collection(coll_key, item_ph)?;
-            val.extend_from_slice(&block_idx.to_le_bytes());
+        // if the item already exists, it means it belongs to this list. we just need to update the value and
+        // keep the existing chain part
+        if let Some(old_val) = self.get_raw(&item_key)? {
+            let mut new_val = val.as_ref().to_owned();
+            new_val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
+            match self.replace_raw(&item_key, &new_val)? {
+                ReplaceStatus::DoesNotExist => {
+                    // another thread deleted this entry, but that's acceptable
+                    return Ok(SetStatus::CreatedNew);
+                }
+                ReplaceStatus::PrevValue(mut v) => {
+                    v.truncate(v.len() - size_of::<Chain>());
+                    return Ok(SetStatus::PrevValue(v));
+                }
+            }
         }
-        self.set_raw(&item_key, val.as_ref())
-    }
 
-    pub fn replace_in_collection<
-        B1: AsRef<[u8]> + ?Sized,
-        B2: AsRef<[u8]> + ?Sized,
-        B3: AsRef<[u8]> + ?Sized,
-    >(
-        &self,
-        coll_key: &B1,
-        item_key: &B2,
-        val: &B3,
-    ) -> Result<ReplaceStatus> {
-        let (coll_ph, _) = self.make_coll_key(coll_key.as_ref());
-        let (_, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
+        // item does not exist, and the list itself might also not exist. get or create the list
+        let curr_list = LinkedList {
+            tail: item_ph,
+            head: item_ph,
+            len: 1,
+        };
 
-        self.replace_raw(&item_key, val.as_ref())
-    }
+        let curr_list = match self.get_or_create_raw(&coll_key, bytes_of(&curr_list))? {
+            GetOrCreateStatus::CreatedNew(_) => curr_list,
+            GetOrCreateStatus::ExistingValue(v) => *from_bytes::<LinkedList>(&v),
+        };
 
-    pub fn get_or_create_in_collection<
-        B1: AsRef<[u8]> + ?Sized,
-        B2: AsRef<[u8]> + ?Sized,
-        B3: AsRef<[u8]> + ?Sized,
-    >(
-        &self,
-        coll_key: &B1,
-        item_key: &B2,
-        default_val: &B3,
-    ) -> Result<GetOrCreateStatus> {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
-        let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
+        let mut this_val = val.as_ref().to_owned();
 
-        let res = self.get_or_create_raw(&item_key, default_val.as_ref())?;
-        if res.was_created() {
-            self._add_to_collection(coll_key, item_ph)?;
+        // we have the list. if the list points to this item, it means we've just created it and we point to the
+        // first item. the first time should have prev=INVALID and next=INVALID
+        if curr_list.head == item_ph {
+            assert_eq!(curr_list.tail, item_ph);
+            assert_eq!(curr_list.len, 1);
+            this_val.extend_from_slice(bytes_of(&Chain::INVALID));
+            return self.set_raw(&item_key, &this_val);
         }
-        Ok(res)
+
+        // the list already existed, which means we need to read the last element (tail) and update its pointers
+        let Some((last_k, last_v)) = self._get_from_collection(coll_ph, curr_list.tail)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+
+        //  list [h  t]                \\         list [h  t]
+        //        |  \_____             \\              |  \________________
+        //        |        \             \\             |                   \
+        //       item1     item2         //            item1     item2      item3
+        //        n---------^ n--X      //              n---------^ n--------^ n--X
+        //    X__p \________p          //           X__p \________p \_________p
+
+        let mut last_chain = chain_of(&last_v);
+        last_chain.next = item_ph;
+        let new_list = LinkedList {
+            head: curr_list.head,
+            tail: item_ph,
+            len: curr_list.len + 1,
+        };
+        let this_chain = Chain {
+            next: PartedHash::INVALID,
+            prev: curr_list.tail,
+        };
+        this_val.extend_from_slice(bytes_of(&this_chain));
+
+        // first create the new item, then update last_k, then update the list
+
+        if self.set_raw(&item_key, &this_val)?.was_replaced() {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        match self.modify_inplace_raw(
+            &last_k,
+            bytes_of(&last_chain),
+            last_v.len() - size_of::<Chain>(),
+            Some(&last_v[last_v.len() - size_of::<Chain>()..]),
+        )? {
+            ModifyStatus::DoesNotExist => return Err(Box::new(VickyError::BrokenList)),
+            ModifyStatus::PrevValue(_) => {}     // success
+            ModifyStatus::ValueMismatch(_) => {} // retry
+            ModifyStatus::ValueTooLong(_, _, _) => return Err(Box::new(VickyError::BrokenList)),
+            ModifyStatus::WrongLength(_, _) => return Err(Box::new(VickyError::BrokenList)),
+        }
+
+        match self.modify_inplace_raw(
+            &coll_key,
+            bytes_of(&new_list),
+            0,
+            Some(bytes_of(&curr_list)),
+        )? {
+            ModifyStatus::DoesNotExist => return Err(Box::new(VickyError::BrokenList)),
+            ModifyStatus::PrevValue(_) => {
+                return Ok(SetStatus::CreatedNew);
+            }
+            ModifyStatus::ValueMismatch(_) => return Err(Box::new(VickyError::BrokenList)),
+            ModifyStatus::ValueTooLong(_, _, _) => return Err(Box::new(VickyError::BrokenList)),
+            ModifyStatus::WrongLength(_, _) => return Err(Box::new(VickyError::BrokenList)),
+        }
     }
 
     pub fn get_from_collection<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
@@ -237,7 +240,171 @@ impl VickyStore {
     ) -> Result<Option<Vec<u8>>> {
         let (coll_ph, _) = self.make_coll_key(coll_key.as_ref());
         let (_, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
-        self.get_raw(&item_key)
+        let Some(mut v) = self.get_raw(&item_key)? else {
+            return Ok(None);
+        };
+        v.truncate(v.len() - size_of::<Chain>());
+        Ok(Some(v))
+    }
+
+    fn _remove_from_collection_single(
+        &self,
+        list: LinkedList,
+        chain: Chain,
+        coll_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<()> {
+        // this is the only element - remove it and the list itself
+        assert_eq!(list.len, 0);
+        assert_eq!(chain.next, PartedHash::INVALID);
+        assert_eq!(chain.prev, PartedHash::INVALID);
+
+        self.remove_raw(&coll_key)?;
+        self.remove_raw(&item_key)?;
+        Ok(())
+    }
+
+    fn _remove_from_collection_last(
+        &self,
+        list_buf: Vec<u8>,
+        mut list: LinkedList,
+        chain: Chain,
+        coll_ph: PartedHash,
+        coll_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<()> {
+        // this item is the last one, and we have a previous item. update list.tail to the previous one,
+        // and set prev.next = INVALID, and remove this item
+        assert_eq!(chain.next, PartedHash::INVALID);
+        assert_ne!(chain.prev, PartedHash::INVALID);
+        list.tail = chain.prev;
+
+        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+
+        if !self
+            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        let mut prev_chain = chain_of(&prev_v);
+        prev_chain.next = PartedHash::INVALID;
+        self.modify_inplace_raw(
+            &prev_k,
+            bytes_of(&prev_chain),
+            prev_v.len() - size_of::<Chain>(),
+            Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
+        )?;
+
+        self.remove_raw(&item_key)?;
+        Ok(())
+    }
+
+    fn _remove_from_collection_first(
+        &self,
+        list_buf: Vec<u8>,
+        mut list: LinkedList,
+        chain: Chain,
+        coll_ph: PartedHash,
+        coll_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<()> {
+        // this is the first item in the list, and we have a following one. set list.head = next,
+        // set next.prev = INVALID, and remove the item
+        assert_eq!(chain.prev, PartedHash::INVALID);
+        assert_ne!(chain.next, PartedHash::INVALID);
+        list.head = chain.next;
+
+        let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+
+        if !self
+            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        let mut next_chain = chain_of(&next_v);
+        next_chain.prev = PartedHash::INVALID;
+        if !self
+            .modify_inplace_raw(
+                &next_k,
+                bytes_of(&next_chain),
+                next_v.len() - size_of::<Chain>(),
+                Some(&next_v[next_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        self.remove_raw(&item_key)?;
+        Ok(())
+    }
+
+    fn _remove_from_collection_middle(
+        &self,
+        list_buf: Vec<u8>,
+        list: LinkedList,
+        chain: Chain,
+        coll_ph: PartedHash,
+        coll_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<()> {
+        // this is a "middle" item, it has a prev one and a next one. set prev.next = this.next,
+        // set next.prev = prev, update list (for `len`)
+        assert_ne!(chain.next, PartedHash::INVALID);
+        assert_ne!(chain.prev, PartedHash::INVALID);
+
+        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+        let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+
+        if !self
+            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        let mut prev_chain = chain_of(&prev_v);
+        let mut next_chain = chain_of(&next_v);
+        prev_chain.next = chain.next;
+        next_chain.prev = chain.prev;
+
+        if !self
+            .modify_inplace_raw(
+                &prev_k,
+                bytes_of(&prev_chain),
+                prev_v.len() - size_of::<Chain>(),
+                Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+        if !self
+            .modify_inplace_raw(
+                &next_k,
+                bytes_of(&next_chain),
+                next_v.len() - size_of::<Chain>(),
+                Some(&next_v[next_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            return Err(Box::new(VickyError::BrokenList));
+        }
+
+        self.remove_raw(&item_key)?;
+        Ok(())
     }
 
     pub fn remove_from_collection<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
@@ -245,62 +412,45 @@ impl VickyStore {
         coll_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        /*let (coll_ph, mut coll_key) = self.make_coll_key(coll_key.as_ref());
+        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
         let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
 
-        let Some(res) = self.remove_raw(&item_key)? else {
+        let _guard = self.lock_collection(coll_ph);
+
+        let Some(mut v) = self.get_raw(&item_key)? else {
             return Ok(None);
         };
 
-        let block_idx_offset = coll_key.len() - ITEM_NAMESPACE.len() - size_of::<u32>();
-        for block_idx in 0u32.. {
-            coll_key[block_idx_offset..block_idx_offset + size_of::<u32>()]
-                .copy_from_slice(&block_idx.to_le_bytes());
+        let Some(list_buf) = self.get_raw(&coll_key)? else {
+            return Err(Box::new(VickyError::BrokenList));
+        };
+        let mut list = *from_bytes::<LinkedList>(&list_buf);
+        let chain = chain_of(&v);
 
-            let found = self.operate_on_key_mut(&coll_key, |shard, row, _, idx_kv| {
-                let Some((row_idx, _, v)) = idx_kv else {
-                    // block does not exist - end of chain
-                    return Ok(true);
-                };
-                let entries = unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u64, NUM_HASHES_IN_BLOCK)
-                };
-                if let Some(item_idx) = entries.iter().position_simd(item_ph.as_u64()) {
-                    let (klen, vlen, offset) =
-                        Shard::extract_offset_and_size(row.offsets_and_sizes[row_idx]);
-                    assert!(item_idx * PartedHash::LEN < vlen);
-                    shard.write_raw(
-                        &[0u8; PartedHash::LEN],
-                        offset + klen as u64 + (item_idx * PartedHash::LEN) as u64,
-                    )?;
-                    Ok(true)
-                } else {
-                    // try next block
-                    Ok(false)
-                }
-            })?;
-            if found {
-                break;
-            }
-        }
+        assert!(list.len > 0);
+        list.len -= 1;
 
-        Ok(Some(res))*/
-        Ok(None)
+        if list.tail == item_ph && list.head == item_ph {
+            self._remove_from_collection_single(list, chain, coll_key, item_key)?
+        } else if list.tail == item_ph {
+            self._remove_from_collection_last(list_buf, list, chain, coll_ph, coll_key, item_key)?
+        } else if list.head == item_ph {
+            self._remove_from_collection_first(list_buf, list, chain, coll_ph, coll_key, item_key)?
+        } else {
+            self._remove_from_collection_middle(list_buf, list, chain, coll_ph, coll_key, item_key)?
+        };
+
+        v.truncate(v.len() - size_of::<Chain>());
+        Ok(Some(v))
     }
 
-    pub fn iter_collection<'a, B: AsRef<[u8]> + ?Sized>(
-        &'a self,
-        coll_key: &B,
-    ) -> CollectionIterator<'a> {
+    pub fn iter_collection<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> LinkedListIterator {
         let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
-
-        CollectionIterator {
-            coll_key,
-            block_idx: 0,
-            suffix: self.make_item_suffix(coll_ph),
-            curr_buf: None,
+        LinkedListIterator {
             store: &self,
-            entry_idx: 0,
+            coll_key,
+            coll_ph,
+            next_ph: None,
         }
     }
 }
