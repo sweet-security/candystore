@@ -1,6 +1,15 @@
 # VickyStore
-A pure rust implementation of a fast, persistent, in-process key-value store, that relies on a novel sharding 
-mechanism. 
+A pure rust implementation of a fast (*blazingly* :tm:, of course), persistent, in-process key-value store, that relies 
+on a novel sharding algorithm. Just how blazingly? It's over 9000!
+
+| Operation | Time  |
+|-----------|-------|
+| Lookup    | < 1us  |
+| Insert    | < 2us  |
+| Removal   | < 1us  |
+
+See [the benchmark](vicky-perf/README.md)
+
 
 ## Overview
 Being a hash-table, the key is hashed, producing a 64 bit number. The 16 most significant bits select 
@@ -119,8 +128,7 @@ for res in db.iter_collection("mycoll") {
 ```
 
 ## Design Goals
-* Fast and efficient
-* Low memory footprint
+* Fast and efficient, with a very low memory footprint (~0.6% overhead)
 * No heavy/unbounded merges
 * No Write-Ahead Log (WAL) or journalling of any kind
 * Crash safe: you may lose the latest operations, but never be in an inconsistent state
