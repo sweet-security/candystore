@@ -222,17 +222,18 @@ where
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         coll_key: &Q,
-    ) -> impl Iterator<Item = Result<(K, V)>> + 'a
+    ) -> impl Iterator<Item = Result<Option<(K, V)>>> + 'a
     where
         C: Borrow<Q>,
     {
         let coll_key = coll_key.to_bytes::<LE>();
         self.store.iter_collection(&coll_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok((k, v)) => {
+            Ok(None) => Ok(None),
+            Ok(Some((k, v))) => {
                 let key = K::from_bytes::<LE>(&k)?;
                 let val = V::from_bytes::<LE>(&v)?;
-                Ok((key, val))
+                Ok(Some((key, val)))
             }
         })
     }

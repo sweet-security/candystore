@@ -45,7 +45,7 @@ pub struct LinkedListIterator<'a> {
 }
 
 impl<'a> Iterator for LinkedListIterator<'a> {
-    type Item = Result<KVPair>;
+    type Item = Result<Option<KVPair>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_ph.is_none() {
             let buf = match self.store.get_raw(&self.coll_key) {
@@ -72,14 +72,14 @@ impl<'a> Iterator for LinkedListIterator<'a> {
             // this means the current element was removed by another thread, and that's okay
             // because we don't hold any locks during iteration. this is an early stop,
             // which means the reader might want to retry
-            return Some(Err(Box::new(VickyError::IterationEarlyStop)));
+            return Some(Ok(None));
         };
         k.truncate(k.len() - ITEM_SUFFIX_LEN);
         let chain = chain_of(&v);
         self.next_ph = Some(chain.next);
         v.truncate(v.len() - size_of::<Chain>());
 
-        Some(Ok((k, v)))
+        Some(Ok(Some((k, v))))
     }
 }
 

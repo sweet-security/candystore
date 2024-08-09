@@ -43,7 +43,7 @@ fn test_collections() -> Result<()> {
 
         let items = db
             .iter_collection("texas")
-            .map(|res| res.unwrap())
+            .map(|res| res.unwrap().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(items[0].0, "dallas".as_bytes());
         assert_eq!(items[2].0, "houston".as_bytes());
@@ -86,7 +86,7 @@ fn test_collections() -> Result<()> {
         assert!(db.stats().num_splits > 1);
 
         for (i, res) in db.iter_collection("xxx").enumerate() {
-            let (k, _) = res?;
+            let (k, _) = res?.unwrap();
             assert_eq!(k, format!("my key {i}").as_bytes());
             db.remove_from_collection("xxx", &k)?;
             let remaining = 10_000 - 1 - i;
@@ -120,7 +120,7 @@ fn test_typed_collections() -> Result<()> {
 
         let items = typed
             .iter("texas")
-            .map(|res| res.unwrap().1)
+            .map(|res| res.unwrap().unwrap().1)
             .collect::<Vec<_>>();
         assert_eq!(items, vec![2005, 2009, 2008]);
 

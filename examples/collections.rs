@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     db.set_in_collection("europe", "greece", "greek")?;
 
     for res in db.iter_collection("asia") {
-        let (k, v) = res?;
+        let (k, v) = res?.unwrap();
         println!(
             "{} => {}",
             String::from_utf8(k).unwrap(),

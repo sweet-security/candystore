@@ -23,7 +23,6 @@ pub enum VickyError {
     SplitFailed(String),
     LoadingFailed(String),
     CorruptedLinkedList(String),
-    IterationEarlyStop,
 }
 
 impl Display for VickyError {
@@ -37,7 +36,6 @@ impl Display for VickyError {
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
             Self::SplitFailed(s) => write!(f, "shard split failed: {s}"),
-            Self::IterationEarlyStop => write!(f, "iteration early stop"),
         }
     }
 }
