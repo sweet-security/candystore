@@ -258,21 +258,20 @@ impl VickyStore {
         config: &Arc<Config>,
         shards: &mut BTreeMap<u32, Shard>,
     ) -> Result<()> {
-        let shards_needed = (config.expected_number_of_keys / Shard::EXPECTED_CAPACITY).max(1);
-        let step = Self::END_OF_SHARDS / 2u32.pow(shards_needed.ilog2());
+        let step = (Self::END_OF_SHARDS as f64)
+            / (config.expected_number_of_keys as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
+        let step = 1 << (step as u32).ilog2();
 
         let mut start = 0;
         while start < Self::END_OF_SHARDS {
             let end = start + step;
-            shards.insert(
-                Self::END_OF_SHARDS,
-                Shard::open(
-                    dir_path.join(format!("shard_{:04x}-{:04x}", start, end)),
-                    0..Self::END_OF_SHARDS,
-                    false,
-                    config.clone(),
-                )?,
-            );
+            let shard = Shard::open(
+                dir_path.join(format!("shard_{:04x}-{:04x}", start, end)),
+                0..Self::END_OF_SHARDS,
+                false,
+                config.clone(),
+            )?;
+            shards.insert(end, shard);
             start = end;
         }
 
