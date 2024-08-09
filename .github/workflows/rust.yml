@@ -28,3 +28,5 @@ jobs:
       run: cargo run --example collections
     - name: Run typed example
       run: cargo run --example typed
+    - name: Run perftest
+      run: cargo -Z unstable-options -C vicky-perf run --release

@@ -24,7 +24,7 @@ fn test_pre_split() -> Result<()> {
             .filter(|filename| filename.starts_with("shard_"))
             .collect::<Vec<_>>();
 
-        assert_eq!(files.len(), 32);
+        assert_eq!(files.len(), 64);
 
         Ok(())
     })
