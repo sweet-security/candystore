@@ -1,11 +1,9 @@
 Performance results from my machine
 
-```
-Ubuntu 24.04 LTS
-Lenovo ThinkPad X1 Carbon Gen 10 (12th Gen Intel® Core™ i7-1260P × 16)
-RAM: 32.0 GiB
-SSD: 512 GB
-```
+* Ubuntu 24.04 LTS
+* Lenovo ThinkPad X1 Carbon Gen 10 (12th Gen Intel® Core™ i7-1260P × 16)
+* RAM: 32.0 GiB
+* SSD: 512 GB
 * Built with `cargo build --release`
 * Running on a local filesystem
 
