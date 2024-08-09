@@ -37,6 +37,7 @@ typed_builtin!(usize, 12);
 typed_builtin!(isize, 13);
 typed_builtin!(char, 14);
 typed_builtin!(String, 15);
+typed_builtin!(Vec<u8>, 16);
 
 #[derive(Clone)]
 pub struct VickyTypedStore<K, V> {
@@ -155,6 +156,16 @@ where
         }
     }
 
+    fn make_coll<Q: ?Sized + Encode>(c: &Q) -> Vec<u8>
+        where
+            C: Borrow<Q>,
+    {
+        let mut cbytes = vec![];
+        cbytes.extend_from_slice(&c.to_bytes::<LE>());
+        cbytes.extend_from_slice(&C::TYPE_ID.to_le_bytes());
+        cbytes
+    }
+
     pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         coll_key: &Q1,
@@ -164,7 +175,7 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         Ok(self
             .store
@@ -181,7 +192,7 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.get_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
@@ -193,7 +204,7 @@ where
     }
 
     pub fn set(&self, coll_key: C, item_key: K, val: V) -> Result<SetStatus> {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(&coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
         self.store.set_in_collection(&coll_key, &item_key, &val)
@@ -208,7 +219,7 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.remove_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
@@ -226,7 +237,7 @@ where
     where
         C: Borrow<Q>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         self.store.iter_collection(&coll_key).map(|res| match res {
             Err(e) => Err(e),
             Ok(None) => Ok(None),
