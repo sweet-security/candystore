@@ -1,0 +1,9 @@
+[package]
+name = "vicky-crasher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.155"
+rand = "0.8.5"
+vicky-store={path=".."}
