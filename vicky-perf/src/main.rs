@@ -176,7 +176,7 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
 
     run2(
         "  Removal 50% of items",
-        num_colls * num_items_per_coll,
+        num_colls * num_items_per_coll / 2,
         || {
             for coll in 0..num_colls {
                 for item in 0..num_items_per_coll {
@@ -191,7 +191,7 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
         },
     )?;
 
-    run2("  Discards", num_colls * num_items_per_coll, || {
+    run2("  Discards", num_colls * num_items_per_coll / 2, || {
         for coll in 0..num_colls {
             db.discard_collection(&coll.to_le_bytes())?;
         }
