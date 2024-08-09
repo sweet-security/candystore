@@ -83,6 +83,8 @@ use vicky_store::{Config, Result, VickyStore};
 
 let db = VickyStore::open("/tmp/vicky-dir", Config::default())?;
 
+// simple API
+
 db.insert("mykey", "myval")?;
 assert_eq!(db.get("mykey")?, Some("myval".into()));
 
@@ -98,13 +100,15 @@ for res in db.iter() {
 
 assert_eq!(db.iter().count(), 0);
 
+// Collections API ("linked lists")
+
 db.set_in_collection("mycoll", "key1", "123")?;
 db.set_in_collection("mycoll", "key2", "456")?;
 assert_eq!(db.get_from_collection("mycoll", "key1")?, Some("123".into()));
 
-assert_eq!(db.iter_collections("mycoll").count(), 2);
+assert_eq!(db.iter_collection("mycoll").count(), 2);
 
-for res in db.iter_collections("mycoll") {
+for res in db.iter_collection("mycoll") {
     let (k, v) = res?;
     println!("{k:?} => {v:?}");
 }
