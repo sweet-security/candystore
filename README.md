@@ -9,34 +9,37 @@ opaque signature. The signature is matched against the signature array within th
 The row also stores the file offset of the entry, which is used to retrive the entry's key and value.
 
 ```
-                 hash (64 bits)                                
-      ┌───────────────────────────────────┐                    
-   ┌──┴───────┬───────────┬───────────────┴──┐                 
-   │  shard   │   row     │    signature     │                 
-   │ selector │ selector  │                  │                 
-   │   (16)   │   (16)    │      (32)        │                 
-   └──┬───────┴───┬───────┴───────────┬──────┘                 
-      │           │                   │                        
-      │           │                   │                        
-      │       ┌───┼───────────────────┼───────────────────────┐
-      │       │   │                   │                       │
-      │       │   │  ┌─rows─┐         │                       │
-n <= sel < m  │   │  │0     │     Parallel lookup of sig      │
-      │       │   │  ├──────┤         │   within the row      │
-      │       │   │  │1     │         ▼                       │
-      │       │   │  ├──────┤   ┌───┬───┬─────┬───┐           │
-      └─────► │   └─►│2     ├───┤ 0 │ 1 │     │511│           │
-              │      ├──────┤   ├───┼───┼─...─┼───┤           │
-              │      │3     │   │sig│sig│     │sig│           │
-              │      ├──────┤   │off│off│     │off│           │
-              │      │.     │   │len│len│     │len│           │
-              │      │.     │   └───┴─┬─┴─────┴───┘           │
-              │      │.     │         │                       │
-              │      ├──────┤         ├─► entry's file offset │
-              │      │63    │         └─► entry's length      │
-              │      └──────┘                                 │
-              │                                               │
-              └────────────── shard file [n..m) ──────────────┘
+                 hash (64 bits)                                                        
+      ┌───────────────────────────────────┐                                            
+   ┌──┴───────┬───────────┬───────────────┴──┐                                         
+   │  shard   │   row     │    signature     │                                         
+   │ selector │ selector  │                  │                                         
+   │   (16)   │   (16)    │      (32)        │                                         
+   └──┬───────┴───┬───────┴───────────┬──────┘                                         
+      │           │                   │                                                
+      │           │                   │        shard file [m..n)                       
+      │       ┌───┼───────────────────┼────────────────────────┐                       
+      │       │   │                   │                        │ shard file [n..p)     
+      │       │   │  ┌─rows─┐         │ Parallel lookup of sig ├────┐                  
+m <= sel < n  │   │  │0     │         │     within the row     │    │ shard file [p..q)
+      │       │   │  ├──────┤     ┌───┼───┬─────┐              │    ├────┐             
+      │       │   │  │1     │     ▼   ▼   ▼     ▼              │    │    │             
+      │       │   │  ├──────┤   ┌───┬───┬─────┬───┐            │    │    │             
+      └─────► │   └─►│2     ├───┤ 0 │ 1 │     │511│            │    │    │             
+              │      ├──────┤   ├───┼───┼─...─┼───┤            │    │    │             
+              │      │3     │   │sig│sig│     │sig│            │    │    │             
+              │      ├──────┤   │off│off│     │off│            │    │    │             
+              │      │.     │   │len│len│     │len│            │    │    │             
+              │      │.     │   └───┴─┬─┴─────┴───┘            │    │    │             
+              │      │.     │         │                        │    │    │             
+              │      ├──────┤         ├─► entry's file offset  │    │    │             
+              │      │63    │         └─► entry's length       │    │    │             
+              │      └──────┘                                  │    │    │             
+              └────┬───────────────────────────────────────────┘    │    │             
+                   │                                                │    │             
+                   └────┬───────────────────────────────────────────┘    │             
+                        │                                                │             
+                        └────────────────────────────────────────────────┘             
 ```
 
 Each shard is mapped to a shard file, and a shard file can cover a wide range of consecutive shards.
