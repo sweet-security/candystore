@@ -117,7 +117,12 @@ impl VickyStore {
             let (k, v) = res?;
             let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
-            assert!(matches!(status, InsertStatus::Added), "{status:?}");
+            if !matches!(status, InsertStatus::Added) {
+                return Err(Box::new(VickyError::CompactionFailed(format!(
+                    "{ph:?} [{}..{}] shard {status:?} k={k:?} v={v:?}",
+                    removed_shard.span.start, removed_shard.span.end
+                ))));
+            }
         }
 
         std::fs::rename(tmpfile, &orig_filename)?;
@@ -164,7 +169,11 @@ impl VickyStore {
             } else {
                 top_shard.insert(ph, &k, &v, InsertMode::Set)?
             };
-            assert!(matches!(status, InsertStatus::Added), "{status:?}");
+            if !matches!(status, InsertStatus::Added) {
+                return Err(Box::new(VickyError::SplitFailed(format!(
+                    "{ph:?} {status:?} [{shard_start} {midpoint} {shard_end}] k={k:?} v={v:?}",
+                ))));
+            }
         }
 
         self.num_splits.fetch_add(1, Ordering::SeqCst);
@@ -184,8 +193,7 @@ impl VickyStore {
         std::fs::remove_file(
             self.dir_path
                 .join(format!("shard_{:04x}-{:04x}", shard_start, shard_end)),
-        )
-        .unwrap();
+        )?;
 
         guard.insert(midpoint, bottom_shard);
         guard.insert(shard_end, top_shard);

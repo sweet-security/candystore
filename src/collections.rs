@@ -69,7 +69,10 @@ impl<'a> Iterator for LinkedListIterator<'a> {
             Ok(kv) => kv,
         };
         let Some((mut k, mut v)) = kv else {
-            return Some(Err(Box::new(VickyError::CorruptedLinkedList)));
+            // this means the current element was removed by another thread, and that's okay
+            // because we don't hold any locks during iteration. this is an early stop,
+            // which means the reader might want to retry
+            return Some(Err(Box::new(VickyError::IterationEarlyStop)));
         };
         k.truncate(k.len() - ITEM_SUFFIX_LEN);
         let chain = chain_of(&v);
@@ -78,6 +81,32 @@ impl<'a> Iterator for LinkedListIterator<'a> {
 
         Some(Ok((k, v)))
     }
+}
+
+macro_rules! corrupted_list {
+    ($($arg:tt)*) => {
+        return Err(Box::new(VickyError::CorruptedLinkedList(format!($($arg)*))));
+    };
+}
+
+macro_rules! corrupted_if {
+    ($e1: expr, $e2: expr, $($arg:tt)*) => {
+        if ($e1 == $e2) {
+            let tmp = format!($($arg)*);
+            let full = format!("{tmp} ({:?} == {:?})", $e1, $e2);
+            return Err(Box::new(VickyError::CorruptedLinkedList(full)));
+        }
+    };
+}
+
+macro_rules! corrupted_unless {
+    ($e1: expr, $e2: expr, $($arg:tt)*) => {
+        if ($e1 != $e2) {
+            let tmp = format!($($arg)*);
+            let full = format!("{tmp} ({:?} != {:?})", $e1, $e2);
+            return Err(Box::new(VickyError::CorruptedLinkedList(full)));
+        }
+    };
 }
 
 impl VickyStore {
@@ -143,7 +172,7 @@ impl VickyStore {
             new_val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
             match self.replace_raw(&item_key, &new_val)? {
                 ReplaceStatus::DoesNotExist => {
-                    return Err(Box::new(VickyError::CorruptedLinkedList));
+                    corrupted_list!("failed replacing existing item");
                 }
                 ReplaceStatus::PrevValue(mut v) => {
                     v.truncate(v.len() - size_of::<Chain>());
@@ -174,15 +203,15 @@ impl VickyStore {
         // we have the list. if the list points to this item, it means we've just created it and we point to the
         // first item. the first time should have prev=INVALID and next=INVALID
         if curr_list.head == item_ph {
-            assert_eq!(curr_list.tail, item_ph);
-            assert_eq!(curr_list.len, 1);
+            corrupted_unless!(curr_list.tail, item_ph, "head != tail");
+            corrupted_unless!(curr_list.len, 1, "len != 1");
             this_val.extend_from_slice(bytes_of(&Chain::INVALID));
             return self.set_raw(&item_key, &this_val);
         }
 
         // the list already existed, which means we need to read the last element (tail) and update its pointers
         let Some((last_k, last_v)) = self._get_from_collection(coll_ph, curr_list.tail)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("tail {:?} does not exist", curr_list.tail);
         };
 
         //  list [h  t]                           list [h  t]
@@ -208,7 +237,7 @@ impl VickyStore {
         // first create the new item, then update last_k, then update the list
 
         if self.set_raw(&item_key, &this_val)?.was_replaced() {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("tail element {item_key:?} already exists");
         }
 
         if !self
@@ -220,7 +249,9 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!(
+                "failed to update previous element {last_k:?} to point to this one {item_key:?}"
+            );
         }
 
         if !self
@@ -232,7 +263,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed to update list tail to point to {item_key:?}");
         }
         Ok(SetStatus::CreatedNew)
     }
@@ -319,9 +350,17 @@ impl VickyStore {
         item_key: Vec<u8>,
     ) -> Result<()> {
         // this is the only element - remove it and the list itself
-        assert_eq!(list.len, 0);
-        assert_eq!(chain.next, PartedHash::INVALID);
-        assert_eq!(chain.prev, PartedHash::INVALID);
+        corrupted_unless!(list.len, 0, "expected list to be empty {item_key:?}");
+        corrupted_unless!(
+            chain.next,
+            PartedHash::INVALID,
+            "chain.next must be invalid"
+        );
+        corrupted_unless!(
+            chain.prev,
+            PartedHash::INVALID,
+            "chain.prev must be invalid"
+        );
 
         self.remove_raw(&coll_key)?;
         self.remove_raw(&item_key)?;
@@ -339,19 +378,27 @@ impl VickyStore {
     ) -> Result<()> {
         // this item is the last one, and we have a previous item. update list.tail to the previous one,
         // and set prev.next = INVALID, and remove this item
-        assert_eq!(chain.next, PartedHash::INVALID);
-        assert_ne!(chain.prev, PartedHash::INVALID);
+        corrupted_unless!(
+            chain.next,
+            PartedHash::INVALID,
+            "last element must not have a valid next"
+        );
+        corrupted_if!(
+            chain.prev,
+            PartedHash::INVALID,
+            "last element must have a valid prev"
+        );
         list.tail = chain.prev;
 
         let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("missing prev element {item_key:?}");
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating list tail to point to prev");
         }
 
         let mut prev_chain = chain_of(&prev_v);
@@ -378,19 +425,27 @@ impl VickyStore {
     ) -> Result<()> {
         // this is the first item in the list, and we have a following one. set list.head = next,
         // set next.prev = INVALID, and remove the item
-        assert_eq!(chain.prev, PartedHash::INVALID);
-        assert_ne!(chain.next, PartedHash::INVALID);
+        corrupted_unless!(
+            chain.prev,
+            PartedHash::INVALID,
+            "first element must not have a valid prev {item_key:?}"
+        );
+        corrupted_if!(
+            chain.next,
+            PartedHash::INVALID,
+            "first element must have a valid next {item_key:?}"
+        );
         list.head = chain.next;
 
         let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed getting next of {item_key:?}");
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating list head to point to next");
         }
 
         let mut next_chain = chain_of(&next_v);
@@ -404,7 +459,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating prev=INVALID on the now-first element");
         }
 
         self.remove_raw(&item_key)?;
@@ -422,21 +477,29 @@ impl VickyStore {
     ) -> Result<()> {
         // this is a "middle" item, it has a prev one and a next one. set prev.next = this.next,
         // set next.prev = prev, update list (for `len`)
-        assert_ne!(chain.next, PartedHash::INVALID);
-        assert_ne!(chain.prev, PartedHash::INVALID);
+        corrupted_if!(
+            chain.next,
+            PartedHash::INVALID,
+            "a middle element must have a valid prev"
+        );
+        corrupted_if!(
+            chain.prev,
+            PartedHash::INVALID,
+            "a middle element must have a valid next"
+        );
 
         let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("missing prev element of {item_key:?}");
         };
         let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("missing next element of {item_key:?}");
         };
 
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating list length");
         }
 
         let mut prev_chain = chain_of(&prev_v);
@@ -453,7 +516,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating prev.next on {prev_k:?}");
         }
         if !self
             .modify_inplace_raw(
@@ -464,7 +527,7 @@ impl VickyStore {
             )?
             .was_replaced()
         {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("failed updating next.prev on {next_k:?}");
         }
 
         self.remove_raw(&item_key)?;
@@ -486,12 +549,14 @@ impl VickyStore {
         };
 
         let Some(list_buf) = self.get_raw(&coll_key)? else {
-            return Err(Box::new(VickyError::CorruptedLinkedList));
+            corrupted_list!("list element exists but list does not {item_key:?}");
         };
         let mut list = *from_bytes::<LinkedList>(&list_buf);
         let chain = chain_of(&v);
 
-        assert!(list.len > 0);
+        if list.len == 0 {
+            corrupted_list!("list has elements but has len=0");
+        }
         list.len -= 1;
 
         if list.tail == item_ph && list.head == item_ph {
@@ -516,5 +581,39 @@ impl VickyStore {
             coll_ph,
             next_ph: None,
         }
+    }
+
+    pub fn collection_len<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> Result<usize> {
+        let (_coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
+        let Some(list_buf) = self.get_raw(&coll_key)? else {
+            return Ok(0);
+        };
+        let list = from_bytes::<LinkedList>(&list_buf);
+        Ok(list.len as usize)
+    }
+
+    /// Discards the given list (removes all elements). This also works for corrupt lists, in case they
+    /// need to be dropped.
+    pub fn discard_collection<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> Result<()> {
+        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
+
+        let _guard = self.lock_collection(coll_ph);
+
+        let Some(list_buf) = self.remove_raw(&coll_key)? else {
+            return Ok(());
+        };
+        let list = *from_bytes::<LinkedList>(&list_buf);
+        let mut curr = list.head;
+
+        while curr != PartedHash::INVALID {
+            let Some((k, v)) = self._get_from_collection(coll_ph, curr)? else {
+                break;
+            };
+
+            curr = chain_of(&v).next;
+            self.remove_raw(&k)?;
+        }
+
+        Ok(())
     }
 }

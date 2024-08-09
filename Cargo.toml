@@ -19,4 +19,4 @@ rand = "0.8.5"
 [workspace]
 members = [
     "simulator"
-]
+, "vicky-perf"]

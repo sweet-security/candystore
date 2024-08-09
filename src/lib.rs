@@ -19,7 +19,11 @@ pub enum VickyError {
     KeyTooLong,
     ValueTooLong,
     KeyNotFound,
-    CorruptedLinkedList,
+    CompactionFailed(String),
+    SplitFailed(String),
+    LoadingFailed(String),
+    CorruptedLinkedList(String),
+    IterationEarlyStop,
 }
 
 impl Display for VickyError {
@@ -29,7 +33,11 @@ impl Display for VickyError {
             Self::KeyTooLong => write!(f, "key too long"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong => write!(f, "value too long"),
-            Self::CorruptedLinkedList => write!(f, "corrupted linked list"),
+            Self::CorruptedLinkedList(s) => write!(f, "corrupted linked list: {s}"),
+            Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
+            Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
+            Self::SplitFailed(s) => write!(f, "shard split failed: {s}"),
+            Self::IterationEarlyStop => write!(f, "iteration early stop"),
         }
     }
 }

@@ -8,8 +8,11 @@ use std::{
     },
 };
 
-use crate::shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH};
 use crate::{hashing::PartedHash, shard::KVPair};
+use crate::{
+    shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH},
+    VickyError,
+};
 use crate::{Config, Result};
 
 pub(crate) const USER_NAMESPACE: &[u8] = &[1];
@@ -190,7 +193,12 @@ impl VickyStore {
             };
             let start = u32::from_str_radix(start, 16).expect(filename);
             let end = u32::from_str_radix(end, 16).expect(filename);
-            assert!(start <= end && end <= Self::END_OF_SHARDS, "{start}..{end}");
+
+            if start > end || end > Self::END_OF_SHARDS {
+                return Err(Box::new(VickyError::LoadingFailed(format!(
+                    "Bad span for {filename}"
+                ))));
+            }
 
             if let Some(existing) = shards.get(&end) {
                 // this means we hit an uncompleted split - we need to take the wider of the two shards
@@ -225,7 +233,13 @@ impl VickyStore {
             if i < spans.len() - 1 {
                 let (next_start, next_end) = spans[i + 1];
                 if *start == next_start {
-                    assert!(next_end > *end);
+                    if next_end <= *end {
+                        return Err(Box::new(VickyError::LoadingFailed(format!(
+                            "Removing in-progress split with start={} end={} next_start={} next_end={}",
+                            *start, *end, next_start, next_end
+                        ))));
+                    }
+
                     to_remove.push((*start, *end))
                 }
             }
@@ -317,7 +331,7 @@ impl VickyStore {
     }
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<KVPair>> {
-        assert_ne!(ph, PartedHash::INVALID);
+        debug_assert_ne!(ph, PartedHash::INVALID);
         self.shards
             .read()
             .unwrap()
