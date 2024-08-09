@@ -144,7 +144,7 @@ pub struct VickyTypedCollection<C, K, V> {
 impl<C, K, V> VickyTypedCollection<C, K, V>
 where
     C: VickyTypedKey,
-    K: VickyTypedKey,
+    K: Encode + DecodeOwned,
     V: Encode + DecodeOwned,
 {
     pub fn new(store: Arc<VickyStore>) -> Self {
@@ -247,5 +247,15 @@ where
                 Ok(Some((key, val)))
             }
         })
+    }
+
+    pub fn discard<Q: ?Sized + Encode>(
+        &self,
+        coll_key: &Q,
+    ) -> Result<()>
+        where
+            C: Borrow<Q>, {
+        let coll_key = Self::make_coll(coll_key);
+        self.store.discard_collection(&coll_key)
     }
 }
