@@ -14,7 +14,6 @@ use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 struct LinkedList {
     tail: PartedHash,
     head: PartedHash,
-    len: u64,
 }
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -109,39 +108,6 @@ macro_rules! corrupted_unless {
     };
 }
 
-/// in order to make linked-lists crash-safe, the algorithm will be as follows:
-///
-/// insert:
-///  * check for existance of item, if it exists, it's already a member of the list
-///  * if it does not exist, go to list.tail. this element must exist.
-///  * start walking from list.tail over the next elements until we find a valid item
-///  * this is the true tail of the list. if curr->next is valid but missing, we consider
-///    curr to be true end as well.
-///  * make curr->next = new item's key
-///  * insert new item (prev pointing to curr)
-///  * set list.tail = new item, len+=1
-///
-///    this is safe because if we crash at any point, the list is still valid, and
-///    the accounting will be fixed by the next insert (patching len and tail)
-///
-/// removal:
-///  * check if the element exists. if not, no-op
-///  * if the element is the only item in the list, remove the list, and then remove the item.
-///  * if the element is the first in the (non-empty) list:
-///    * point list.head to element->next, set len-=1
-///    * point the new first element.prev = INVALID
-///    * remove the element
-///  * if the element is the last in the (non-empty) list:
-///    * point list.tail to element->prev, set len-=1
-///    * point the new last element.next = INVALID
-///    * remove the element
-///  * if the element is a middle element:
-///    * point element->prev->next to element->next -- now the element will not be traversed by iteration
-///    * point element->next->prev to element->prev -- now the element is completely disconnected
-///    * set list.len -= 1 -- THIS IS NOT CRASH SAFE. better remove the len altogether
-///    * remove the element
-///
-
 impl VickyStore {
     fn make_coll_key(&self, coll_key: &[u8]) -> (PartedHash, Vec<u8>) {
         let mut full_key = coll_key.to_owned();
@@ -223,7 +189,6 @@ impl VickyStore {
         let curr_list = LinkedList {
             tail: item_ph,
             head: item_ph,
-            len: 1,
         };
 
         let curr_list = match self.get_or_create_raw(&coll_key, bytes_of(&curr_list))? {
@@ -237,7 +202,6 @@ impl VickyStore {
         // first item. the first time should have prev=INVALID and next=INVALID
         if curr_list.head == item_ph {
             corrupted_unless!(curr_list.tail, item_ph, "head != tail");
-            corrupted_unless!(curr_list.len, 1, "len != 1");
             this_val.extend_from_slice(bytes_of(&Chain::INVALID));
             return self.set_raw(&item_key, &this_val);
         }
@@ -259,7 +223,6 @@ impl VickyStore {
         let new_list = LinkedList {
             head: curr_list.head,
             tail: item_ph,
-            len: curr_list.len + 1,
         };
         let this_chain = Chain {
             next: PartedHash::INVALID,
@@ -377,13 +340,11 @@ impl VickyStore {
 
     fn _remove_from_collection_single(
         &self,
-        list: LinkedList,
         chain: Chain,
         coll_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // this is the only element - remove it and the list itself
-        corrupted_unless!(list.len, 0, "expected list to be empty {item_key:?}");
         corrupted_unless!(
             chain.next,
             PartedHash::INVALID,
@@ -584,16 +545,11 @@ impl VickyStore {
         let Some(list_buf) = self.get_raw(&coll_key)? else {
             corrupted_list!("list element exists but list does not {item_key:?}");
         };
-        let mut list = *from_bytes::<LinkedList>(&list_buf);
+        let list = *from_bytes::<LinkedList>(&list_buf);
         let chain = chain_of(&v);
 
-        if list.len == 0 {
-            corrupted_list!("list has elements but has len=0");
-        }
-        list.len -= 1;
-
         if list.tail == item_ph && list.head == item_ph {
-            self._remove_from_collection_single(list, chain, coll_key, item_key)?
+            self._remove_from_collection_single(chain, coll_key, item_key)?
         } else if list.tail == item_ph {
             self._remove_from_collection_last(list_buf, list, chain, coll_ph, coll_key, item_key)?
         } else if list.head == item_ph {
@@ -614,15 +570,6 @@ impl VickyStore {
             coll_ph,
             next_ph: None,
         }
-    }
-
-    pub fn collection_len<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> Result<usize> {
-        let (_coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
-        let Some(list_buf) = self.get_raw(&coll_key)? else {
-            return Ok(0);
-        };
-        let list = from_bytes::<LinkedList>(&list_buf);
-        Ok(list.len as usize)
     }
 
     /// Discards the given list (removes all elements). This also works for corrupt lists, in case they

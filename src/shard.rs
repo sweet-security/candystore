@@ -90,6 +90,13 @@ impl<'a> Iterator for ByHashIterator<'a> {
     }
 }
 
+// Note: it's possible to reduce the number row_locks, it we make them per-store rather than per-shard.
+// the trivial way that would be to use NUM_ROWS (without risking deadlocks), which means you can have 64
+// concurrent operations. if you'd want more concurrency, it's possible to take the number of shards,
+// rounded down to the nearest power of two, and add that many MSBs from the shard selector to create a
+// shard+row combination that would be safe from deadlocks. however, it seems that holding 64 locks for
+// 64MB isn't that much, and you'd still need a RW lock per shard anyway.
+
 pub(crate) struct Shard {
     pub(crate) span: Range<u32>,
     file: File,
@@ -130,7 +137,7 @@ impl Shard {
         let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
 
         let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
-        let mut row_locks = vec![];
+        let mut row_locks = Vec::with_capacity(NUM_ROWS);
         for _ in 0..NUM_ROWS {
             row_locks.push(RwLock::new(()));
         }

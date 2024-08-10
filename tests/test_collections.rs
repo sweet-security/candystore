@@ -71,16 +71,10 @@ fn test_collections() -> Result<()> {
         assert_eq!(db.remove_from_collection("xxx", "k2")?, Some("v2".into()));
         assert_eq!(db.iter_collection("xxx").count(), 0);
 
-        assert_eq!(db.collection_len("xxx")?, 0);
-
-        assert_eq!(db.collection_len("floop")?, 0);
-
         for i in 0..10_000 {
             db.set_in_collection("xxx", &format!("my key {i}"), 
                 "very long key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
         }
-
-        assert_eq!(db.collection_len("xxx")?, 10_000);
 
         // make sure we survive splits
         assert!(db.stats().num_splits > 1);
@@ -89,8 +83,6 @@ fn test_collections() -> Result<()> {
             let (k, _) = res?.unwrap();
             assert_eq!(k, format!("my key {i}").as_bytes());
             db.remove_from_collection("xxx", &k)?;
-            let remaining = 10_000 - 1 - i;
-            assert_eq!(db.collection_len("xxx")?, remaining);
         }
 
         assert_eq!(db.iter_collection("xxx").count(), 0);
