@@ -592,9 +592,9 @@ impl VickyStore {
 
         if list.tail == item_ph && list.head == item_ph {
             self._remove_from_collection_single(chain, coll_key, item_key)?
-        } else if list.head == item_ph {
+        } else if list.head == item_ph || chain.prev == PartedHash::INVALID {
             self._remove_from_collection_head(list_buf, list, chain, coll_ph, coll_key, item_key)?
-        } else if list.tail == item_ph {
+        } else if list.tail == item_ph || chain.next == PartedHash::INVALID {
             self._remove_from_collection_tail(list_buf, list, chain, coll_ph, coll_key, item_key)?
         } else {
             self._remove_from_collection_middle(chain, coll_ph, item_ph, item_key)?

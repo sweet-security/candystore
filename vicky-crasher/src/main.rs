@@ -91,6 +91,55 @@ fn child_collection_inserts() -> Result<()> {
     Ok(())
 }
 
+fn child_collection_removals() -> Result<()> {
+    // our job is to remove 1M entries to a collection while being killed by our evil parent
+
+    let store = VickyStore::open("dbdir", Config::default())?;
+
+    let lowest_bytes = store.get("coll_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
+    let lowest = u32::from_le_bytes([
+        lowest_bytes[0],
+        lowest_bytes[1],
+        lowest_bytes[2],
+        lowest_bytes[3],
+    ]);
+
+    if lowest == TARGET - 1 {
+        println!("child finished (already at {lowest})");
+        return Ok(());
+    }
+
+    println!("child starting at {lowest}",);
+    const Q: u32 = TARGET / 4;
+    const Q1: u32 = Q;
+    const Q2: u32 = 2 * Q;
+    const Q3: u32 = 3 * Q;
+    const Q4: u32 = 4 * Q;
+    const _: () = assert!(Q4 == TARGET);
+
+    for i in lowest..TARGET {
+        let j = match i {
+            0..Q1 => i,                      // remove head [0..250K), remaining [250K..1M)
+            Q1..Q2 => TARGET - 1 - (i - Q1), // remove tail [750K..1M), reamining [250K..750K)
+            Q2..Q3 => i,                     // remove middle [500K..750K), remaining [250K..500K)
+            Q3..Q4 => i - Q2,                // remove head [250K..500K), remaining [)
+            _ => unreachable!(),
+        };
+
+        let old = store.remove_from_collection("xxx", &j.to_le_bytes())?;
+
+        assert!(
+            old.is_none() || old == Some("yyy".into()),
+            "{i} old={old:?}"
+        );
+        store.set("coll_lowest", &i.to_le_bytes())?;
+    }
+
+    println!("child finished");
+
+    Ok(())
+}
+
 fn parent_run(mut child_func: impl FnMut() -> Result<()>, sleep: Range<u64>) -> Result<()> {
     for i in 0.. {
         let pid = unsafe { libc::fork() };
@@ -183,6 +232,22 @@ fn main() -> Result<()> {
             assert_eq!(k, (i as u32).to_le_bytes());
             assert_eq!(v, b"yyy");
         }
+
+        println!("DB validated successfully");
+    }
+
+    parent_run(child_collection_removals, 10..30)?;
+
+    {
+        println!("Parent starts validating the DB...");
+
+        let store = VickyStore::open("dbdir", Config::default())?;
+        assert_eq!(
+            store.remove("coll_lowest")?,
+            Some((TARGET - 1).to_le_bytes().to_vec())
+        );
+
+        assert_eq!(store.iter_collection("xxx").count(), 0);
 
         println!("DB validated successfully");
     }
