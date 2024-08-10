@@ -38,6 +38,7 @@ pub struct VickyStore {
     pub(crate) num_compactions: AtomicUsize,
     pub(crate) num_splits: AtomicUsize,
     // locks for complicated operations
+    pub(crate) keyed_locks_mask: u32,
     pub(crate) keyed_locks: Vec<Mutex<()>>,
 }
 
@@ -143,8 +144,13 @@ impl VickyStore {
             Self::create_first_shards(&dir_path, &config, &mut shards)?;
         }
 
+        let mut num_keyed_locks = config.max_concurrent_collection_ops.max(4);
+        if !num_keyed_locks.is_power_of_two() {
+            num_keyed_locks = 1 << (num_keyed_locks.ilog2() + 1);
+        }
+
         let mut keyed_locks = vec![];
-        for _ in 0..1024 {
+        for _ in 0..num_keyed_locks {
             keyed_locks.push(Mutex::new(()));
         }
 
@@ -155,6 +161,7 @@ impl VickyStore {
             num_entries: 0.into(),
             num_compactions: 0.into(),
             num_splits: 0.into(),
+            keyed_locks_mask: num_keyed_locks - 1,
             keyed_locks,
         })
     }

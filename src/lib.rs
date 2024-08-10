@@ -54,6 +54,7 @@ pub struct Config {
     pub hash_seed: HashSeed, // just some entropy, not so important unless you fear DoS
     pub expected_number_of_keys: usize, // hint for creating number of shards accordingly)
     pub merge_small_shards: bool, // whether or not to merge small shards when items are removed
+    pub max_concurrent_collection_ops: u32, // number of keyed locks for concurrent collection ops
 }
 
 impl Default for Config {
@@ -64,6 +65,7 @@ impl Default for Config {
             hash_seed: HashSeed::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
             expected_number_of_keys: 0,
             merge_small_shards: false,
+            max_concurrent_collection_ops: 64,
         }
     }
 }

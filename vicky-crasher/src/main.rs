@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::time::Duration;
 
 use rand::Rng;
@@ -5,7 +6,7 @@ use vicky_store::{Config, Result, VickyStore};
 
 const TARGET: u32 = 1_000_000;
 
-fn child_func() -> Result<()> {
+fn child_inserts() -> Result<()> {
     // our job is to create 1M entries while being killed by our evil parent
 
     let store = VickyStore::open("dbdir", Config::default())?;
@@ -33,18 +34,46 @@ fn child_func() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    _ = std::fs::remove_dir_all("dbdir");
+fn child_removals() -> Result<()> {
+    // our job is to create 1M entries while being killed by our evil parent
 
+    let store = VickyStore::open("dbdir", Config::default())?;
+    let lowest_bytes = store.get("lowest")?.unwrap_or(vec![0, 0, 0, 0]);
+    let lowest = u32::from_le_bytes([
+        lowest_bytes[0],
+        lowest_bytes[1],
+        lowest_bytes[2],
+        lowest_bytes[3],
+    ]);
+
+    if lowest == TARGET - 1 {
+        println!("child finished (already at {lowest})");
+        return Ok(());
+    }
+
+    println!("child starting at {lowest}");
+
+    for i in lowest..TARGET {
+        store.remove(&i.to_le_bytes())?;
+        store.set("lowest", &i.to_le_bytes())?;
+    }
+    println!("child finished");
+
+    Ok(())
+}
+
+fn parent_run(mut child_func: impl FnMut() -> Result<()>, sleep: Range<u64>) -> Result<()> {
     for i in 0.. {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
-            child_func()?;
-            return Ok(());
+            let res = child_func();
+            unsafe { libc::exit(if res.is_err() { 1 } else { 0 }) };
         } else {
             // parent
-            std::thread::sleep(Duration::from_millis(rand::thread_rng().gen_range(10..300)));
+            std::thread::sleep(Duration::from_millis(
+                rand::thread_rng().gen_range(sleep.clone()),
+            ));
             let mut status = 0i32;
             let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if rc == 0 {
@@ -60,6 +89,13 @@ fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("dbdir");
+
+    parent_run(child_inserts, 10..300)?;
 
     println!("Parent starts validating the DB...");
 
@@ -77,6 +113,18 @@ fn main() -> Result<()> {
         count += 1;
     }
     assert_eq!(count, TARGET);
+
+    println!("DB validated successfully");
+
+    parent_run(child_removals, 10..30)?;
+
+    println!("Parent starts validating the DB...");
+
+    assert_eq!(
+        store.remove("lowest")?,
+        Some((TARGET - 1).to_le_bytes().to_vec())
+    );
+    assert_eq!(store.iter().count(), 0);
 
     println!("DB validated successfully");
 
