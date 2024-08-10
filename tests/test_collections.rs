@@ -77,7 +77,7 @@ fn test_collections() -> Result<()> {
         }
 
         // make sure we survive splits
-        assert!(db.stats().num_splits > 1);
+        assert!(db._num_splits() > 1);
 
         for (i, res) in db.iter_collection("xxx").enumerate() {
             let (k, _) = res?.unwrap();

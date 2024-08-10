@@ -20,7 +20,7 @@ fn test_loading() -> Result<()> {
                 db.set(&format!("unique key {i}"), LONG_VAL)?;
             }
 
-            assert!(db.stats().num_splits > 1);
+            assert!(db._num_splits() > 1);
             assert_eq!(db.iter().count(), 1000);
         }
 

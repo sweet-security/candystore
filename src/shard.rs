@@ -46,7 +46,7 @@ pub(crate) struct ShardHeader {
     pub rows: PageAligned<[ShardRow; NUM_ROWS]>,
 }
 
-const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
+pub(crate) const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
 const _: () = assert!(HEADER_SIZE % 4096 == 0);
 
 #[derive(Debug)]

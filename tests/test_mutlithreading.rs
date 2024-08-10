@@ -60,16 +60,17 @@ fn test_multithreaded() -> Result<()> {
             let gets = succ_gets.load(std::sync::atomic::Ordering::SeqCst);
             let removals = succ_removals.load(std::sync::atomic::Ordering::SeqCst);
 
-            let stats = db.stats();
             println!(
-                "[{attempt}] {stats:?} gets={gets} removals={removals} diff={}",
-                gets - removals
+                "[{attempt}] splits={} compactions={} gets={gets} removals={removals} stats={:?}",
+                db._num_splits(),
+                db._num_compactions(),
+                db.stats()
             );
 
-            assert_eq!(db.iter().count(), stats.num_entries);
+            assert_eq!(db.iter().count(), db._num_entries());
             assert!(
-                stats.num_entries >= (NUM_ITEMS * 7) / 10
-                    && stats.num_entries <= (NUM_ITEMS * 9) / 10
+                db._num_entries() >= (NUM_ITEMS * 7) / 10
+                    && db._num_entries() <= (NUM_ITEMS * 9) / 10
             );
             db.clear()?;
         }

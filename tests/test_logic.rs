@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use vicky_store::{Config, Result, Stats, VickyStore};
+use vicky_store::{Config, Result, VickyStore};
 
 use crate::common::{run_in_tempdir, LONG_VAL};
 
@@ -33,10 +33,9 @@ fn test_logic() -> Result<()> {
         assert!(db.remove("my_name")?.is_none());
         assert!(db.get("my name")?.is_none());
 
-        let stats = db.stats();
-        assert_eq!(stats.num_entries, 1);
-        assert_eq!(stats.num_compactions, 0);
-        assert_eq!(stats.num_splits, 0);
+        assert_eq!(db._num_entries(), 1);
+        assert_eq!(db._num_compactions(), 0);
+        assert_eq!(db._num_splits(), 0);
 
         for _ in 0..1000 {
             db.set(
@@ -48,32 +47,27 @@ fn test_logic() -> Result<()> {
                 .is_some());
         }
 
-        let stats = db.stats();
-        assert_eq!(stats.num_entries, 1);
-        assert!(stats.num_compactions >= 2);
-        assert_eq!(stats.num_splits, 0);
+        let compactions1 = db._num_compactions();
+        let splits1 = db._num_splits();
+        assert_eq!(db._num_entries(), 1);
+        assert!(compactions1 >= 2);
+        assert_eq!(splits1, 0);
 
         for i in 0..1000 {
             db.set(&format!("unique key {i}"), LONG_VAL)?;
         }
 
-        let stats2 = db.stats();
-        assert_eq!(stats2.num_entries, 1001);
-        assert_eq!(stats2.num_compactions, stats.num_compactions);
-        assert!(stats2.num_splits > stats.num_splits);
+        assert_eq!(db._num_entries(), 1001);
+        assert_eq!(db._num_compactions(), compactions1);
+        assert!(db._num_splits() > splits1);
 
         assert_eq!(db.get("your_name")?, Some("vizzini".into()));
         db.clear()?;
         assert_eq!(db.get("your_name")?, None);
 
-        assert_eq!(
-            db.stats(),
-            Stats {
-                num_compactions: 0,
-                num_entries: 0,
-                num_splits: 0
-            }
-        );
+        assert_eq!(db._num_entries(), 0);
+        assert_eq!(db._num_compactions(), 0);
+        assert_eq!(db._num_splits(), 0);
 
         for i in 0..1000 {
             db.set(&format!("unique key {i}"), LONG_VAL)?;

@@ -8,7 +8,10 @@ use std::{
     },
 };
 
-use crate::{hashing::PartedHash, shard::KVPair};
+use crate::{
+    hashing::PartedHash,
+    shard::{KVPair, HEADER_SIZE},
+};
 use crate::{
     shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH},
     VickyError,
@@ -20,12 +23,20 @@ pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
 pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 
-/// Stats from VickyStore, mainly useful for debugging
-#[derive(Debug, PartialEq, Eq, Clone)]
+/// Stats from VickyStore
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Stats {
-    pub num_entries: usize,
-    pub num_splits: usize,
-    pub num_compactions: usize,
+    pub num_shards: usize,
+    pub num_inserted: usize,
+    pub num_deleted: usize,
+    pub total_bytes: usize,
+    pub wasted_bytes: usize,
+}
+
+impl Stats {
+    pub fn len(&self) -> usize {
+        self.num_inserted - self.num_deleted
+    }
 }
 
 /// The VickyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
@@ -419,12 +430,30 @@ impl VickyStore {
 
     /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and
     /// are not persisted, so closing and opening the store will reset the stats.
+    pub fn _num_entries(&self) -> usize {
+        self.num_entries.load(Ordering::Acquire)
+    }
+    pub fn _num_compactions(&self) -> usize {
+        self.num_compactions.load(Ordering::Acquire)
+    }
+    pub fn _num_splits(&self) -> usize {
+        self.num_splits.load(Ordering::Acquire)
+    }
+
     pub fn stats(&self) -> Stats {
-        Stats {
-            num_entries: self.num_entries.load(Ordering::Acquire),
-            num_compactions: self.num_compactions.load(Ordering::Relaxed),
-            num_splits: self.num_splits.load(Ordering::Relaxed),
+        let guard = self.shards.read().unwrap();
+        let mut stats = Stats {
+            num_shards: guard.len(),
+            ..Default::default()
+        };
+        for (_, shard) in guard.iter() {
+            stats.num_inserted += shard.header.num_inserted.load(Ordering::Relaxed) as usize;
+            stats.num_deleted += shard.header.num_deleted.load(Ordering::Relaxed) as usize;
+            stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
+            stats.total_bytes +=
+                shard.header.write_offset.load(Ordering::Relaxed) as usize + HEADER_SIZE as usize;
         }
+        stats
     }
 
     /// Returns an iterator over the whole store
