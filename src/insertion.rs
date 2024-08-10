@@ -309,7 +309,7 @@ impl VickyStore {
         self.replace_raw(&self.make_user_key(key.as_ref()), val.as_ref())
     }
 
-    pub fn get_or_create_raw(
+    pub(crate) fn get_or_create_raw(
         &self,
         full_key: &[u8],
         default_val: &[u8],
