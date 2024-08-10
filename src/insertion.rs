@@ -296,7 +296,11 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<SetStatus> {
-        self.set_raw(&self.make_user_key(key.as_ref()), val.as_ref())
+        self.owned_set(key.as_ref().to_owned(), val.as_ref())
+    }
+
+    pub fn owned_set(&self, key: Vec<u8>, val: &[u8]) -> Result<SetStatus> {
+        self.set_raw(&self.make_user_key(key), val)
     }
 
     pub fn replace_raw(&self, full_key: &[u8], val: &[u8]) -> Result<ReplaceStatus> {
@@ -317,19 +321,23 @@ impl VickyStore {
         key: &B1,
         val: &B2,
     ) -> Result<ReplaceStatus> {
-        self.replace_raw(&self.make_user_key(key.as_ref()), val.as_ref())
+        self.owned_replace(key.as_ref().to_owned(), val.as_ref())
+    }
+
+    pub fn owned_replace(&self, key: Vec<u8>, val: &[u8]) -> Result<ReplaceStatus> {
+        self.replace_raw(&self.make_user_key(key), val.as_ref())
     }
 
     pub(crate) fn get_or_create_raw(
         &self,
         full_key: &[u8],
-        default_val: &[u8],
+        default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
-        let res = self.insert_internal(&full_key, default_val, InsertMode::GetOrCreate)?;
+        let res = self.insert_internal(&full_key, &default_val, InsertMode::GetOrCreate)?;
         if let Some(prev) = res {
             Ok(GetOrCreateStatus::ExistingValue(prev))
         } else {
-            Ok(GetOrCreateStatus::CreatedNew(vec![]))
+            Ok(GetOrCreateStatus::CreatedNew(default_val))
         }
     }
 
@@ -344,12 +352,15 @@ impl VickyStore {
         key: &B1,
         default_val: &B2,
     ) -> Result<GetOrCreateStatus> {
-        match self.get_or_create_raw(&self.make_user_key(key.as_ref()), default_val.as_ref())? {
-            GetOrCreateStatus::CreatedNew(_) => Ok(GetOrCreateStatus::CreatedNew(
-                default_val.as_ref().to_owned(),
-            )),
-            v @ GetOrCreateStatus::ExistingValue(_) => Ok(v),
-        }
+        self.owned_get_or_create(key.as_ref().to_owned(), default_val.as_ref().to_owned())
+    }
+
+    pub fn owned_get_or_create(
+        &self,
+        key: Vec<u8>,
+        default_val: Vec<u8>,
+    ) -> Result<GetOrCreateStatus> {
+        self.get_or_create_raw(&self.make_user_key(key), default_val)
     }
 
     // this is NOT crash safe (may produce inconsistent results)
@@ -396,7 +407,7 @@ impl VickyStore {
         expected: Option<&B2>,
     ) -> Result<ModifyStatus> {
         self.modify_inplace_raw(
-            &self.make_user_key(key.as_ref()),
+            &self.make_user_key(key.as_ref().to_owned()),
             patch.as_ref(),
             patch_offset,
             expected.map(|b| b.as_ref()),
@@ -436,6 +447,10 @@ impl VickyStore {
         key: &B1,
         new_value: &B2,
     ) -> Result<ModifyStatus> {
-        self.replace_inplace_raw(&self.make_user_key(key.as_ref()), new_value.as_ref())
+        self.owned_replace_inplace(key.as_ref().to_owned(), new_value.as_ref())
+    }
+
+    pub fn owned_replace_inplace(&self, key: Vec<u8>, new_value: &[u8]) -> Result<ModifyStatus> {
+        self.replace_inplace_raw(&self.make_user_key(key), new_value)
     }
 }

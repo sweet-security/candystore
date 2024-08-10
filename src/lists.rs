@@ -109,17 +109,15 @@ macro_rules! corrupted_unless {
 }
 
 impl VickyStore {
-    fn make_list_key(&self, list_key: &[u8]) -> (PartedHash, Vec<u8>) {
-        let mut full_key = list_key.to_owned();
-        full_key.extend_from_slice(LIST_NAMESPACE);
-        (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
+    fn make_list_key(&self, mut list_key: Vec<u8>) -> (PartedHash, Vec<u8>) {
+        list_key.extend_from_slice(LIST_NAMESPACE);
+        (PartedHash::new(&self.config.hash_seed, &list_key), list_key)
     }
 
-    fn make_item_key(&self, list_ph: PartedHash, item_key: &[u8]) -> (PartedHash, Vec<u8>) {
-        let mut full_key = item_key.to_owned();
-        full_key.extend_from_slice(bytes_of(&list_ph));
-        full_key.extend_from_slice(ITEM_NAMESPACE);
-        (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
+    fn make_item_key(&self, list_ph: PartedHash, mut item_key: Vec<u8>) -> (PartedHash, Vec<u8>) {
+        item_key.extend_from_slice(bytes_of(&list_ph));
+        item_key.extend_from_slice(ITEM_NAMESPACE);
+        (PartedHash::new(&self.config.hash_seed, &item_key), item_key)
     }
 
     fn _list_lock(&self, list_ph: PartedHash) -> MutexGuard<()> {
@@ -170,11 +168,11 @@ impl VickyStore {
 
     fn _insert_to_list(
         &self,
-        list_key: &[u8],
-        item_key: &[u8],
-        val: &[u8],
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+        mut val: Vec<u8>,
         mode: InsertMode,
-    ) -> Result<SetStatus> {
+    ) -> Result<GetOrCreateStatus> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
 
@@ -186,25 +184,24 @@ impl VickyStore {
             if matches!(mode, InsertMode::GetOrCreate) {
                 // don't replace the existing value
                 old_val.truncate(old_val.len() - size_of::<Chain>());
-                return Ok(SetStatus::PrevValue(old_val));
+                return Ok(GetOrCreateStatus::ExistingValue(old_val));
             }
 
-            let mut new_val = val.as_ref().to_owned();
-            new_val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
-            match self.replace_raw(&item_key, &new_val)? {
+            val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
+            match self.replace_raw(&item_key, &val)? {
                 ReplaceStatus::DoesNotExist => {
                     corrupted_list!("failed replacing existing item");
                 }
                 ReplaceStatus::PrevValue(mut v) => {
                     v.truncate(v.len() - size_of::<Chain>());
-                    return Ok(SetStatus::PrevValue(v));
+                    return Ok(GetOrCreateStatus::ExistingValue(v));
                 }
             }
         }
 
         if matches!(mode, InsertMode::Replace) {
             // not allowed to create
-            return Ok(SetStatus::CreatedNew);
+            return Ok(GetOrCreateStatus::CreatedNew(val));
         }
 
         // item does not exist, and the list itself might also not exist. get or create the list
@@ -213,19 +210,22 @@ impl VickyStore {
             head: item_ph,
         };
 
-        let curr_list = match self.get_or_create_raw(&list_key, bytes_of(&curr_list))? {
-            GetOrCreateStatus::CreatedNew(_) => curr_list,
-            GetOrCreateStatus::ExistingValue(v) => *from_bytes::<LinkedList>(&v),
-        };
-
-        let mut this_val = val.as_ref().to_owned();
+        let curr_list = *from_bytes::<LinkedList>(
+            &self
+                .get_or_create_raw(&list_key, bytes_of(&curr_list).to_vec())?
+                .value(),
+        );
 
         // we have the list. if the list points to this item, it means we've just created it
         // this first time should have prev=INVALID and next=INVALID
         if curr_list.head == item_ph {
             corrupted_unless!(curr_list.tail, item_ph, "head != tail");
-            this_val.extend_from_slice(bytes_of(&Chain::INVALID));
-            return self.set_raw(&item_key, &this_val);
+            val.extend_from_slice(bytes_of(&Chain::INVALID));
+            if !self.set_raw(&item_key, &val)?.was_created() {
+                corrupted_list!("expected to create {item_key:?}");
+            }
+            val.truncate(val.len() - size_of::<Chain>());
+            return Ok(GetOrCreateStatus::CreatedNew(val));
         }
 
         // the list already exists. start at list.tail and find the true tail (it's possible list.tail
@@ -257,9 +257,9 @@ impl VickyStore {
             next: PartedHash::INVALID,
             prev: tail_ph,
         };
-        this_val.extend_from_slice(bytes_of(&this_chain));
+        val.extend_from_slice(bytes_of(&this_chain));
 
-        if self.set_raw(&item_key, &this_val)?.was_replaced() {
+        if self.set_raw(&item_key, &val)?.was_replaced() {
             corrupted_list!("tail element {item_key:?} already exists");
         }
 
@@ -280,7 +280,8 @@ impl VickyStore {
         {
             corrupted_list!("failed to update list tail to point to {item_key:?}");
         }
-        Ok(SetStatus::CreatedNew)
+        val.truncate(val.len() - size_of::<Chain>());
+        Ok(GetOrCreateStatus::CreatedNew(val))
     }
 
     pub fn set_in_list<
@@ -293,12 +294,23 @@ impl VickyStore {
         item_key: &B2,
         val: &B3,
     ) -> Result<SetStatus> {
-        self._insert_to_list(
-            list_key.as_ref(),
-            item_key.as_ref(),
-            val.as_ref(),
-            InsertMode::Set,
+        self.owned_set_in_list(
+            list_key.as_ref().to_owned(),
+            item_key.as_ref().to_owned(),
+            val.as_ref().to_owned(),
         )
+    }
+
+    pub fn owned_set_in_list(
+        &self,
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+        val: Vec<u8>,
+    ) -> Result<SetStatus> {
+        match self._insert_to_list(list_key, item_key, val, InsertMode::Set)? {
+            GetOrCreateStatus::CreatedNew(_) => Ok(SetStatus::CreatedNew),
+            GetOrCreateStatus::ExistingValue(v) => Ok(SetStatus::PrevValue(v)),
+        }
     }
 
     pub fn replace_in_list<
@@ -311,14 +323,22 @@ impl VickyStore {
         item_key: &B2,
         val: &B3,
     ) -> Result<ReplaceStatus> {
-        match self._insert_to_list(
-            list_key.as_ref(),
-            item_key.as_ref(),
-            val.as_ref(),
-            InsertMode::Replace,
-        )? {
-            SetStatus::CreatedNew => Ok(ReplaceStatus::DoesNotExist),
-            SetStatus::PrevValue(v) => Ok(ReplaceStatus::PrevValue(v)),
+        self.owned_replace_in_list(
+            list_key.as_ref().to_owned(),
+            item_key.as_ref().to_owned(),
+            val.as_ref().to_owned(),
+        )
+    }
+
+    pub fn owned_replace_in_list(
+        &self,
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+        val: Vec<u8>,
+    ) -> Result<ReplaceStatus> {
+        match self._insert_to_list(list_key, item_key, val, InsertMode::Replace)? {
+            GetOrCreateStatus::CreatedNew(_) => Ok(ReplaceStatus::DoesNotExist),
+            GetOrCreateStatus::ExistingValue(v) => Ok(ReplaceStatus::PrevValue(v)),
         }
     }
 
@@ -332,15 +352,20 @@ impl VickyStore {
         item_key: &B2,
         val: &B3,
     ) -> Result<GetOrCreateStatus> {
-        match self._insert_to_list(
-            list_key.as_ref(),
-            item_key.as_ref(),
-            val.as_ref(),
-            InsertMode::GetOrCreate,
-        )? {
-            SetStatus::CreatedNew => Ok(GetOrCreateStatus::CreatedNew(val.as_ref().to_owned())),
-            SetStatus::PrevValue(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
-        }
+        self.owned_get_or_create_in_list(
+            list_key.as_ref().to_owned(),
+            item_key.as_ref().to_owned(),
+            val.as_ref().to_owned(),
+        )
+    }
+
+    pub fn owned_get_or_create_in_list(
+        &self,
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+        val: Vec<u8>,
+    ) -> Result<GetOrCreateStatus> {
+        self._insert_to_list(list_key, item_key, val, InsertMode::GetOrCreate)
     }
 
     pub fn get_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
@@ -348,8 +373,16 @@ impl VickyStore {
         list_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        let (list_ph, _) = self.make_list_key(list_key.as_ref());
-        let (_, item_key) = self.make_item_key(list_ph, item_key.as_ref());
+        self.owned_get_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
+    }
+
+    pub fn owned_get_from_list(
+        &self,
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        let (list_ph, _) = self.make_list_key(list_key);
+        let (_, item_key) = self.make_item_key(list_ph, item_key);
         let Some(mut v) = self.get_raw(&item_key)? else {
             return Ok(None);
         };
@@ -561,8 +594,16 @@ impl VickyStore {
         list_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
-        let (item_ph, item_key) = self.make_item_key(list_ph, item_key.as_ref());
+        self.owned_remove_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
+    }
+
+    pub fn owned_remove_from_list(
+        &self,
+        list_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        let (list_ph, list_key) = self.make_list_key(list_key);
+        let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
 
         let _guard = self._list_lock(list_ph);
 
@@ -597,7 +638,10 @@ impl VickyStore {
     }
 
     pub fn iter_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> LinkedListIterator {
-        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
+        self.owned_iter_list(list_key.as_ref().to_owned())
+    }
+    pub fn owned_iter_list(&self, list_key: Vec<u8>) -> LinkedListIterator {
+        let (list_ph, list_key) = self.make_list_key(list_key);
         LinkedListIterator {
             store: &self,
             list_key,
@@ -609,7 +653,11 @@ impl VickyStore {
     /// Discards the given list (removes all elements). This also works for corrupt lists, in case they
     /// need to be dropped.
     pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<()> {
-        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
+        self.owned_discard_list(list_key.as_ref().to_owned())
+    }
+
+    pub fn owned_discard_list(&self, list_key: Vec<u8>) -> Result<()> {
+        let (list_ph, list_key) = self.make_list_key(list_key);
 
         let _guard = self._list_lock(list_ph);
 

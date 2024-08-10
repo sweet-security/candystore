@@ -343,10 +343,9 @@ impl VickyStore {
         Ok(())
     }
 
-    pub(crate) fn make_user_key(&self, key: &[u8]) -> Vec<u8> {
-        let mut full_key = key.to_owned();
-        full_key.extend_from_slice(USER_NAMESPACE);
-        full_key
+    pub(crate) fn make_user_key(&self, mut key: Vec<u8>) -> Vec<u8> {
+        key.extend_from_slice(USER_NAMESPACE);
+        key
     }
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<Result<KVPair>>> {
@@ -396,12 +395,20 @@ impl VickyStore {
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
     /// The data is fully-owned, no references are returned.
     pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        self.get_raw(&self.make_user_key(key.as_ref()))
+        self.owned_get(key.as_ref().to_owned())
+    }
+
+    pub fn owned_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        self.get_raw(&self.make_user_key(key))
     }
 
     /// Checks whether the given key exists in the store
     pub fn contains<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<bool> {
-        Ok(self.get_raw(&self.make_user_key(key.as_ref()))?.is_some())
+        self.owned_contains(key.as_ref().to_owned())
+    }
+
+    pub fn owned_contains(&self, key: Vec<u8>) -> Result<bool> {
+        Ok(self.get_raw(&self.make_user_key(key))?.is_some())
     }
 
     pub(crate) fn remove_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -424,7 +431,11 @@ impl VickyStore {
     /// Removes a key-value pair from the store, returning `None` if the key did not exist,
     /// or `Some(old_value)` if it did
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        self.remove_raw(&self.make_user_key(key.as_ref()))
+        self.owned_remove(key.as_ref().to_owned())
+    }
+
+    pub fn owned_remove(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        self.remove_raw(&self.make_user_key(key))
     }
 
     /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and
