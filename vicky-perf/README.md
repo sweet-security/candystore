@@ -4,8 +4,7 @@ Performance results from my machine
 * Lenovo ThinkPad X1 Carbon Gen 10 (12th Gen Intel® Core™ i7-1260P × 16)
 * RAM: 32.0 GiB
 * SSD: 512 GB
-* Built with `cargo build -F use_sink --release` (the `sink` makes sure the optimizer can't 
-  eliminate actual code paths, but it has some performance penalty)
+* Built with `cargo build --release`
 * Running on a local filesystem
 
 ### Smallish entries (4 byte keys, 3 byte values)

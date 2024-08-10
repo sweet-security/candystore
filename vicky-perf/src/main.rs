@@ -1,25 +1,9 @@
 use std::{
+    hint::black_box,
     sync::{atomic::AtomicU64, Arc},
     time::Instant,
 };
-
 use vicky_store::{Config, Result, VickyStore};
-
-static SINK: AtomicU64 = AtomicU64::new(0);
-
-// the sink will consume the data, thus making sure the compiler does not optimize out actually reading the data
-#[cfg(feature = "use_sink")]
-fn sink(buf: &[u8]) {
-    if !buf.is_empty() {
-        SINK.fetch_add(
-            buf[0] as u64 + buf[buf.len() - 1] as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-#[cfg(not(feature = "use_sink"))]
-fn sink(_buf: &[u8]) {}
 
 fn run2(msg: &str, iters: u32, mut func: impl FnMut() -> Result<()>) -> Result<()> {
     let t0 = Instant::now();
@@ -66,19 +50,19 @@ fn test_small_keys(num_keys: u32) -> Result<()> {
 
         run("  Small entries get 100% existing", num_keys, |i| {
             let val = db.get(&(i * 2).to_le_bytes())?;
-            sink(&val.unwrap());
+            black_box(val.unwrap());
             Ok(())
         })?;
 
         run("  Small entries get 50% existing", num_keys, |i| {
             let val = db.get(&(i * 2).to_le_bytes())?;
-            sink(&val.unwrap_or_default());
+            black_box(val.unwrap());
             Ok(())
         })?;
 
         run("  Small entries removal", num_keys, |i| {
             let val = db.remove(&(i * 2).to_le_bytes())?;
-            sink(&val.unwrap());
+            black_box(val.unwrap());
             Ok(())
         })?;
 
@@ -87,7 +71,7 @@ fn test_small_keys(num_keys: u32) -> Result<()> {
         run("  Small entries mixed", num_keys, |i| {
             db.set(&(i * 2).to_le_bytes(), "xxx")?;
             let val = db.get(&(i / 2).to_le_bytes())?;
-            sink(&val.unwrap_or_default());
+            black_box(val);
             if i % 8 == 7 {
                 db.remove(&(i / 2).to_le_bytes())?;
             }
@@ -130,7 +114,7 @@ fn test_large_keys(num_keys: u32) -> Result<()> {
             let mut key = [99u8; 100];
             key[0..4].copy_from_slice(&i.to_le_bytes());
             let val = db.get(&key)?;
-            sink(&val.unwrap_or_default());
+            black_box(val);
             Ok(())
         })?;
 
@@ -138,7 +122,7 @@ fn test_large_keys(num_keys: u32) -> Result<()> {
             let mut key = [99u8; 100];
             key[0..4].copy_from_slice(&i.to_le_bytes());
             let val = db.remove(&(i * 2).to_le_bytes())?;
-            sink(&val.unwrap_or_default());
+            black_box(val);
             Ok(())
         })?;
 
@@ -180,7 +164,7 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
         for coll in 0..num_colls {
             for item in 0..num_items_per_coll {
                 let val = db.get_from_collection(&coll.to_le_bytes(), &item.to_le_bytes())?;
-                sink(&val.unwrap());
+                black_box(val);
             }
         }
         Ok(())
@@ -189,7 +173,7 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
     run2("  Iterations", num_colls * num_items_per_coll, || {
         for coll in 0..num_colls {
             let count = db.iter_collection(&coll.to_le_bytes()).count();
-            sink(&count.to_le_bytes());
+            black_box(count);
             debug_assert_eq!(count, num_items_per_coll as usize);
         }
         Ok(())
@@ -204,7 +188,7 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
                     if item % 2 == 0 {
                         let val =
                             db.remove_from_collection(&coll.to_le_bytes(), &item.to_le_bytes())?;
-                        sink(&val.unwrap());
+                        black_box(val.unwrap());
                     }
                 }
             }
@@ -275,7 +259,7 @@ fn test_concurrency_without_contention(num_threads: u32, num_keys: u32) -> Resul
                     for i in thd * num_keys..(thd + 1) * num_keys {
                         let val = db.get(&i.to_le_bytes())?;
                         debug_assert_eq!(val, Some(thd.to_le_bytes().to_vec()));
-                        sink(&val.unwrap());
+                        black_box(val.unwrap());
                     }
                     get_time_ns.fetch_add(
                         Instant::now().duration_since(t0).as_nanos() as u64,
@@ -288,7 +272,7 @@ fn test_concurrency_without_contention(num_threads: u32, num_keys: u32) -> Resul
                     for i in thd * num_keys..(thd + 1) * num_keys {
                         let val = db.remove(&i.to_le_bytes())?;
                         debug_assert!(val.is_some());
-                        sink(&val.unwrap());
+                        black_box(val.unwrap());
                     }
                     removal_time_ns.fetch_add(
                         Instant::now().duration_since(t0).as_nanos() as u64,
@@ -339,7 +323,7 @@ fn do_gets(num_keys: u32, get_time_ns: &Arc<AtomicU64>, db: &Arc<VickyStore>) ->
     let t0 = Instant::now();
     for i in 0..num_keys {
         let val = db.get(&i.to_le_bytes())?;
-        sink(&val.unwrap_or_default());
+        black_box(val);
     }
     get_time_ns.fetch_add(
         Instant::now().duration_since(t0).as_nanos() as u64,
@@ -356,7 +340,7 @@ fn do_removals(
     let t0 = Instant::now();
     for i in 0..num_keys {
         let val = db.remove(&i.to_le_bytes())?;
-        sink(&val.unwrap_or_default());
+        black_box(val);
     }
     removal_time_ns.fetch_add(
         Instant::now().duration_since(t0).as_nanos() as u64,
@@ -442,8 +426,6 @@ fn main() -> Result<()> {
     test_collections(10, 100_000)?;
     test_concurrency_without_contention(10, 100_000)?;
     test_concurrency_with_contention(10, 1_000_000)?;
-
-    println!("junk={}", SINK.load(std::sync::atomic::Ordering::Relaxed));
 
     Ok(())
 }

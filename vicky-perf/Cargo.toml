@@ -5,6 +5,3 @@ edition = "2021"
 
 [dependencies]
 vicky-store={path=".."}
-
-[features]
-use_sink=[]

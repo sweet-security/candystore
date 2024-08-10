@@ -502,12 +502,12 @@ impl VickyStore {
         // this is a "middle" item, it has a prev one and a next one. set prev.next = this.next,
         // set next.prev = prev, update list (for `len`)
         corrupted_if!(
-            chain.next,
+            chain.prev,
             PartedHash::INVALID,
             "a middle element must have a valid prev"
         );
         corrupted_if!(
-            chain.prev,
+            chain.next,
             PartedHash::INVALID,
             "a middle element must have a valid next"
         );
