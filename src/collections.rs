@@ -146,6 +146,34 @@ impl VickyStore {
         Ok(None)
     }
 
+    fn find_true_tail(
+        &self,
+        coll_ph: PartedHash,
+        tail: PartedHash,
+    ) -> Result<(PartedHash, Vec<u8>, Vec<u8>)> {
+        let mut curr = tail;
+        let mut prev = None;
+        loop {
+            if let Some((k, v)) = self._get_from_collection(coll_ph, curr)? {
+                let chain = chain_of(&v);
+                if chain.next == PartedHash::INVALID {
+                    // curr is the true tail
+                    return Ok((curr, k, v));
+                }
+                prev = Some((curr, k, v));
+                curr = chain.next;
+            } else if let Some(prev) = prev {
+                // prev is the true tail
+                assert_ne!(curr, tail);
+                return Ok(prev);
+            } else {
+                // if prev=None, it means we weren't able to find list.tail. this should never happen
+                assert_eq!(curr, tail);
+                corrupted_list!("tail {:?} does not exist", tail);
+            }
+        }
+    }
+
     fn _insert_to_collection(
         &self,
         coll_key: &[u8],
@@ -198,57 +226,54 @@ impl VickyStore {
 
         let mut this_val = val.as_ref().to_owned();
 
-        // we have the list. if the list points to this item, it means we've just created it and we point to the
-        // first item. the first time should have prev=INVALID and next=INVALID
+        // we have the list. if the list points to this item, it means we've just created it
+        // this first time should have prev=INVALID and next=INVALID
         if curr_list.head == item_ph {
             corrupted_unless!(curr_list.tail, item_ph, "head != tail");
             this_val.extend_from_slice(bytes_of(&Chain::INVALID));
             return self.set_raw(&item_key, &this_val);
         }
 
-        // the list already existed, which means we need to read the last element (tail) and update its pointers
-        let Some((last_k, last_v)) = self._get_from_collection(coll_ph, curr_list.tail)? else {
-            corrupted_list!("tail {:?} does not exist", curr_list.tail);
-        };
+        // the list already exists. start at list.tail and find the true tail (it's possible list.tail
+        // isn't up to date because of crashes)
+        let (tail_ph, tail_k, tail_v) = self.find_true_tail(coll_ph, curr_list.tail)?;
 
-        //  list [h  t]                           list [h  t]
-        //        |  \_____             \\              |  \________________
-        //        |        \             \\             |                   \
-        //       item1     item2         //            item1     item2      item3
-        //        n---------^ n--X      //              n---------^ n--------^ n--X
-        //    X__p \________p                       X__p \________p \_________p
+        // modify the last item to point to the new item. if we crash after this, everything is okay because
+        // find_true_tail will stop at this item
+        let mut tail_chain = chain_of(&tail_v);
+        tail_chain.next = item_ph;
 
-        let mut last_chain = chain_of(&last_v);
-        last_chain.next = item_ph;
-        let new_list = LinkedList {
-            head: curr_list.head,
-            tail: item_ph,
-        };
+        if !self
+            .modify_inplace_raw(
+                &tail_k,
+                bytes_of(&tail_chain),
+                tail_v.len() - size_of::<Chain>(),
+                Some(&tail_v[tail_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            corrupted_list!(
+                "failed to update previous element {tail_v:?} to point to this one {item_key:?}"
+            );
+        }
+
+        // now add item, with prev pointing to the old tail. if we crash after this, find_true_tail
+        // will return the newly-added item as the tail.
         let this_chain = Chain {
             next: PartedHash::INVALID,
-            prev: curr_list.tail,
+            prev: tail_ph,
         };
         this_val.extend_from_slice(bytes_of(&this_chain));
-
-        // first create the new item, then update last_k, then update the list
 
         if self.set_raw(&item_key, &this_val)?.was_replaced() {
             corrupted_list!("tail element {item_key:?} already exists");
         }
 
-        if !self
-            .modify_inplace_raw(
-                &last_k,
-                bytes_of(&last_chain),
-                last_v.len() - size_of::<Chain>(),
-                Some(&last_v[last_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
-            corrupted_list!(
-                "failed to update previous element {last_k:?} to point to this one {item_key:?}"
-            );
-        }
+        // now update the list to point to the new tail. if we crash before it's committed, all's good
+        let new_list = LinkedList {
+            head: curr_list.head,
+            tail: item_ph,
+        };
 
         if !self
             .modify_inplace_raw(
@@ -340,28 +365,28 @@ impl VickyStore {
 
     fn _remove_from_collection_single(
         &self,
-        chain: Chain,
+        _chain: Chain,
         coll_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // this is the only element - remove it and the list itself
-        corrupted_unless!(
-            chain.next,
-            PartedHash::INVALID,
-            "chain.next must be invalid"
-        );
-        corrupted_unless!(
-            chain.prev,
-            PartedHash::INVALID,
-            "chain.prev must be invalid"
-        );
+        // corrupted_unless!(
+        //     chain.next,
+        //     PartedHash::INVALID,
+        //     "chain.next must be invalid"
+        // );
+        // corrupted_unless!(
+        //     chain.prev,
+        //     PartedHash::INVALID,
+        //     "chain.prev must be invalid"
+        // );
 
         self.remove_raw(&coll_key)?;
         self.remove_raw(&item_key)?;
         Ok(())
     }
 
-    fn _remove_from_collection_last(
+    fn _remove_from_collection_head(
         &self,
         list_buf: Vec<u8>,
         mut list: LinkedList,
@@ -370,71 +395,26 @@ impl VickyStore {
         coll_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
-        // this item is the last one, and we have a previous item. update list.tail to the previous one,
-        // and set prev.next = INVALID, and remove this item
-        corrupted_unless!(
-            chain.next,
-            PartedHash::INVALID,
-            "last element must not have a valid next"
-        );
-        corrupted_if!(
-            chain.prev,
-            PartedHash::INVALID,
-            "last element must have a valid prev"
-        );
-        list.tail = chain.prev;
-
-        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
-            corrupted_list!("missing prev element {item_key:?}");
-        };
-
-        if !self
-            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
-            .was_replaced()
-        {
-            corrupted_list!("failed updating list tail to point to prev");
-        }
-
-        let mut prev_chain = chain_of(&prev_v);
-        prev_chain.next = PartedHash::INVALID;
-        self.modify_inplace_raw(
-            &prev_k,
-            bytes_of(&prev_chain),
-            prev_v.len() - size_of::<Chain>(),
-            Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
-        )?;
-
-        self.remove_raw(&item_key)?;
-        Ok(())
-    }
-
-    fn _remove_from_collection_first(
-        &self,
-        list_buf: Vec<u8>,
-        mut list: LinkedList,
-        chain: Chain,
-        coll_ph: PartedHash,
-        coll_key: Vec<u8>,
-        item_key: Vec<u8>,
-    ) -> Result<()> {
-        // this is the first item in the list, and we have a following one. set list.head = next,
-        // set next.prev = INVALID, and remove the item
-        corrupted_unless!(
-            chain.prev,
-            PartedHash::INVALID,
-            "first element must not have a valid prev {item_key:?}"
-        );
+        // corrupted_unless!(
+        //     chain.prev,
+        //     PartedHash::INVALID,
+        //     "first element must not have a valid prev {item_key:?}"
+        // );
         corrupted_if!(
             chain.next,
             PartedHash::INVALID,
             "first element must have a valid next {item_key:?}"
         );
-        list.head = chain.next;
 
+        // we surely have a next element
         let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
             corrupted_list!("failed getting next of {item_key:?}");
         };
 
+        // update list.head from this to this.next. if we crash afterwards, the list will start
+        // at the expected place. XXX: head.prev will not be INVALID, which might break asserts.
+        // we will need to remove the asserts, or add find_true_head
+        list.head = chain.next;
         if !self
             .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
@@ -442,6 +422,7 @@ impl VickyStore {
             corrupted_list!("failed updating list head to point to next");
         }
 
+        // set the new head's prev link to INVALID. if we crash afterwards, everything is good.
         let mut next_chain = chain_of(&next_v);
         next_chain.prev = PartedHash::INVALID;
         if !self
@@ -456,17 +437,66 @@ impl VickyStore {
             corrupted_list!("failed updating prev=INVALID on the now-first element");
         }
 
+        // finally remove the item, sealing the deal
+        self.remove_raw(&item_key)?;
+        Ok(())
+    }
+
+    fn _remove_from_collection_tail(
+        &self,
+        list_buf: Vec<u8>,
+        mut list: LinkedList,
+        chain: Chain,
+        coll_ph: PartedHash,
+        coll_key: Vec<u8>,
+        item_key: Vec<u8>,
+    ) -> Result<()> {
+        // corrupted_unless!(
+        //     chain.next,
+        //     PartedHash::INVALID,
+        //     "last element must not have a valid next"
+        // );
+        corrupted_if!(
+            chain.prev,
+            PartedHash::INVALID,
+            "last element must have a valid prev"
+        );
+
+        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
+            corrupted_list!("missing prev element {item_key:?}");
+        };
+
+        // point list.tail to the prev item. if we crash afterwards, the removed tail is still considered
+        // part of the list (find_true_tai will find it)
+        list.tail = chain.prev;
+        if !self
+            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .was_replaced()
+        {
+            corrupted_list!("failed updating list tail to point to prev");
+        }
+
+        // update the new tail's next to INVALID. if we crash afterwards, the removed tail is no longer
+        // considered part of the list
+        let mut prev_chain = chain_of(&prev_v);
+        prev_chain.next = PartedHash::INVALID;
+        self.modify_inplace_raw(
+            &prev_k,
+            bytes_of(&prev_chain),
+            prev_v.len() - size_of::<Chain>(),
+            Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
+        )?;
+
+        // finally remove the item, sealing the deal
         self.remove_raw(&item_key)?;
         Ok(())
     }
 
     fn _remove_from_collection_middle(
         &self,
-        list_buf: Vec<u8>,
-        list: LinkedList,
         chain: Chain,
         coll_ph: PartedHash,
-        coll_key: Vec<u8>,
+        item_ph: PartedHash,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // this is a "middle" item, it has a prev one and a next one. set prev.next = this.next,
@@ -489,41 +519,45 @@ impl VickyStore {
             corrupted_list!("missing next element of {item_key:?}");
         };
 
-        if !self
-            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
-            .was_replaced()
-        {
-            corrupted_list!("failed updating list length");
-        }
-
+        // disconnect the item from its prev. if we crash afterwards, the item is still considered part
+        // of the list, but will no longer appear in iterations.
+        // note: we only do that if the previous item thinks that we're its next item, otherwise it means
+        // we crashed in the middle of such an operation before
         let mut prev_chain = chain_of(&prev_v);
+        if prev_chain.next == item_ph {
+            prev_chain.next = chain.next;
+            if !self
+                .modify_inplace_raw(
+                    &prev_k,
+                    bytes_of(&prev_chain),
+                    prev_v.len() - size_of::<Chain>(),
+                    Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
+                )?
+                .was_replaced()
+            {
+                corrupted_list!("failed updating prev.next on {prev_k:?}");
+            }
+        }
+
+        // disconnect the item from its next. if we crash afterwards, the item is truly no longer linked to the
+        // list, so everything's good
         let mut next_chain = chain_of(&next_v);
-        prev_chain.next = chain.next;
-        next_chain.prev = chain.prev;
-
-        if !self
-            .modify_inplace_raw(
-                &prev_k,
-                bytes_of(&prev_chain),
-                prev_v.len() - size_of::<Chain>(),
-                Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
-            corrupted_list!("failed updating prev.next on {prev_k:?}");
-        }
-        if !self
-            .modify_inplace_raw(
-                &next_k,
-                bytes_of(&next_chain),
-                next_v.len() - size_of::<Chain>(),
-                Some(&next_v[next_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
-            corrupted_list!("failed updating next.prev on {next_k:?}");
+        if next_chain.prev == item_ph {
+            next_chain.prev = chain.prev;
+            if !self
+                .modify_inplace_raw(
+                    &next_k,
+                    bytes_of(&next_chain),
+                    next_v.len() - size_of::<Chain>(),
+                    Some(&next_v[next_v.len() - size_of::<Chain>()..]),
+                )?
+                .was_replaced()
+            {
+                corrupted_list!("failed updating next.prev on {next_k:?}");
+            }
         }
 
+        // now it's safe to remove the item
         self.remove_raw(&item_key)?;
         Ok(())
     }
@@ -538,27 +572,33 @@ impl VickyStore {
 
         let _guard = self.lock_collection(coll_ph);
 
+        // if the item does not exist -- all's good
         let Some(mut v) = self.get_raw(&item_key)? else {
             return Ok(None);
         };
 
-        let Some(list_buf) = self.get_raw(&coll_key)? else {
-            corrupted_list!("list element exists but list does not {item_key:?}");
-        };
-        let list = *from_bytes::<LinkedList>(&list_buf);
         let chain = chain_of(&v);
+        v.truncate(v.len() - size_of::<Chain>());
+
+        // fetch the list
+        let Some(list_buf) = self.get_raw(&coll_key)? else {
+            // if it does not exist, it means we've crashed right between removing the list and removing
+            // the only item it held - proceed to removing this item
+            self.remove_raw(&item_key)?;
+            return Ok(Some(v));
+        };
+
+        let list = *from_bytes::<LinkedList>(&list_buf);
 
         if list.tail == item_ph && list.head == item_ph {
             self._remove_from_collection_single(chain, coll_key, item_key)?
-        } else if list.tail == item_ph {
-            self._remove_from_collection_last(list_buf, list, chain, coll_ph, coll_key, item_key)?
         } else if list.head == item_ph {
-            self._remove_from_collection_first(list_buf, list, chain, coll_ph, coll_key, item_key)?
+            self._remove_from_collection_head(list_buf, list, chain, coll_ph, coll_key, item_key)?
+        } else if list.tail == item_ph {
+            self._remove_from_collection_tail(list_buf, list, chain, coll_ph, coll_key, item_key)?
         } else {
-            self._remove_from_collection_middle(list_buf, list, chain, coll_ph, coll_key, item_key)?
+            self._remove_from_collection_middle(chain, coll_ph, item_ph, item_key)?
         };
-
-        v.truncate(v.len() - size_of::<Chain>());
         Ok(Some(v))
     }
 
