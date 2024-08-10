@@ -132,62 +132,61 @@ fn test_large_keys(num_keys: u32) -> Result<()> {
     Ok(())
 }
 
-fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
+fn test_lists(num_lists: u32, num_items_per_list: u32) -> Result<()> {
     let db = VickyStore::open(
         "./dbdir",
         Config {
-            expected_number_of_keys: (num_colls * num_items_per_coll) as usize,
+            expected_number_of_keys: (num_lists * num_items_per_list) as usize,
             ..Default::default()
         },
     )?;
 
-    println!("{num_colls} collections with {num_items_per_coll} items in each");
-    run2("  Inserts", num_colls * num_items_per_coll, || {
-        for coll in 0..num_colls {
-            for item in 0..num_items_per_coll {
-                db.set_in_collection(&coll.to_le_bytes(), &item.to_le_bytes(), "xxx")?;
+    println!("{num_lists} lists with {num_items_per_list} items in each");
+    run2("  Inserts", num_lists * num_items_per_list, || {
+        for list in 0..num_lists {
+            for item in 0..num_items_per_list {
+                db.set_in_list(&list.to_le_bytes(), &item.to_le_bytes(), "xxx")?;
             }
         }
         Ok(())
     })?;
 
-    run2("  Updates", num_colls * num_items_per_coll, || {
-        for coll in 0..num_colls {
-            for item in 0..num_items_per_coll {
-                db.set_in_collection(&coll.to_le_bytes(), &item.to_le_bytes(), "yyy")?;
+    run2("  Updates", num_lists * num_items_per_list, || {
+        for list in 0..num_lists {
+            for item in 0..num_items_per_list {
+                db.set_in_list(&list.to_le_bytes(), &item.to_le_bytes(), "yyy")?;
             }
         }
         Ok(())
     })?;
 
-    run2("  Gets", num_colls * num_items_per_coll, || {
-        for coll in 0..num_colls {
-            for item in 0..num_items_per_coll {
-                let val = db.get_from_collection(&coll.to_le_bytes(), &item.to_le_bytes())?;
+    run2("  Gets", num_lists * num_items_per_list, || {
+        for list in 0..num_lists {
+            for item in 0..num_items_per_list {
+                let val = db.get_from_list(&list.to_le_bytes(), &item.to_le_bytes())?;
                 black_box(val);
             }
         }
         Ok(())
     })?;
 
-    run2("  Iterations", num_colls * num_items_per_coll, || {
-        for coll in 0..num_colls {
-            let count = db.iter_collection(&coll.to_le_bytes()).count();
+    run2("  Iterations", num_lists * num_items_per_list, || {
+        for list in 0..num_lists {
+            let count = db.iter_list(&list.to_le_bytes()).count();
             black_box(count);
-            debug_assert_eq!(count, num_items_per_coll as usize);
+            debug_assert_eq!(count, num_items_per_list as usize);
         }
         Ok(())
     })?;
 
     run2(
         "  Removal of 50% items",
-        num_colls * num_items_per_coll / 2,
+        num_lists * num_items_per_list / 2,
         || {
-            for coll in 0..num_colls {
-                for item in 0..num_items_per_coll {
+            for list in 0..num_lists {
+                for item in 0..num_items_per_list {
                     if item % 2 == 0 {
-                        let val =
-                            db.remove_from_collection(&coll.to_le_bytes(), &item.to_le_bytes())?;
+                        let val = db.remove_from_list(&list.to_le_bytes(), &item.to_le_bytes())?;
                         black_box(val.unwrap());
                     }
                 }
@@ -196,9 +195,9 @@ fn test_collections(num_colls: u32, num_items_per_coll: u32) -> Result<()> {
         },
     )?;
 
-    run2("  Discards", num_colls * num_items_per_coll / 2, || {
-        for coll in 0..num_colls {
-            db.discard_collection(&coll.to_le_bytes())?;
+    run2("  Discards", num_lists * num_items_per_list / 2, || {
+        for list in 0..num_lists {
+            db.discard_list(&list.to_le_bytes())?;
         }
         Ok(())
     })?;
@@ -423,7 +422,7 @@ fn test_concurrency_with_contention(num_threads: u32, num_keys: u32) -> Result<(
 fn main() -> Result<()> {
     test_small_keys(1_000_000)?;
     test_large_keys(500_000)?;
-    test_collections(10, 100_000)?;
+    test_lists(10, 100_000)?;
     test_concurrency_without_contention(10, 100_000)?;
     test_concurrency_with_contention(10, 1_000_000)?;
 

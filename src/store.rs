@@ -157,7 +157,7 @@ impl VickyStore {
             Self::create_first_shards(&dir_path, &config, &mut shards)?;
         }
 
-        let mut num_keyed_locks = config.max_concurrent_collection_ops.max(4);
+        let mut num_keyed_locks = config.max_concurrent_list_ops.max(4);
         if !num_keyed_locks.is_power_of_two() {
             num_keyed_locks = 1 << (num_keyed_locks.ilog2() + 1);
         }

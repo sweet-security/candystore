@@ -38,8 +38,8 @@ fn chain_of(buf: &[u8]) -> Chain {
 
 pub struct LinkedListIterator<'a> {
     store: &'a VickyStore,
-    coll_key: Vec<u8>,
-    coll_ph: PartedHash,
+    list_key: Vec<u8>,
+    list_ph: PartedHash,
     next_ph: Option<PartedHash>,
 }
 
@@ -47,7 +47,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
     type Item = Result<Option<KVPair>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_ph.is_none() {
-            let buf = match self.store.get_raw(&self.coll_key) {
+            let buf = match self.store.get_raw(&self.list_key) {
                 Ok(buf) => buf,
                 Err(e) => return Some(Err(e)),
             };
@@ -63,7 +63,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
         if curr == PartedHash::INVALID {
             return None;
         }
-        let kv = match self.store._get_from_collection(self.coll_ph, curr) {
+        let kv = match self.store._list_get(self.list_ph, curr) {
             Err(e) => return Some(Err(e)),
             Ok(kv) => kv,
         };
@@ -109,30 +109,26 @@ macro_rules! corrupted_unless {
 }
 
 impl VickyStore {
-    fn make_coll_key(&self, coll_key: &[u8]) -> (PartedHash, Vec<u8>) {
-        let mut full_key = coll_key.to_owned();
+    fn make_list_key(&self, list_key: &[u8]) -> (PartedHash, Vec<u8>) {
+        let mut full_key = list_key.to_owned();
         full_key.extend_from_slice(LIST_NAMESPACE);
         (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
     }
 
-    fn make_item_key(&self, coll_ph: PartedHash, item_key: &[u8]) -> (PartedHash, Vec<u8>) {
+    fn make_item_key(&self, list_ph: PartedHash, item_key: &[u8]) -> (PartedHash, Vec<u8>) {
         let mut full_key = item_key.to_owned();
-        full_key.extend_from_slice(bytes_of(&coll_ph));
+        full_key.extend_from_slice(bytes_of(&list_ph));
         full_key.extend_from_slice(ITEM_NAMESPACE);
         (PartedHash::new(&self.config.hash_seed, &full_key), full_key)
     }
 
-    fn lock_collection(&self, coll_ph: PartedHash) -> MutexGuard<()> {
-        self.keyed_locks[(coll_ph.signature() & self.keyed_locks_mask) as usize].lock()
+    fn _list_lock(&self, list_ph: PartedHash) -> MutexGuard<()> {
+        self.keyed_locks[(list_ph.signature() & self.keyed_locks_mask) as usize].lock()
     }
 
-    fn _get_from_collection(
-        &self,
-        coll_ph: PartedHash,
-        item_ph: PartedHash,
-    ) -> Result<Option<KVPair>> {
+    fn _list_get(&self, list_ph: PartedHash, item_ph: PartedHash) -> Result<Option<KVPair>> {
         let mut suffix = [0u8; ITEM_SUFFIX_LEN];
-        suffix[0..PartedHash::LEN].copy_from_slice(bytes_of(&coll_ph));
+        suffix[0..PartedHash::LEN].copy_from_slice(bytes_of(&list_ph));
         suffix[PartedHash::LEN..].copy_from_slice(ITEM_NAMESPACE);
 
         for res in self.get_by_hash(item_ph)? {
@@ -146,13 +142,13 @@ impl VickyStore {
 
     fn find_true_tail(
         &self,
-        coll_ph: PartedHash,
+        list_ph: PartedHash,
         tail: PartedHash,
     ) -> Result<(PartedHash, Vec<u8>, Vec<u8>)> {
         let mut curr = tail;
         let mut prev = None;
         loop {
-            if let Some((k, v)) = self._get_from_collection(coll_ph, curr)? {
+            if let Some((k, v)) = self._list_get(list_ph, curr)? {
                 let chain = chain_of(&v);
                 if chain.next == PartedHash::INVALID {
                     // curr is the true tail
@@ -172,17 +168,17 @@ impl VickyStore {
         }
     }
 
-    fn _insert_to_collection(
+    fn _insert_to_list(
         &self,
-        coll_key: &[u8],
+        list_key: &[u8],
         item_key: &[u8],
         val: &[u8],
         mode: InsertMode,
     ) -> Result<SetStatus> {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key);
-        let (item_ph, item_key) = self.make_item_key(coll_ph, item_key);
+        let (list_ph, list_key) = self.make_list_key(list_key);
+        let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
 
-        let _guard = self.lock_collection(coll_ph);
+        let _guard = self._list_lock(list_ph);
 
         // if the item already exists, it means it belongs to this list. we just need to update the value and
         // keep the existing chain part
@@ -217,7 +213,7 @@ impl VickyStore {
             head: item_ph,
         };
 
-        let curr_list = match self.get_or_create_raw(&coll_key, bytes_of(&curr_list))? {
+        let curr_list = match self.get_or_create_raw(&list_key, bytes_of(&curr_list))? {
             GetOrCreateStatus::CreatedNew(_) => curr_list,
             GetOrCreateStatus::ExistingValue(v) => *from_bytes::<LinkedList>(&v),
         };
@@ -234,7 +230,7 @@ impl VickyStore {
 
         // the list already exists. start at list.tail and find the true tail (it's possible list.tail
         // isn't up to date because of crashes)
-        let (tail_ph, tail_k, tail_v) = self.find_true_tail(coll_ph, curr_list.tail)?;
+        let (tail_ph, tail_k, tail_v) = self.find_true_tail(list_ph, curr_list.tail)?;
 
         // modify the last item to point to the new item. if we crash after this, everything is okay because
         // find_true_tail will stop at this item
@@ -275,7 +271,7 @@ impl VickyStore {
 
         if !self
             .modify_inplace_raw(
-                &coll_key,
+                &list_key,
                 bytes_of(&new_list),
                 0,
                 Some(bytes_of(&curr_list)),
@@ -287,36 +283,36 @@ impl VickyStore {
         Ok(SetStatus::CreatedNew)
     }
 
-    pub fn set_in_collection<
+    pub fn set_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
         B3: AsRef<[u8]> + ?Sized,
     >(
         &self,
-        coll_key: &B1,
+        list_key: &B1,
         item_key: &B2,
         val: &B3,
     ) -> Result<SetStatus> {
-        self._insert_to_collection(
-            coll_key.as_ref(),
+        self._insert_to_list(
+            list_key.as_ref(),
             item_key.as_ref(),
             val.as_ref(),
             InsertMode::Set,
         )
     }
 
-    pub fn replace_in_collection<
+    pub fn replace_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
         B3: AsRef<[u8]> + ?Sized,
     >(
         &self,
-        coll_key: &B1,
+        list_key: &B1,
         item_key: &B2,
         val: &B3,
     ) -> Result<ReplaceStatus> {
-        match self._insert_to_collection(
-            coll_key.as_ref(),
+        match self._insert_to_list(
+            list_key.as_ref(),
             item_key.as_ref(),
             val.as_ref(),
             InsertMode::Replace,
@@ -326,18 +322,18 @@ impl VickyStore {
         }
     }
 
-    pub fn get_or_create_in_collection<
+    pub fn get_or_create_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
         B3: AsRef<[u8]> + ?Sized,
     >(
         &self,
-        coll_key: &B1,
+        list_key: &B1,
         item_key: &B2,
         val: &B3,
     ) -> Result<GetOrCreateStatus> {
-        match self._insert_to_collection(
-            coll_key.as_ref(),
+        match self._insert_to_list(
+            list_key.as_ref(),
             item_key.as_ref(),
             val.as_ref(),
             InsertMode::GetOrCreate,
@@ -347,13 +343,13 @@ impl VickyStore {
         }
     }
 
-    pub fn get_from_collection<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    pub fn get_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
-        coll_key: &B1,
+        list_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        let (coll_ph, _) = self.make_coll_key(coll_key.as_ref());
-        let (_, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
+        let (list_ph, _) = self.make_list_key(list_key.as_ref());
+        let (_, item_key) = self.make_item_key(list_ph, item_key.as_ref());
         let Some(mut v) = self.get_raw(&item_key)? else {
             return Ok(None);
         };
@@ -361,10 +357,10 @@ impl VickyStore {
         Ok(Some(v))
     }
 
-    fn _remove_from_collection_single(
+    fn _remove_from_list_single(
         &self,
         _chain: Chain,
-        coll_key: Vec<u8>,
+        list_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // this is the only element - remove it and the list itself
@@ -379,18 +375,18 @@ impl VickyStore {
         //     "chain.prev must be invalid"
         // );
 
-        self.remove_raw(&coll_key)?;
+        self.remove_raw(&list_key)?;
         self.remove_raw(&item_key)?;
         Ok(())
     }
 
-    fn _remove_from_collection_head(
+    fn _remove_from_list_head(
         &self,
         list_buf: Vec<u8>,
         mut list: LinkedList,
         chain: Chain,
-        coll_ph: PartedHash,
-        coll_key: Vec<u8>,
+        list_ph: PartedHash,
+        list_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // corrupted_unless!(
@@ -405,7 +401,7 @@ impl VickyStore {
         );
 
         // we surely have a next element
-        let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
+        let Some((next_k, next_v)) = self._list_get(list_ph, chain.next)? else {
             corrupted_list!("failed getting next of {item_key:?}");
         };
 
@@ -414,7 +410,7 @@ impl VickyStore {
         // we will need to remove the asserts, or add find_true_head
         list.head = chain.next;
         if !self
-            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .modify_inplace_raw(&list_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
             corrupted_list!("failed updating list head to point to next");
@@ -440,13 +436,13 @@ impl VickyStore {
         Ok(())
     }
 
-    fn _remove_from_collection_tail(
+    fn _remove_from_list_tail(
         &self,
         list_buf: Vec<u8>,
         mut list: LinkedList,
         chain: Chain,
-        coll_ph: PartedHash,
-        coll_key: Vec<u8>,
+        list_ph: PartedHash,
+        list_key: Vec<u8>,
         item_key: Vec<u8>,
     ) -> Result<()> {
         // corrupted_unless!(
@@ -460,7 +456,7 @@ impl VickyStore {
             "last element must have a valid prev"
         );
 
-        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
+        let Some((prev_k, prev_v)) = self._list_get(list_ph, chain.prev)? else {
             corrupted_list!("missing prev element {item_key:?}");
         };
 
@@ -468,7 +464,7 @@ impl VickyStore {
         // part of the list (find_true_tai will find it)
         list.tail = chain.prev;
         if !self
-            .modify_inplace_raw(&coll_key, bytes_of(&list), 0, Some(&list_buf))?
+            .modify_inplace_raw(&list_key, bytes_of(&list), 0, Some(&list_buf))?
             .was_replaced()
         {
             corrupted_list!("failed updating list tail to point to prev");
@@ -490,10 +486,10 @@ impl VickyStore {
         Ok(())
     }
 
-    fn _remove_from_collection_middle(
+    fn _remove_from_list_middle(
         &self,
         chain: Chain,
-        coll_ph: PartedHash,
+        list_ph: PartedHash,
         item_ph: PartedHash,
         item_key: Vec<u8>,
     ) -> Result<()> {
@@ -510,10 +506,10 @@ impl VickyStore {
             "a middle element must have a valid next"
         );
 
-        let Some((prev_k, prev_v)) = self._get_from_collection(coll_ph, chain.prev)? else {
+        let Some((prev_k, prev_v)) = self._list_get(list_ph, chain.prev)? else {
             corrupted_list!("missing prev element of {item_key:?}");
         };
-        let Some((next_k, next_v)) = self._get_from_collection(coll_ph, chain.next)? else {
+        let Some((next_k, next_v)) = self._list_get(list_ph, chain.next)? else {
             corrupted_list!("missing next element of {item_key:?}");
         };
 
@@ -560,15 +556,15 @@ impl VickyStore {
         Ok(())
     }
 
-    pub fn remove_from_collection<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    pub fn remove_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
-        coll_key: &B1,
+        list_key: &B1,
         item_key: &B2,
     ) -> Result<Option<Vec<u8>>> {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
-        let (item_ph, item_key) = self.make_item_key(coll_ph, item_key.as_ref());
+        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
+        let (item_ph, item_key) = self.make_item_key(list_ph, item_key.as_ref());
 
-        let _guard = self.lock_collection(coll_ph);
+        let _guard = self._list_lock(list_ph);
 
         // if the item does not exist -- all's good
         let Some(mut v) = self.get_raw(&item_key)? else {
@@ -579,7 +575,7 @@ impl VickyStore {
         v.truncate(v.len() - size_of::<Chain>());
 
         // fetch the list
-        let Some(list_buf) = self.get_raw(&coll_key)? else {
+        let Some(list_buf) = self.get_raw(&list_key)? else {
             // if it does not exist, it means we've crashed right between removing the list and removing
             // the only item it held - proceed to removing this item
             self.remove_raw(&item_key)?;
@@ -589,42 +585,42 @@ impl VickyStore {
         let list = *from_bytes::<LinkedList>(&list_buf);
 
         if list.tail == item_ph && list.head == item_ph {
-            self._remove_from_collection_single(chain, coll_key, item_key)?
+            self._remove_from_list_single(chain, list_key, item_key)?
         } else if list.head == item_ph || chain.prev == PartedHash::INVALID {
-            self._remove_from_collection_head(list_buf, list, chain, coll_ph, coll_key, item_key)?
+            self._remove_from_list_head(list_buf, list, chain, list_ph, list_key, item_key)?
         } else if list.tail == item_ph || chain.next == PartedHash::INVALID {
-            self._remove_from_collection_tail(list_buf, list, chain, coll_ph, coll_key, item_key)?
+            self._remove_from_list_tail(list_buf, list, chain, list_ph, list_key, item_key)?
         } else {
-            self._remove_from_collection_middle(chain, coll_ph, item_ph, item_key)?
+            self._remove_from_list_middle(chain, list_ph, item_ph, item_key)?
         };
         Ok(Some(v))
     }
 
-    pub fn iter_collection<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> LinkedListIterator {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
+    pub fn iter_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> LinkedListIterator {
+        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
         LinkedListIterator {
             store: &self,
-            coll_key,
-            coll_ph,
+            list_key,
+            list_ph,
             next_ph: None,
         }
     }
 
     /// Discards the given list (removes all elements). This also works for corrupt lists, in case they
     /// need to be dropped.
-    pub fn discard_collection<B: AsRef<[u8]> + ?Sized>(&self, coll_key: &B) -> Result<()> {
-        let (coll_ph, coll_key) = self.make_coll_key(coll_key.as_ref());
+    pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<()> {
+        let (list_ph, list_key) = self.make_list_key(list_key.as_ref());
 
-        let _guard = self.lock_collection(coll_ph);
+        let _guard = self._list_lock(list_ph);
 
-        let Some(list_buf) = self.remove_raw(&coll_key)? else {
+        let Some(list_buf) = self.remove_raw(&list_key)? else {
             return Ok(());
         };
         let list = *from_bytes::<LinkedList>(&list_buf);
         let mut curr = list.head;
 
         while curr != PartedHash::INVALID {
-            let Some((k, v)) = self._get_from_collection(coll_ph, curr)? else {
+            let Some((k, v)) = self._list_get(list_ph, curr)? else {
                 break;
             };
 

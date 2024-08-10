@@ -7,15 +7,15 @@ fn main() -> Result<()> {
     // not clear the DB every time
     db.clear()?;
 
-    db.set_in_collection("asia", "iraq", "arabic")?;
-    db.set_in_collection("asia", "china", "chinese")?;
-    db.set_in_collection("asia", "russia", "russian")?;
+    db.set_in_list("asia", "iraq", "arabic")?;
+    db.set_in_list("asia", "china", "chinese")?;
+    db.set_in_list("asia", "russia", "russian")?;
 
-    db.set_in_collection("europe", "spain", "spanish")?;
-    db.set_in_collection("europe", "italy", "italian")?;
-    db.set_in_collection("europe", "greece", "greek")?;
+    db.set_in_list("europe", "spain", "spanish")?;
+    db.set_in_list("europe", "italy", "italian")?;
+    db.set_in_list("europe", "greece", "greek")?;
 
-    for res in db.iter_collection("asia") {
+    for res in db.iter_list("asia") {
         let (k, v) = res?.unwrap();
         println!(
             "{} => {}",

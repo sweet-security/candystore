@@ -63,12 +63,12 @@ fn child_removals() -> Result<()> {
     Ok(())
 }
 
-fn child_collection_inserts() -> Result<()> {
-    // our job is to insert 1M entries to a collection while being killed by our evil parent
+fn child_list_inserts() -> Result<()> {
+    // our job is to insert 1M entries to a list while being killed by our evil parent
 
     let store = VickyStore::open("dbdir", Config::default())?;
 
-    let highest_bytes = store.get("coll_highest")?.unwrap_or(vec![0, 0, 0, 0]);
+    let highest_bytes = store.get("list_highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes([
         highest_bytes[0],
         highest_bytes[1],
@@ -84,20 +84,20 @@ fn child_collection_inserts() -> Result<()> {
     println!("child starting at {highest}");
 
     for i in highest..TARGET {
-        store.set_in_collection("xxx", &i.to_le_bytes(), "yyy")?;
-        store.set("coll_highest", &i.to_le_bytes())?;
+        store.set_in_list("xxx", &i.to_le_bytes(), "yyy")?;
+        store.set("list_highest", &i.to_le_bytes())?;
     }
     println!("child finished");
 
     Ok(())
 }
 
-fn child_collection_removals() -> Result<()> {
-    // our job is to remove 1M entries to a collection while being killed by our evil parent
+fn child_list_removals() -> Result<()> {
+    // our job is to remove 1M entries to a list while being killed by our evil parent
 
     let store = VickyStore::open("dbdir", Config::default())?;
 
-    let lowest_bytes = store.get("coll_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
+    let lowest_bytes = store.get("list_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes([
         lowest_bytes[0],
         lowest_bytes[1],
@@ -127,13 +127,13 @@ fn child_collection_removals() -> Result<()> {
             _ => unreachable!(),
         };
 
-        let old = store.remove_from_collection("xxx", &j.to_le_bytes())?;
+        let old = store.remove_from_list("xxx", &j.to_le_bytes())?;
 
         assert!(
             old.is_none() || old == Some("yyy".into()),
             "{i} old={old:?}"
         );
-        store.set("coll_lowest", &i.to_le_bytes())?;
+        store.set("list_lowest", &i.to_le_bytes())?;
     }
 
     println!("child finished");
@@ -256,18 +256,18 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(shared_stuff, child_collection_inserts, 10..30)?;
+    parent_run(shared_stuff, child_list_inserts, 10..30)?;
 
     {
         println!("Parent starts validating the DB...");
 
         let store = VickyStore::open("dbdir", Config::default())?;
         assert_eq!(
-            store.remove("coll_highest")?,
+            store.remove("list_highest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
         );
 
-        for (i, res) in store.iter_collection("xxx").enumerate() {
+        for (i, res) in store.iter_list("xxx").enumerate() {
             let (k, v) = res?.unwrap();
             assert_eq!(k, (i as u32).to_le_bytes());
             assert_eq!(v, b"yyy");
@@ -276,18 +276,18 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(shared_stuff, child_collection_removals, 10..30)?;
+    parent_run(shared_stuff, child_list_removals, 10..30)?;
 
     {
         println!("Parent starts validating the DB...");
 
         let store = VickyStore::open("dbdir", Config::default())?;
         assert_eq!(
-            store.remove("coll_lowest")?,
+            store.remove("list_lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
         );
 
-        assert_eq!(store.iter_collection("xxx").count(), 0);
+        assert_eq!(store.iter_list("xxx").count(), 0);
 
         println!("DB validated successfully");
     }

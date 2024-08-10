@@ -113,15 +113,15 @@ for res in db.iter() {
 
 assert_eq!(db.iter().count(), 0);
 
-// Collections API ("linked lists")
+// list API ("linked lists")
 
-db.set_in_collection("mycoll", "key1", "123")?;
-db.set_in_collection("mycoll", "key2", "456")?;
-assert_eq!(db.get_from_collection("mycoll", "key1")?, Some("123".into()));
+db.set_in_list("mylist", "key1", "123")?;
+db.set_in_list("mylist", "key2", "456")?;
+assert_eq!(db.get_from_list("mylist", "key1")?, Some("123".into()));
 
-assert_eq!(db.iter_collection("mycoll").count(), 2);
+assert_eq!(db.iter_list("mylist").count(), 2);
 
-for res in db.iter_collection("mycoll") {
+for res in db.iter_list("mylist") {
     let (k, v) = res?;
     println!("{k:?} => {v:?}");
 }

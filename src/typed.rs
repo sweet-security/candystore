@@ -134,12 +134,12 @@ where
 }
 
 #[derive(Clone)]
-pub struct VickyTypedCollection<C, K, V> {
+pub struct VickyTypedList<C, K, V> {
     store: Arc<VickyStore>,
     _phantom: PhantomData<(C, K, V)>,
 }
 
-impl<C, K, V> VickyTypedCollection<C, K, V>
+impl<C, K, V> VickyTypedList<C, K, V>
 where
     C: VickyTypedKey,
     K: Encode + DecodeOwned,
@@ -152,7 +152,7 @@ where
         }
     }
 
-    fn make_coll<Q: ?Sized + Encode>(c: &Q) -> Vec<u8>
+    fn make_list_key<Q: ?Sized + Encode>(c: &Q) -> Vec<u8>
     where
         C: Borrow<Q>,
     {
@@ -164,33 +164,30 @@ where
 
     pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        coll_key: &Q1,
+        list_key: &Q1,
         item_key: &Q2,
     ) -> Result<bool>
     where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = Self::make_coll(coll_key);
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
-        Ok(self
-            .store
-            .get_from_collection(&coll_key, &item_key)?
-            .is_some())
+        Ok(self.store.get_from_list(&list_key, &item_key)?.is_some())
     }
 
     pub fn get<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        coll_key: &Q1,
+        list_key: &Q1,
         item_key: &Q2,
     ) -> Result<Option<V>>
     where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = Self::make_coll(coll_key);
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
-        let vbytes = self.store.get_from_collection(&coll_key, &item_key)?;
+        let vbytes = self.store.get_from_list(&list_key, &item_key)?;
         if let Some(vbytes) = vbytes {
             let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
@@ -199,25 +196,25 @@ where
         }
     }
 
-    pub fn set(&self, coll_key: C, item_key: K, val: V) -> Result<SetStatus> {
-        let coll_key = Self::make_coll(&coll_key);
+    pub fn set(&self, list_key: C, item_key: K, val: V) -> Result<SetStatus> {
+        let list_key = Self::make_list_key(&list_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
-        self.store.set_in_collection(&coll_key, &item_key, &val)
+        self.store.set_in_list(&list_key, &item_key, &val)
     }
 
     pub fn remove<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        coll_key: &Q1,
+        list_key: &Q1,
         item_key: &Q2,
     ) -> Result<Option<V>>
     where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = Self::make_coll(coll_key);
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
-        let vbytes = self.store.remove_from_collection(&coll_key, &item_key)?;
+        let vbytes = self.store.remove_from_list(&list_key, &item_key)?;
         if let Some(vbytes) = vbytes {
             let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
@@ -228,13 +225,13 @@ where
 
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
-        coll_key: &Q,
+        list_key: &Q,
     ) -> impl Iterator<Item = Result<Option<(K, V)>>> + 'a
     where
         C: Borrow<Q>,
     {
-        let coll_key = Self::make_coll(coll_key);
-        self.store.iter_collection(&coll_key).map(|res| match res {
+        let list_key = Self::make_list_key(list_key);
+        self.store.iter_list(&list_key).map(|res| match res {
             Err(e) => Err(e),
             Ok(None) => Ok(None),
             Ok(Some((k, v))) => {
@@ -245,11 +242,11 @@ where
         })
     }
 
-    pub fn discard<Q: ?Sized + Encode>(&self, coll_key: &Q) -> Result<()>
+    pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<()>
     where
         C: Borrow<Q>,
     {
-        let coll_key = Self::make_coll(coll_key);
-        self.store.discard_collection(&coll_key)
+        let list_key = Self::make_list_key(list_key);
+        self.store.discard_list(&list_key)
     }
 }

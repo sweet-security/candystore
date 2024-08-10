@@ -3,13 +3,13 @@ mod common;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use vicky_store::{
-    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedCollection,
+    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedList,
 };
 
 use crate::common::run_in_tempdir;
 
 #[test]
-fn test_collections() -> Result<()> {
+fn test_lists() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = VickyStore::open(
             dir,
@@ -20,83 +20,77 @@ fn test_collections() -> Result<()> {
             },
         )?;
 
-        db.set_in_collection("texas", "dallas", "500,000")?;
-        db.set_in_collection("texas", "austin", "300,000")?;
-        db.set_in_collection("texas", "houston", "700,000")?;
-        db.set_in_collection("texas", "dallas", "450,000")?;
+        db.set_in_list("texas", "dallas", "500,000")?;
+        db.set_in_list("texas", "austin", "300,000")?;
+        db.set_in_list("texas", "houston", "700,000")?;
+        db.set_in_list("texas", "dallas", "450,000")?;
 
+        assert_eq!(db.get_from_list("texas", "dallas")?, Some("450,000".into()));
+        assert_eq!(db.get_from_list("texas", "austin")?, Some("300,000".into()));
         assert_eq!(
-            db.get_from_collection("texas", "dallas")?,
-            Some("450,000".into())
-        );
-        assert_eq!(
-            db.get_from_collection("texas", "austin")?,
-            Some("300,000".into())
-        );
-        assert_eq!(
-            db.get_from_collection("texas", "houston")?,
+            db.get_from_list("texas", "houston")?,
             Some("700,000".into())
         );
 
-        assert_eq!(db.iter_collection("texas").count(), 3);
-        assert_eq!(db.iter_collection("arkansas").count(), 0);
+        assert_eq!(db.iter_list("texas").count(), 3);
+        assert_eq!(db.iter_list("arkansas").count(), 0);
 
         let items = db
-            .iter_collection("texas")
+            .iter_list("texas")
             .map(|res| res.unwrap().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(items[0].0, "dallas".as_bytes());
         assert_eq!(items[2].0, "houston".as_bytes());
 
-        db.discard_collection("texas")?;
-        assert_eq!(db.get_from_collection("texas", "houston")?, None);
-        assert_eq!(db.get_from_collection("texas", "dallas")?, None);
-        assert_eq!(db.iter_collection("texas").count(), 0);
+        db.discard_list("texas")?;
+        assert_eq!(db.get_from_list("texas", "houston")?, None);
+        assert_eq!(db.get_from_list("texas", "dallas")?, None);
+        assert_eq!(db.iter_list("texas").count(), 0);
 
-        db.set_in_collection("xxx", "k1", "v1")?;
-        db.set_in_collection("xxx", "k2", "v2")?;
-        db.set_in_collection("xxx", "k3", "v3")?;
-        db.set_in_collection("xxx", "k4", "v4")?;
+        db.set_in_list("xxx", "k1", "v1")?;
+        db.set_in_list("xxx", "k2", "v2")?;
+        db.set_in_list("xxx", "k3", "v3")?;
+        db.set_in_list("xxx", "k4", "v4")?;
 
         // remove from the middle
-        assert_eq!(db.remove_from_collection("xxx", "k3")?, Some("v3".into()));
-        assert_eq!(db.iter_collection("xxx").count(), 3);
+        assert_eq!(db.remove_from_list("xxx", "k3")?, Some("v3".into()));
+        assert_eq!(db.iter_list("xxx").count(), 3);
         // remove first
-        assert_eq!(db.remove_from_collection("xxx", "k1")?, Some("v1".into()));
-        assert_eq!(db.iter_collection("xxx").count(), 2);
+        assert_eq!(db.remove_from_list("xxx", "k1")?, Some("v1".into()));
+        assert_eq!(db.iter_list("xxx").count(), 2);
         // remove last
-        assert_eq!(db.remove_from_collection("xxx", "k4")?, Some("v4".into()));
-        assert_eq!(db.iter_collection("xxx").count(), 1);
+        assert_eq!(db.remove_from_list("xxx", "k4")?, Some("v4".into()));
+        assert_eq!(db.iter_list("xxx").count(), 1);
         // remove single
-        assert_eq!(db.remove_from_collection("xxx", "k2")?, Some("v2".into()));
-        assert_eq!(db.iter_collection("xxx").count(), 0);
+        assert_eq!(db.remove_from_list("xxx", "k2")?, Some("v2".into()));
+        assert_eq!(db.iter_list("xxx").count(), 0);
 
         for i in 0..10_000 {
-            db.set_in_collection("xxx", &format!("my key {i}"), 
+            db.set_in_list("xxx", &format!("my key {i}"), 
                 "very long key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
         }
 
         // make sure we survive splits
         assert!(db._num_splits() > 1);
 
-        for (i, res) in db.iter_collection("xxx").enumerate() {
+        for (i, res) in db.iter_list("xxx").enumerate() {
             let (k, _) = res?.unwrap();
             assert_eq!(k, format!("my key {i}").as_bytes());
-            db.remove_from_collection("xxx", &k)?;
+            db.remove_from_list("xxx", &k)?;
         }
 
-        assert_eq!(db.iter_collection("xxx").count(), 0);
+        assert_eq!(db.iter_list("xxx").count(), 0);
 
         Ok(())
     })
 }
 
 #[test]
-fn test_typed_collections() -> Result<()> {
+fn test_typed_lists() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = Arc::new(VickyStore::open(dir, Config::default())?);
 
-        let typed = VickyTypedCollection::<String, u64, u32>::new(db);
+        let typed = VickyTypedList::<String, u64, u32>::new(db);
         typed.set("texas".into(), 108, 2005)?;
         typed.set("texas".into(), 555, 2006)?;
         typed.set("texas".into(), 827, 2007)?;
@@ -121,7 +115,7 @@ fn test_typed_collections() -> Result<()> {
 }
 
 #[test]
-fn test_collections_multithreading() -> Result<()> {
+fn test_lists_multithreading() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = Arc::new(VickyStore::open(dir, Config::default())?);
 
@@ -144,7 +138,7 @@ fn test_collections_multithreading() -> Result<()> {
                 for _ in 0..num_iters {
                     let idx1: u8 = rand::random();
                     if db
-                        .set_in_collection("xxx", &format!("key{idx1}"), &format!("val-{thd}"))?
+                        .set_in_list("xxx", &format!("key{idx1}"), &format!("val-{thd}"))?
                         .was_created()
                     {
                         created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -155,17 +149,14 @@ fn test_collections_multithreading() -> Result<()> {
                     std::thread::yield_now();
 
                     let idx2: u8 = rand::random();
-                    if let Some(v) = db.get_from_collection("xxx", &format!("key{idx2}"))? {
+                    if let Some(v) = db.get_from_list("xxx", &format!("key{idx2}"))? {
                         assert!(v.starts_with(b"val-"));
                         gotten.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
 
                     std::thread::yield_now();
                     let idx3: u8 = rand::random();
-                    if db
-                        .remove_from_collection("xxx", &format!("key{idx3}"))?
-                        .is_some()
-                    {
+                    if db.remove_from_list("xxx", &format!("key{idx3}"))?.is_some() {
                         removed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     std::thread::yield_now();
@@ -179,7 +170,7 @@ fn test_collections_multithreading() -> Result<()> {
             h.join().unwrap()?;
         }
 
-        let reamining = db.iter_collection("xxx").count();
+        let reamining = db.iter_list("xxx").count();
         let created = created.load(std::sync::atomic::Ordering::SeqCst);
         let replaced = replaced.load(std::sync::atomic::Ordering::SeqCst);
         let removed = removed.load(std::sync::atomic::Ordering::SeqCst);
@@ -195,41 +186,41 @@ fn test_collections_multithreading() -> Result<()> {
 }
 
 #[test]
-fn test_collections_atomics() -> Result<()> {
+fn test_list_atomics() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = VickyStore::open(dir, Config::default())?;
 
         assert_eq!(
-            db.get_or_create_in_collection("xxx", "yyy", "1")?,
+            db.get_or_create_in_list("xxx", "yyy", "1")?,
             GetOrCreateStatus::CreatedNew("1".into())
         );
 
         assert_eq!(
-            db.get_or_create_in_collection("xxx", "yyy", "2")?,
+            db.get_or_create_in_list("xxx", "yyy", "2")?,
             GetOrCreateStatus::ExistingValue("1".into())
         );
 
         assert_eq!(
-            db.replace_in_collection("xxx", "yyy", "3")?,
+            db.replace_in_list("xxx", "yyy", "3")?,
             ReplaceStatus::PrevValue("1".into())
         );
 
         assert_eq!(
-            db.replace_in_collection("xxx", "zzz", "3")?,
+            db.replace_in_list("xxx", "zzz", "3")?,
             ReplaceStatus::DoesNotExist
         );
 
         assert_eq!(
-            db.get_or_create_in_collection("xxx", "yyy", "7")?,
+            db.get_or_create_in_list("xxx", "yyy", "7")?,
             GetOrCreateStatus::ExistingValue("3".into())
         );
 
         assert_eq!(
-            db.set_in_collection("xxx", "yyy", "4")?,
+            db.set_in_list("xxx", "yyy", "4")?,
             SetStatus::PrevValue("3".into())
         );
 
-        assert_eq!(db.get_from_collection("xxx", "yyy")?, Some("4".into()));
+        assert_eq!(db.get_from_list("xxx", "yyy")?, Some("4".into()));
 
         Ok(())
     })
