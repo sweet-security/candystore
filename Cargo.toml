@@ -12,6 +12,7 @@ databuf = "0.5.0"
 memmap = "0.7.0"
 simd-itertools = "0.2.3"
 siphasher = "1.0.1"
+anyhow = "1.0.86"
 
 [dev-dependencies]
 rand = "0.8.5"

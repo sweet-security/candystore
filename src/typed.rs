@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
@@ -6,7 +7,8 @@ use crate::{
     ModifyStatus, VickyStore,
 };
 
-use databuf::{config::num::LE, DecodeOwned, Encode, Result};
+use crate::Result;
+use databuf::{config::num::LE, DecodeOwned, Encode};
 
 pub trait VickyTypedKey: Encode + DecodeOwned {
     /// a random number that remains consistent (unlike `TypeId`), so that `MyPair(u32, u32)` is different than
@@ -82,7 +84,7 @@ where
         let kbytes = Self::make_key(k);
         let vbytes = self.store.get_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -123,7 +125,7 @@ where
         let kbytes = Self::make_key(k);
         let vbytes = self.store.remove_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -151,8 +153,8 @@ where
     }
 
     fn make_coll<Q: ?Sized + Encode>(c: &Q) -> Vec<u8>
-        where
-            C: Borrow<Q>,
+    where
+        C: Borrow<Q>,
     {
         let mut cbytes = vec![];
         cbytes.extend_from_slice(&c.to_bytes::<LE>());
@@ -190,7 +192,7 @@ where
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.get_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -217,7 +219,7 @@ where
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.remove_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -236,19 +238,17 @@ where
             Err(e) => Err(e),
             Ok(None) => Ok(None),
             Ok(Some((k, v))) => {
-                let key = K::from_bytes::<LE>(&k)?;
-                let val = V::from_bytes::<LE>(&v)?;
+                let key = K::from_bytes::<LE>(&k).map_err(|e| anyhow!(e))?;
+                let val = V::from_bytes::<LE>(&v).map_err(|e| anyhow!(e))?;
                 Ok(Some((key, val)))
             }
         })
     }
 
-    pub fn discard<Q: ?Sized + Encode>(
-        &self,
-        coll_key: &Q,
-    ) -> Result<()>
-        where
-            C: Borrow<Q>, {
+    pub fn discard<Q: ?Sized + Encode>(&self, coll_key: &Q) -> Result<()>
+    where
+        C: Borrow<Q>,
+    {
         let coll_key = Self::make_coll(coll_key);
         self.store.discard_collection(&coll_key)
     }
