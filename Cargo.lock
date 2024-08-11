@@ -310,6 +310,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vicky-longliving"
+version = "0.1.0"
+dependencies = [
+ "vicky-store",
+]
+
+[[package]]
 name = "vicky-perf"
 version = "0.1.0"
 dependencies = [

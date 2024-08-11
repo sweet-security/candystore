@@ -78,12 +78,13 @@ pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 impl<'a> Iterator for ByHashIterator<'a> {
     type Item = Result<KVPair>;
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(idx) = self.row.signatures[self.start_idx..]
+        while let Some(rel_idx) = self.row.signatures[self.start_idx..]
             .iter()
             .position_simd(self.signature)
         {
-            self.start_idx = idx + 1;
-            return Some(self.shard.read_kv(self.row.offsets_and_sizes[idx]));
+            let abs_idx = self.start_idx + rel_idx;
+            self.start_idx = abs_idx + 1;
+            return Some(self.shard.read_kv(self.row.offsets_and_sizes[abs_idx]));
         }
         None
     }
@@ -263,8 +264,9 @@ impl Shard {
         mode: InsertMode,
     ) -> Result<TryReplaceStatus> {
         let mut start = 0;
-        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
-            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
+        while let Some(rel_idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
+            let abs_idx = start + rel_idx;
+            let (k, v) = self.read_kv(row.offsets_and_sizes[abs_idx])?;
             if key == k {
                 match mode {
                     InsertMode::GetOrCreate => {
@@ -274,7 +276,7 @@ impl Shard {
                     InsertMode::Set | InsertMode::Replace => {
                         // optimization
                         if val != v {
-                            row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
+                            row.offsets_and_sizes[abs_idx] = self.write_kv(key, val)?;
                             self.header
                                 .wasted_bytes
                                 .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
@@ -283,7 +285,7 @@ impl Shard {
                     }
                 }
             }
-            start = idx + 1;
+            start = abs_idx + 1;
         }
         Ok(TryReplaceStatus::KeyDoesNotExist)
     }
@@ -375,12 +377,13 @@ impl Shard {
         let (_guard, row) = self.get_row_mut(ph);
 
         let mut start = 0;
-        while let Some(idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
-            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
+        while let Some(rel_idx) = row.signatures[start..].iter().position_simd(ph.signature()) {
+            let abs_idx = start + rel_idx;
+            let (k, v) = self.read_kv(row.offsets_and_sizes[abs_idx])?;
             if key == k {
-                return func(&self, row, ph, Some((idx, k, v)));
+                return func(&self, row, ph, Some((abs_idx, k, v)));
             }
-            start = idx + 1;
+            start = abs_idx + 1;
         }
 
         func(&self, row, ph, None)

@@ -355,7 +355,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
+            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
             .1
             .iter_by_hash(ph)
             .collect::<Vec<_>>())
@@ -376,7 +376,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
+            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
             .1
             .operate_on_key_mut(ph, key, func)
     }
@@ -387,7 +387,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
+            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
             .1
             .get(ph, &full_key)
     }
@@ -419,7 +419,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
+            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
             .1
             .remove(ph, &full_key)?;
         if val.is_some() {

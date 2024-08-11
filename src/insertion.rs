@@ -221,7 +221,7 @@ impl VickyStore {
             .unwrap_or(0);
         let (shard_end, shard) = cursor.peek_next().with_context(|| {
             format!(
-                "missing shard for selector {} start={}",
+                "missing shard for selector 0x{:04x} start=0x{:04x}",
                 ph.shard_selector(),
                 shard_start
             )
