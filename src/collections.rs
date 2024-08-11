@@ -135,7 +135,7 @@ impl VickyStore {
         suffix[0..PartedHash::LEN].copy_from_slice(bytes_of(&coll_ph));
         suffix[PartedHash::LEN..].copy_from_slice(ITEM_NAMESPACE);
 
-        for res in self.get_by_hash(item_ph) {
+        for res in self.get_by_hash(item_ph)? {
             let (k, v) = res?;
             if k.ends_with(&suffix) {
                 return Ok(Some((k, v)));

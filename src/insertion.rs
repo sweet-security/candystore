@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
@@ -87,7 +87,7 @@ impl VickyStore {
         // it's possible that another thread already compacted this shard
         if guard
             .get(&shard_end)
-            .unwrap()
+            .with_context(|| format!("missing shard {shard_end}"))?
             .header
             .write_offset
             .load(Ordering::Relaxed)
@@ -96,7 +96,9 @@ impl VickyStore {
             return Ok(false);
         }
 
-        let removed_shard = guard.remove(&shard_end).unwrap();
+        let removed_shard = guard
+            .remove(&shard_end)
+            .with_context(|| format!("missing shard {shard_end}"))?;
         let orig_filename = self.dir_path.join(format!(
             "shard_{:04x}-{:04x}",
             removed_shard.span.start, removed_shard.span.end
@@ -139,7 +141,9 @@ impl VickyStore {
             return Ok(false);
         }
 
-        let removed_shard = guard.remove(&shard_end).unwrap();
+        let removed_shard = guard
+            .remove(&shard_end)
+            .with_context(|| format!("missing shard {shard_end}"))?;
 
         let bottomfile = self
             .dir_path
@@ -215,7 +219,13 @@ impl VickyStore {
             .peek_prev()
             .map(|(&shard_start, _)| shard_start)
             .unwrap_or(0);
-        let (shard_end, shard) = cursor.peek_next().unwrap();
+        let (shard_end, shard) = cursor.peek_next().with_context(|| {
+            format!(
+                "missing shard for selector {} start={}",
+                ph.shard_selector(),
+                shard_start
+            )
+        })?;
         let status = shard.insert(ph, key, val, mode)?;
 
         Ok((status, shard_start, *shard_end))

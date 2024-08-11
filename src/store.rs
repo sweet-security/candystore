@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::BTreeMap,
@@ -349,16 +349,17 @@ impl VickyStore {
         full_key
     }
 
-    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Vec<Result<KVPair>> {
+    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<Result<KVPair>>> {
         debug_assert_ne!(ph, PartedHash::INVALID);
-        self.shards
+        Ok(self
+            .shards
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .unwrap()
+            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
             .1
             .iter_by_hash(ph)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
     pub(crate) fn operate_on_key_mut<T>(
@@ -376,7 +377,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .unwrap()
+            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
             .1
             .operate_on_key_mut(ph, key, func)
     }
@@ -387,7 +388,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .unwrap()
+            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
             .1
             .get(ph, &full_key)
     }
@@ -411,7 +412,7 @@ impl VickyStore {
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
-            .unwrap()
+            .with_context(|| format!("missing shard for {}", ph.shard_selector()))?
             .1
             .remove(ph, &full_key)?;
         if val.is_some() {

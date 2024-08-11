@@ -1,14 +1,13 @@
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use simd_itertools::PositionSimd;
-use std::ops::Range;
-use std::sync::atomic::AtomicU32;
-use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 use std::{
     fs::{File, OpenOptions},
+    ops::Range,
     os::unix::fs::FileExt,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc,
     },
 };
 
@@ -211,7 +210,7 @@ impl Shard {
     }
 
     pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<KVPair>> {
-        let _guard = self.row_locks[row_idx].read().unwrap();
+        let _guard = self.row_locks[row_idx].read();
         let row = &self.header.rows.0[row_idx];
         if row.signatures[entry_idx] != INVALID_SIG {
             Some(self.read_kv(row.offsets_and_sizes[entry_idx]))
@@ -234,7 +233,7 @@ impl Shard {
 
     pub(crate) fn iter_by_hash<'a>(&'a self, ph: PartedHash) -> ByHashIterator<'a> {
         let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
-        let guard = self.row_locks[row_idx].read().unwrap();
+        let guard = self.row_locks[row_idx].read();
         let row = &self.header.rows.0[row_idx];
         ByHashIterator {
             shard: &self,
@@ -291,7 +290,7 @@ impl Shard {
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
         let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
-        let guard = self.row_locks[row_idx].write().unwrap();
+        let guard = self.row_locks[row_idx].write();
         // this is safe because we hold a write lock on the row. the row sits in an mmap, so it can't be
         // owned by the lock itself
         #[allow(invalid_reference_casting)]
