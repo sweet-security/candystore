@@ -7,6 +7,7 @@ use crate::{
     GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
 };
 
+use anyhow::anyhow;
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -84,7 +85,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
 
 macro_rules! corrupted_list {
     ($($arg:tt)*) => {
-        return Err(Box::new(VickyError::CorruptedLinkedList(format!($($arg)*))));
+        return Err(anyhow!(VickyError::CorruptedLinkedList(format!($($arg)*))));
     };
 }
 
@@ -93,7 +94,7 @@ macro_rules! corrupted_if {
         if ($e1 == $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} == {:?})", $e1, $e2);
-            return Err(Box::new(VickyError::CorruptedLinkedList(full)));
+            return Err(anyhow!(VickyError::CorruptedLinkedList(full)));
         }
     };
 }
@@ -103,7 +104,7 @@ macro_rules! corrupted_unless {
         if ($e1 != $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} != {:?})", $e1, $e2);
-            return Err(Box::new(VickyError::CorruptedLinkedList(full)));
+            return Err(anyhow!(VickyError::CorruptedLinkedList(full)));
         }
     };
 }

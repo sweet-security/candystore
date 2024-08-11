@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
@@ -118,7 +119,7 @@ impl VickyStore {
             let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
             if !matches!(status, InsertStatus::Added) {
-                return Err(Box::new(VickyError::CompactionFailed(format!(
+                return Err(anyhow!(VickyError::CompactionFailed(format!(
                     "{ph:?} [{}..{}] shard {status:?} k={k:?} v={v:?}",
                     removed_shard.span.start, removed_shard.span.end
                 ))));
@@ -170,7 +171,7 @@ impl VickyStore {
                 top_shard.insert(ph, &k, &v, InsertMode::Set)?
             };
             if !matches!(status, InsertStatus::Added) {
-                return Err(Box::new(VickyError::SplitFailed(format!(
+                return Err(anyhow!(VickyError::SplitFailed(format!(
                     "{ph:?} {status:?} [{shard_start} {midpoint} {shard_end}] k={k:?} v={v:?}",
                 ))));
             }
@@ -229,10 +230,10 @@ impl VickyStore {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
         if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
-            return Err(Box::new(VickyError::KeyTooLong));
+            return Err(anyhow!(VickyError::KeyTooLong));
         }
         if val.len() > MAX_VALUE_SIZE as usize {
-            return Err(Box::new(VickyError::ValueTooLong));
+            return Err(anyhow!(VickyError::ValueTooLong));
         }
 
         loop {

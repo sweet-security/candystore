@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::{
     collections::BTreeMap,
     ops::Bound,
@@ -213,7 +214,7 @@ impl VickyStore {
             let end = u32::from_str_radix(end, 16).expect(filename);
 
             if start > end || end > Self::END_OF_SHARDS {
-                return Err(Box::new(VickyError::LoadingFailed(format!(
+                return Err(anyhow!(VickyError::LoadingFailed(format!(
                     "Bad span for {filename}"
                 ))));
             }
@@ -252,7 +253,7 @@ impl VickyStore {
                 let (next_start, next_end) = spans[i + 1];
                 if *start == next_start {
                     if next_end <= *end {
-                        return Err(Box::new(VickyError::LoadingFailed(format!(
+                        return Err(anyhow!(VickyError::LoadingFailed(format!(
                             "Removing in-progress split with start={} end={} next_start={} next_end={}",
                             *start, *end, next_start, next_end
                         ))));

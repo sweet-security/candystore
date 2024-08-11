@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
@@ -6,7 +7,8 @@ use crate::{
     ModifyStatus, VickyStore,
 };
 
-use databuf::{config::num::LE, DecodeOwned, Encode, Result};
+use crate::Result;
+use databuf::{config::num::LE, DecodeOwned, Encode};
 
 pub trait VickyTypedKey: Encode + DecodeOwned {
     /// a random number that remains consistent (unlike `TypeId`), so that `MyPair(u32, u32)` is different than
@@ -37,12 +39,12 @@ typed_builtin!(usize, 12);
 typed_builtin!(isize, 13);
 typed_builtin!(char, 14);
 typed_builtin!(String, 15);
+typed_builtin!(Vec<u8>, 16);
 
 #[derive(Clone)]
 pub struct VickyTypedStore<K, V> {
     store: Arc<VickyStore>,
-    _k: PhantomData<K>,
-    _v: PhantomData<V>,
+    _phantom: PhantomData<(K, V)>,
 }
 
 impl<K, V> VickyTypedStore<K, V>
@@ -53,8 +55,7 @@ where
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
-            _k: PhantomData,
-            _v: PhantomData,
+            _phantom: Default::default(),
         }
     }
 
@@ -83,7 +84,7 @@ where
         let kbytes = Self::make_key(k);
         let vbytes = self.store.get_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -124,7 +125,7 @@ where
         let kbytes = Self::make_key(k);
         let vbytes = self.store.remove_raw(&kbytes)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -135,24 +136,30 @@ where
 #[derive(Clone)]
 pub struct VickyTypedCollection<C, K, V> {
     store: Arc<VickyStore>,
-    _c: PhantomData<C>,
-    _k: PhantomData<K>,
-    _v: PhantomData<V>,
+    _phantom: PhantomData<(C, K, V)>,
 }
 
 impl<C, K, V> VickyTypedCollection<C, K, V>
 where
     C: VickyTypedKey,
-    K: VickyTypedKey,
+    K: Encode + DecodeOwned,
     V: Encode + DecodeOwned,
 {
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
-            _c: PhantomData,
-            _k: PhantomData,
-            _v: PhantomData,
+            _phantom: Default::default(),
         }
+    }
+
+    fn make_coll<Q: ?Sized + Encode>(c: &Q) -> Vec<u8>
+    where
+        C: Borrow<Q>,
+    {
+        let mut cbytes = vec![];
+        cbytes.extend_from_slice(&c.to_bytes::<LE>());
+        cbytes.extend_from_slice(&C::TYPE_ID.to_le_bytes());
+        cbytes
     }
 
     pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
@@ -164,7 +171,7 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         Ok(self
             .store
@@ -181,11 +188,11 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.get_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -193,7 +200,7 @@ where
     }
 
     pub fn set(&self, coll_key: C, item_key: K, val: V) -> Result<SetStatus> {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(&coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
         self.store.set_in_collection(&coll_key, &item_key, &val)
@@ -208,11 +215,11 @@ where
         C: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         let item_key = item_key.to_bytes::<LE>();
         let vbytes = self.store.remove_from_collection(&coll_key, &item_key)?;
         if let Some(vbytes) = vbytes {
-            let val = V::from_bytes::<LE>(&vbytes)?;
+            let val = V::from_bytes::<LE>(&vbytes).map_err(|e| anyhow!(e))?;
             Ok(Some(val))
         } else {
             Ok(None)
@@ -226,15 +233,23 @@ where
     where
         C: Borrow<Q>,
     {
-        let coll_key = coll_key.to_bytes::<LE>();
+        let coll_key = Self::make_coll(coll_key);
         self.store.iter_collection(&coll_key).map(|res| match res {
             Err(e) => Err(e),
             Ok(None) => Ok(None),
             Ok(Some((k, v))) => {
-                let key = K::from_bytes::<LE>(&k)?;
-                let val = V::from_bytes::<LE>(&v)?;
+                let key = K::from_bytes::<LE>(&k).map_err(|e| anyhow!(e))?;
+                let val = V::from_bytes::<LE>(&v).map_err(|e| anyhow!(e))?;
                 Ok(Some((key, val)))
             }
         })
+    }
+
+    pub fn discard<Q: ?Sized + Encode>(&self, coll_key: &Q) -> Result<()>
+    where
+        C: Borrow<Q>,
+    {
+        let coll_key = Self::make_coll(coll_key);
+        self.store.discard_collection(&coll_key)
     }
 }

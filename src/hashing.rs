@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use siphasher::sip128::{Hash128, SipHasher24};
 
 use crate::{Result, VickyError};
@@ -14,7 +15,7 @@ impl HashSeed {
     pub fn new<B: AsRef<[u8]> + ?Sized>(key: &B) -> Result<Self> {
         let key = key.as_ref();
         if key.len() != Self::LEN {
-            return Err(Box::new(VickyError::WrongHashSeedLength));
+            return Err(anyhow!(VickyError::WrongHashSeedLength));
         }
         let mut bytes = [0u8; Self::LEN];
         bytes.copy_from_slice(&key);
