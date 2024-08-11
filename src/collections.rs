@@ -1,5 +1,3 @@
-use std::sync::MutexGuard;
-
 use crate::{
     hashing::PartedHash,
     shard::{InsertMode, KVPair},
@@ -9,6 +7,7 @@ use crate::{
 
 use anyhow::anyhow;
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
+use parking_lot::MutexGuard;
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -124,9 +123,7 @@ impl VickyStore {
     }
 
     fn lock_collection(&self, coll_ph: PartedHash) -> MutexGuard<()> {
-        self.keyed_locks[(coll_ph.signature() & self.keyed_locks_mask) as usize]
-            .lock()
-            .unwrap()
+        self.keyed_locks[(coll_ph.signature() & self.keyed_locks_mask) as usize].lock()
     }
 
     fn _get_from_collection(

@@ -83,7 +83,7 @@ impl GetOrCreateStatus {
 
 impl VickyStore {
     fn compact(&self, shard_end: u32, write_offset: u32) -> Result<bool> {
-        let mut guard = self.shards.write().unwrap();
+        let mut guard = self.shards.write();
         // it's possible that another thread already compacted this shard
         if guard
             .get(&shard_end)
@@ -132,7 +132,7 @@ impl VickyStore {
     }
 
     fn split(&self, shard_start: u32, shard_end: u32) -> Result<bool> {
-        let mut guard = self.shards.write().unwrap();
+        let mut guard = self.shards.write();
         // it's possible that another thread already split this range - check if midpoint exists, and if so, bail out
         let midpoint = shard_start / 2 + shard_end / 2;
         if guard.contains_key(&midpoint) {
@@ -209,7 +209,7 @@ impl VickyStore {
         val: &[u8],
         mode: InsertMode,
     ) -> Result<(InsertStatus, u32, u32)> {
-        let guard = self.shards.read().unwrap();
+        let guard = self.shards.read();
         let cursor = guard.lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)));
         let shard_start = cursor
             .peek_prev()

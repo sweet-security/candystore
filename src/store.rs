@@ -1,11 +1,12 @@
 use anyhow::anyhow;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::BTreeMap,
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc,
     },
 };
 
@@ -97,7 +98,7 @@ impl<'a> Iterator for VickyStoreIterator<'a> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let guard = self.db.shards.read().unwrap();
+        let guard = self.db.shards.read();
         for (curr_shard_idx, shard) in guard.range(self.shard_idx..) {
             self.shard_idx = *curr_shard_idx;
             loop {
@@ -300,7 +301,7 @@ impl VickyStore {
     /// Attempts for sync all in-memory changes of all shards to disk. Concurrent changes are allowed while
     /// flushing, and may result in partially-sync'ed store. Use sparingly, as this is a costly operaton.
     pub fn flush(&self) -> Result<()> {
-        let guard = self.shards.read().unwrap();
+        let guard = self.shards.read();
         for (_, shard) in guard.iter() {
             shard.flush()?;
         }
@@ -309,7 +310,7 @@ impl VickyStore {
 
     /// Clears the store (erasing all keys)
     pub fn clear(&self) -> Result<()> {
-        let mut guard = self.shards.write().unwrap();
+        let mut guard = self.shards.write();
 
         for res in std::fs::read_dir(&self.dir_path)? {
             let entry = res?;
@@ -352,7 +353,6 @@ impl VickyStore {
         debug_assert_ne!(ph, PartedHash::INVALID);
         self.shards
             .read()
-            .unwrap()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
@@ -374,7 +374,6 @@ impl VickyStore {
         let ph = PartedHash::new(&self.config.hash_seed, key);
         self.shards
             .read()
-            .unwrap()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
@@ -386,7 +385,6 @@ impl VickyStore {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
         self.shards
             .read()
-            .unwrap()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
@@ -411,7 +409,6 @@ impl VickyStore {
         let val = self
             .shards
             .read()
-            .unwrap()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .unwrap()
@@ -442,7 +439,7 @@ impl VickyStore {
     }
 
     pub fn stats(&self) -> Stats {
-        let guard = self.shards.read().unwrap();
+        let guard = self.shards.read();
         let mut stats = Stats {
             num_shards: guard.len(),
             ..Default::default()
