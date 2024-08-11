@@ -83,6 +83,54 @@ impl<'a> Iterator for LinkedListIterator<'a> {
     }
 }
 
+// it doesn't really make sense to implement DoubleEndedIterator here, because we'd have to maintain both
+// pointers and the protocol says iteration ends when they meet in the middle
+pub struct RevLinkedListIterator<'a> {
+    store: &'a VickyStore,
+    list_key: Vec<u8>,
+    list_ph: PartedHash,
+    next_ph: Option<PartedHash>,
+}
+
+impl<'a> Iterator for RevLinkedListIterator<'a> {
+    type Item = Result<Option<KVPair>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_ph.is_none() {
+            let buf = match self.store.get_raw(&self.list_key) {
+                Ok(buf) => buf,
+                Err(e) => return Some(Err(e)),
+            };
+            let Some(buf) = buf else {
+                return None;
+            };
+            let list = *from_bytes::<LinkedList>(&buf);
+            self.next_ph = Some(list.tail);
+        }
+        let Some(curr) = self.next_ph else {
+            return None;
+        };
+        if curr == PartedHash::INVALID {
+            return None;
+        }
+        let kv = match self.store._list_get(self.list_ph, curr) {
+            Err(e) => return Some(Err(e)),
+            Ok(kv) => kv,
+        };
+        let Some((mut k, mut v)) = kv else {
+            // this means the current element was removed by another thread, and that's okay
+            // because we don't hold any locks during iteration. this is an early stop,
+            // which means the reader might want to retry
+            return Some(Ok(None));
+        };
+        k.truncate(k.len() - ITEM_SUFFIX_LEN);
+        let chain = chain_of(&v);
+        self.next_ph = Some(chain.prev);
+        v.truncate(v.len() - size_of::<Chain>());
+
+        Some(Ok(Some((k, v))))
+    }
+}
+
 macro_rules! corrupted_list {
     ($($arg:tt)*) => {
         return Err(anyhow!(VickyError::CorruptedLinkedList(format!($($arg)*))));
@@ -651,6 +699,23 @@ impl VickyStore {
         }
     }
 
+    pub fn iter_list_backwards<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        list_key: &B,
+    ) -> RevLinkedListIterator {
+        self.owned_iter_list_backwards(list_key.as_ref().to_owned())
+    }
+
+    pub fn owned_iter_list_backwards(&self, list_key: Vec<u8>) -> RevLinkedListIterator {
+        let (list_ph, list_key) = self.make_list_key(list_key);
+        RevLinkedListIterator {
+            store: &self,
+            list_key,
+            list_ph,
+            next_ph: None,
+        }
+    }
+
     /// Discards the given list (removes all elements). This also works for corrupt lists, in case they
     /// need to be dropped.
     pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<()> {
@@ -678,6 +743,26 @@ impl VickyStore {
         }
 
         Ok(())
+    }
+
+    pub fn peek_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
+        self.owned_peek_list_head(list_key.as_ref().to_owned())
+    }
+
+    // may have suprious false positives/false negatives if another thread pops
+    pub fn owned_peek_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
+        self.owned_iter_list(list_key).next().unwrap_or(Ok(None))
+    }
+
+    pub fn peek_list_htail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
+        self.owned_peek_list_tail(list_key.as_ref().to_owned())
+    }
+
+    // may have suprious false positives/false negatives if another thread pops
+    pub fn owned_peek_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
+        self.owned_iter_list_backwards(list_key)
+            .next()
+            .unwrap_or(Ok(None))
     }
 
     pub fn pop_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {

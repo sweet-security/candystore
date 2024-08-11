@@ -296,3 +296,41 @@ fn test_typed_queue() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn test_rev_iter() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = VickyStore::open(dir, Config::default())?;
+
+        db.set_in_list("mylist", "item1", "xxx")?;
+        db.set_in_list("mylist", "item2", "xxx")?;
+        db.set_in_list("mylist", "item3", "xxx")?;
+        db.set_in_list("mylist", "item4", "xxx")?;
+
+        let items = db
+            .iter_list("mylist")
+            .map(|res| res.unwrap().unwrap().0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(items, vec![b"item1", b"item2", b"item3", b"item4"]);
+
+        let items = db
+            .iter_list_backwards("mylist")
+            .map(|res| res.unwrap().unwrap().0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(items, vec![b"item4", b"item3", b"item2", b"item1"]);
+
+        assert_eq!(
+            db.peek_list_head("mylist")?,
+            Some(("item1".into(), "xxx".into()))
+        );
+
+        assert_eq!(
+            db.peek_list_htail("mylist")?,
+            Some(("item4".into(), "xxx".into()))
+        );
+
+        Ok(())
+    })
+}
