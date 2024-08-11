@@ -4,6 +4,7 @@ use std::sync::{atomic::AtomicUsize, Arc};
 
 use vicky_store::{
     Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedList,
+    VickyTypedQueue,
 };
 
 use crate::common::run_in_tempdir;
@@ -221,6 +222,76 @@ fn test_list_atomics() -> Result<()> {
         );
 
         assert_eq!(db.get_from_list("xxx", "yyy")?, Some("4".into()));
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_queues() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = VickyStore::open(dir, Config::default())?;
+
+        db.push_to_list("mylist", "hello1")?;
+        db.push_to_list("mylist", "hello2")?;
+        db.push_to_list("mylist", "hello3")?;
+        db.push_to_list("mylist", "hello4")?;
+
+        let mut items = vec![];
+        while let Some((_uuid, v)) = db.pop_list_head("mylist")? {
+            items.push(v);
+        }
+        assert_eq!(items, vec![b"hello1", b"hello2", b"hello3", b"hello4"]);
+
+        db.push_to_list("mylist", "hello5")?;
+        db.push_to_list("mylist", "hello6")?;
+        db.push_to_list("mylist", "hello7")?;
+        db.push_to_list("mylist", "hello8")?;
+
+        let mut items = vec![];
+        while let Some((_uuid, v)) = db.pop_list_tail("mylist")? {
+            items.push(v);
+        }
+        assert_eq!(items, vec![b"hello8", b"hello7", b"hello6", b"hello5"]);
+
+        db.push_to_list("mylist", "hello9")?;
+        db.push_to_list("mylist", "hello10")?;
+        db.push_to_list("mylist", "hello11")?;
+        db.push_to_list("mylist", "hello12")?;
+        db.push_to_list("mylist", "hello13")?;
+        db.push_to_list("mylist", "hello14")?;
+
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello9");
+        assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello14");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello10");
+        assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello13");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello11");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello12");
+        assert_eq!(db.pop_list_head("mylist")?, None);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_typed_queue() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+
+        let queue = VickyTypedQueue::<String, u32>::new(db);
+        assert_eq!(queue.pop_head("orders")?, None);
+
+        for i in 10..30 {
+            queue.push("orders", i)?;
+        }
+        for i in 10..20 {
+            assert_eq!(queue.pop_head("orders")?, Some(i));
+        }
+        for i in (20..30).rev() {
+            assert_eq!(queue.pop_tail("orders")?, Some(i));
+        }
+
+        assert_eq!(queue.pop_head("orders")?, None);
 
         Ok(())
     })

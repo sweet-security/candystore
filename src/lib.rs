@@ -11,7 +11,7 @@ pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ModifyStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
-pub use typed::{VickyTypedKey, VickyTypedList, VickyTypedStore};
+pub use typed::{VickyTypedKey, VickyTypedList, VickyTypedQueue, VickyTypedStore};
 
 #[derive(Debug)]
 pub enum VickyError {

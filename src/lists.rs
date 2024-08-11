@@ -8,6 +8,7 @@ use crate::{
 use anyhow::anyhow;
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 use parking_lot::MutexGuard;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -394,7 +395,7 @@ impl VickyStore {
         &self,
         _chain: Chain,
         list_key: Vec<u8>,
-        item_key: Vec<u8>,
+        item_key: &[u8],
     ) -> Result<()> {
         // this is the only element - remove it and the list itself
         // corrupted_unless!(
@@ -409,7 +410,7 @@ impl VickyStore {
         // );
 
         self.remove_raw(&list_key)?;
-        self.remove_raw(&item_key)?;
+        self.remove_raw(item_key)?;
         Ok(())
     }
 
@@ -420,7 +421,7 @@ impl VickyStore {
         chain: Chain,
         list_ph: PartedHash,
         list_key: Vec<u8>,
-        item_key: Vec<u8>,
+        item_key: &[u8],
     ) -> Result<()> {
         // corrupted_unless!(
         //     chain.prev,
@@ -476,7 +477,7 @@ impl VickyStore {
         chain: Chain,
         list_ph: PartedHash,
         list_key: Vec<u8>,
-        item_key: Vec<u8>,
+        item_key: &[u8],
     ) -> Result<()> {
         // corrupted_unless!(
         //     chain.next,
@@ -626,11 +627,11 @@ impl VickyStore {
         let list = *from_bytes::<LinkedList>(&list_buf);
 
         if list.tail == item_ph && list.head == item_ph {
-            self._remove_from_list_single(chain, list_key, item_key)?
+            self._remove_from_list_single(chain, list_key, &item_key)?
         } else if list.head == item_ph || chain.prev == PartedHash::INVALID {
-            self._remove_from_list_head(list_buf, list, chain, list_ph, list_key, item_key)?
+            self._remove_from_list_head(list_buf, list, chain, list_ph, list_key, &item_key)?
         } else if list.tail == item_ph || chain.next == PartedHash::INVALID {
-            self._remove_from_list_tail(list_buf, list, chain, list_ph, list_key, item_key)?
+            self._remove_from_list_tail(list_buf, list, chain, list_ph, list_key, &item_key)?
         } else {
             self._remove_from_list_middle(chain, list_ph, item_ph, item_key)?
         };
@@ -677,5 +678,85 @@ impl VickyStore {
         }
 
         Ok(())
+    }
+
+    pub fn pop_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
+        self.owned_pop_list_head(list_key.as_ref().to_owned())
+    }
+
+    pub fn owned_pop_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
+        let (list_ph, list_key) = self.make_list_key(list_key);
+
+        let _guard = self._list_lock(list_ph);
+
+        let Some(list_buf) = self.get_raw(&list_key)? else {
+            return Ok(None);
+        };
+        let list = *from_bytes::<LinkedList>(&list_buf);
+        let item_ph = list.head;
+        let Some((item_key, mut item_val)) = self._list_get(list_ph, item_ph)? else {
+            return Ok(None);
+        };
+
+        let chain = chain_of(&item_val);
+        item_val.truncate(item_val.len() - size_of::<Chain>());
+
+        if list.tail == item_ph {
+            self._remove_from_list_single(chain, list_key, &item_key)?;
+        } else {
+            self._remove_from_list_head(list_buf, list, chain, list_ph, list_key, &item_key)?;
+        }
+        Ok(Some((item_key, item_val)))
+    }
+
+    pub fn pop_list_tail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
+        self.owned_pop_list_tail(list_key.as_ref().to_owned())
+    }
+
+    pub fn owned_pop_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
+        let (list_ph, list_key) = self.make_list_key(list_key);
+
+        let _guard = self._list_lock(list_ph);
+
+        let Some(list_buf) = self.get_raw(&list_key)? else {
+            return Ok(None);
+        };
+        let list = *from_bytes::<LinkedList>(&list_buf);
+        let item_ph = list.tail;
+        let Some((item_key, mut item_val)) = self._list_get(list_ph, item_ph)? else {
+            return Ok(None);
+        };
+
+        let chain = chain_of(&item_val);
+        item_val.truncate(item_val.len() - size_of::<Chain>());
+
+        if list.head == item_ph {
+            self._remove_from_list_single(chain, list_key, &item_key)?;
+        } else {
+            self._remove_from_list_tail(list_buf, list, chain, list_ph, list_key, &item_key)?;
+        }
+        Ok(Some((item_key, item_val)))
+    }
+
+    pub fn push_to_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        list_key: &B1,
+        val: &B2,
+    ) -> Result<Uuid> {
+        self.owned_push_to_list(list_key.as_ref().to_owned(), val.as_ref().to_owned())
+    }
+
+    pub fn owned_push_to_list(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
+        let uuid = Uuid::new_v4();
+        let status = self._insert_to_list(
+            list_key,
+            uuid.as_bytes().to_vec(),
+            val,
+            InsertMode::GetOrCreate,
+        )?;
+        if !status.was_created() {
+            corrupted_list!("uuid collision {uuid}");
+        }
+        Ok(uuid)
     }
 }

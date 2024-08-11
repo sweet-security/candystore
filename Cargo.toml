@@ -14,6 +14,7 @@ simd-itertools = "0.2.3"
 siphasher = "1.0.1"
 anyhow = "1.0.86"
 parking_lot = "0.12.3"
+uuid = { version = "1.10.0", features = ["v4"] }
 
 [dev-dependencies]
 rand = "0.8.5"

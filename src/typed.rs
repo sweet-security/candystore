@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
+use uuid::Uuid;
 
 use crate::{
     insertion::{ReplaceStatus, SetStatus},
@@ -281,6 +282,65 @@ where
         L: Borrow<Q>,
     {
         let list_key = Self::make_list_key(list_key);
-        self.store.discard_list(&list_key)
+        self.store.owned_discard_list(list_key)
+    }
+}
+
+#[derive(Clone)]
+pub struct VickyTypedQueue<L, V> {
+    store: Arc<VickyStore>,
+    _phantom: PhantomData<(L, V)>,
+}
+
+impl<L, V> VickyTypedQueue<L, V>
+where
+    L: VickyTypedKey,
+    V: Encode + DecodeOwned,
+{
+    pub fn new(store: Arc<VickyStore>) -> Self {
+        Self {
+            store,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn make_list_key<Q: ?Sized + Encode>(k: &Q) -> Vec<u8>
+    where
+        L: Borrow<Q>,
+    {
+        let mut kbytes = k.to_bytes::<LE>();
+        kbytes.extend_from_slice(&L::TYPE_ID.to_le_bytes());
+        kbytes
+    }
+
+    pub fn push<Q: ?Sized + Encode>(&self, list_key: &Q, v: V) -> Result<Uuid>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let val = v.to_bytes::<LE>();
+        self.store.owned_push_to_list(list_key, val)
+    }
+
+    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((_, v)) = self.store.owned_pop_list_head(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
+    }
+
+    pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((_, v)) = self.store.owned_pop_list_tail(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
     }
 }
