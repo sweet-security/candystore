@@ -13,6 +13,7 @@ memmap = "0.7.0"
 simd-itertools = "0.2.3"
 siphasher = "1.0.1"
 anyhow = "1.0.86"
+parking_lot = "0.12.3"
 
 [dev-dependencies]
 rand = "0.8.5"
@@ -20,4 +21,4 @@ rand = "0.8.5"
 [workspace]
 members = [
     "simulator"
-, "vicky-crasher", "vicky-perf"]
+    , "vicky-crasher", "vicky-perf"]
