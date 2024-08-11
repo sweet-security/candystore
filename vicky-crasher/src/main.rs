@@ -1,5 +1,6 @@
-use std::ops::Range;
+use std::ptr::null_mut;
 use std::time::Duration;
+use std::{ops::Range, sync::atomic::AtomicU64};
 
 use rand::Rng;
 use vicky_store::{Config, Result, VickyStore};
@@ -140,12 +141,21 @@ fn child_collection_removals() -> Result<()> {
     Ok(())
 }
 
-fn parent_run(mut child_func: impl FnMut() -> Result<()>, sleep: Range<u64>) -> Result<()> {
+fn parent_run(
+    shared_stuff: &SharedStuff,
+    mut child_func: impl FnMut() -> Result<()>,
+    sleep: Range<u64>,
+) -> Result<()> {
     for i in 0.. {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
             let res = child_func();
+            if res.is_err() {
+                shared_stuff
+                    .failed
+                    .store(1, std::sync::atomic::Ordering::SeqCst);
+            }
             res.unwrap();
             unsafe { libc::exit(0) };
         } else {
@@ -161,10 +171,22 @@ fn parent_run(mut child_func: impl FnMut() -> Result<()>, sleep: Range<u64>) -> 
                     libc::kill(pid, libc::SIGKILL);
                     libc::wait(&mut status);
                 };
+                if shared_stuff
+                    .failed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != 0
+                {
+                    panic!("child crashed at iteration {i}");
+                }
             } else {
                 assert!(rc > 0);
-                if !libc::WIFSIGNALED(status) && libc::WEXITSTATUS(status) != 0 {
-                    panic!("child crashed at iteration {i}")
+                if (!libc::WIFSIGNALED(status) && libc::WEXITSTATUS(status) != 0)
+                    || shared_stuff
+                        .failed
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        != 0
+                {
+                    panic!("child crashed at iteration {i}");
                 }
 
                 println!("child finished in {i} iterations");
@@ -175,10 +197,28 @@ fn parent_run(mut child_func: impl FnMut() -> Result<()>, sleep: Range<u64>) -> 
     Ok(())
 }
 
+struct SharedStuff {
+    failed: AtomicU64,
+}
+
 fn main() -> Result<()> {
     _ = std::fs::remove_dir_all("dbdir");
 
-    parent_run(child_inserts, 10..300)?;
+    let map_addr = unsafe {
+        libc::mmap(
+            null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(map_addr, libc::MAP_FAILED);
+
+    let shared_stuff = unsafe { &*(map_addr as *const SharedStuff) };
+
+    parent_run(shared_stuff, child_inserts, 10..300)?;
 
     {
         println!("Parent starts validating the DB...");
@@ -201,7 +241,7 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(child_removals, 10..30)?;
+    parent_run(shared_stuff, child_removals, 10..30)?;
 
     {
         println!("Parent starts validating the DB...");
@@ -216,7 +256,7 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(child_collection_inserts, 10..30)?;
+    parent_run(shared_stuff, child_collection_inserts, 10..30)?;
 
     {
         println!("Parent starts validating the DB...");
@@ -236,7 +276,7 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(child_collection_removals, 10..30)?;
+    parent_run(shared_stuff, child_collection_removals, 10..30)?;
 
     {
         println!("Parent starts validating the DB...");
