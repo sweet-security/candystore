@@ -42,8 +42,7 @@ typed_builtin!(Vec<u8>, 16);
 #[derive(Clone)]
 pub struct VickyTypedStore<K, V> {
     store: Arc<VickyStore>,
-    _k: PhantomData<K>,
-    _v: PhantomData<V>,
+    _phantom: PhantomData<(K, V)>,
 }
 
 impl<K, V> VickyTypedStore<K, V>
@@ -54,8 +53,7 @@ where
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
-            _k: PhantomData,
-            _v: PhantomData,
+            _phantom: Default::default(),
         }
     }
 
@@ -136,9 +134,7 @@ where
 #[derive(Clone)]
 pub struct VickyTypedCollection<C, K, V> {
     store: Arc<VickyStore>,
-    _c: PhantomData<C>,
-    _k: PhantomData<K>,
-    _v: PhantomData<V>,
+    _phantom: PhantomData<(C, K, V)>,
 }
 
 impl<C, K, V> VickyTypedCollection<C, K, V>
@@ -150,9 +146,7 @@ where
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
-            _c: PhantomData,
-            _k: PhantomData,
-            _v: PhantomData,
+            _phantom: Default::default(),
         }
     }
 
