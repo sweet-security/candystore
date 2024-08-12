@@ -2,13 +2,13 @@
 A pure rust implementation of a fast (*blazingly* :tm:, of course), persistent, in-process key-value store, that relies 
 on a novel sharding algorithm. Just how blazingly? It's over 9000!
 
-| Operation | Time  |
-|-----------|-------|
+| Operation | Time*  |
+|-----------|--------|
 | Lookup    | < 1us  |
 | Insert    | < 2us  |
 | Removal   | < 1us  |
 
-See [the benchmark](vicky-perf/README.md)
+See [the benchmark](vicky-perf/README.md) and the [note below*](#how-to-interpret-the-performance-results).
 
 
 ## Overview
@@ -147,3 +147,23 @@ for res in db.iter_list("mylist") {
   time spans. It's an alternative to TTL, and amortizes the number of times an entry will move around as the 
   dataset grows.
 * Maybe add Arithmethid coding/Huffman coding as a cheap compression for the keys and values
+
+## How to Interpret the Performance Results
+While the numbers above are incredible, it is obvious that any file-backed store will be limited by the
+filesystem's latency and bandwidth. For example, you can expect a read latency of 20-100us from SSDs (NVMe),
+so that's the lower bound on reading a random location in the file. 
+
+What the numbers above measure is the performance of the *algorithm*, not the *storage*: given you can spare an 
+overhead of 0.6% mapped into memory, lookup/insert/removal require a single disk IO. Replacing (updating) an 
+existing element requires two IOs, since it needs to compare the key before writing it anew.
+These IOs may return from the kernel's page cache, in which case it's practically immediate, or from disk,
+in which case you can expect it to take 1-2 round-trip times of your device.
+
+Inserting to/removing from a linked-lists require 2-3 IOs, since these operations need to update the list's 
+head or tail, as well as link/unlink to their previous element. Such operations should really be done with a "large enough page cache". 
+Updating/fetching an existing element element in a list is a single IO as above.
+
+If your memory is too constrainted for keeping the lookup tables mapped-in (i.e., they get evicted to disk),
+you'll incur one more unit of "IO latency" for fetching the row from the table. Since the row spans 2KB (and 
+aligned to 4KB), it should behave nicely with 4K IOs.
+

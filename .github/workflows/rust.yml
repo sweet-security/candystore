@@ -33,4 +33,4 @@ jobs:
     - name: Run crasher
       run: cargo -Z unstable-options -C vicky-crasher run --release
     - name: Run longliving
-      run: cargo -Z unstable-options -C vicky-longliving run --release -- 40001
+      run: cargo -Z unstable-options -C vicky-longliving run --release -- 10 40001 10000

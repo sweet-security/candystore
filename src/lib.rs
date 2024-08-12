@@ -23,6 +23,7 @@ pub enum VickyError {
     SplitFailed(String),
     LoadingFailed(String),
     CorruptedLinkedList(String),
+    DuplicateHashInList(Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl Display for VickyError {
@@ -36,6 +37,10 @@ impl Display for VickyError {
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
             Self::SplitFailed(s) => write!(f, "shard split failed: {s}"),
+            Self::DuplicateHashInList(list, origk, newk) => write!(
+                f,
+                "list {list:?} has an existing key {origk:?} that hashes the same as {newk:?}"
+            ),
         }
     }
 }

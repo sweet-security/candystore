@@ -46,6 +46,45 @@ impl ShardRow {
     }
 }
 
+#[test]
+fn test_row_lookup() -> Result<()> {
+    let mut row = ShardRow {
+        signatures: [0; ROW_WIDTH],
+        offsets_and_sizes: [0; ROW_WIDTH],
+    };
+
+    row.signatures[7] = 123;
+    row.signatures[8] = 123;
+    row.signatures[9] = 123;
+    row.signatures[90] = 123;
+    row.signatures[ROW_WIDTH - 1] = 999;
+
+    let mut start = 0;
+    assert_eq!(row.lookup(123, &mut start), Some(7));
+    assert_eq!(start, 8);
+    assert_eq!(row.lookup(123, &mut start), Some(8));
+    assert_eq!(start, 9);
+    assert_eq!(row.lookup(123, &mut start), Some(9));
+    assert_eq!(start, 10);
+    assert_eq!(row.lookup(123, &mut start), Some(90));
+    assert_eq!(start, 91);
+    assert_eq!(row.lookup(123, &mut start), None);
+    assert_eq!(start, 91);
+
+    start = 0;
+    assert_eq!(row.lookup(0, &mut start), Some(0));
+    assert_eq!(start, 1);
+
+    start = 0;
+    assert_eq!(row.lookup(999, &mut start), Some(ROW_WIDTH - 1));
+    assert_eq!(start, ROW_WIDTH);
+
+    assert_eq!(row.lookup(999, &mut start), None);
+    assert_eq!(start, ROW_WIDTH);
+
+    Ok(())
+}
+
 #[repr(C, align(4096))]
 pub(crate) struct PageAligned<T>(pub T);
 
@@ -184,7 +223,6 @@ impl Shard {
     // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
     fn read_kv(&self, offset_and_size: u64) -> Result<KVPair> {
         let (klen, vlen, offset) = Self::extract_offset_and_size(offset_and_size);
-
         let mut buf = vec![0u8; klen + vlen];
         self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
 

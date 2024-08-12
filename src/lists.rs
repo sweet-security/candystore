@@ -5,7 +5,7 @@ use crate::{
     GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 use parking_lot::MutexGuard;
 use uuid::Uuid;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 struct LinkedList {
     tail: PartedHash,
     head: PartedHash,
+    anticollision_bits: u64, // MSB: 22 zero bits, 21 bits tail AC, 21 bits head AC
 }
 
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -22,12 +23,14 @@ struct LinkedList {
 struct Chain {
     prev: PartedHash,
     next: PartedHash,
+    anticollision_bits: u64, // MSB: 0, 21 bits for this AC, 21 bits next AC, 21 bits prev AC
 }
 
 impl Chain {
     const INVALID: Self = Self {
         prev: PartedHash::INVALID,
         next: PartedHash::INVALID,
+        anticollision_bits: 0,
     };
 }
 
@@ -253,10 +256,24 @@ impl VickyStore {
             return Ok(GetOrCreateStatus::CreatedNew(val));
         }
 
+        if let Some((origk, _)) = self._list_get(list_ph, item_ph)? {
+            // assuming a single shard, we have 6+32=40 bits of entropy, which should provide 20 bits of
+            // collision revistance which brings us to 1M entries. however, 1M entries should span 64 shards
+            // so we'd have more entropy for collision resistance.
+            //
+            // anyhow, if this happens, we will need to add an anti-collision mechanism where we add extra
+            // 64 bits and store them in the value suffix and chain next/prev
+            //
+            // although improbable, without enforcing this, list iteration and find_true_tail would end up
+            // in an endless loop
+            bail!(VickyError::DuplicateHashInList(list_key, origk, item_key));
+        }
+
         // item does not exist, and the list itself might also not exist. get or create the list
         let curr_list = LinkedList {
             tail: item_ph,
             head: item_ph,
+            anticollision_bits: 0,
         };
 
         let curr_list = *from_bytes::<LinkedList>(
@@ -302,9 +319,12 @@ impl VickyStore {
 
         // now add item, with prev pointing to the old tail. if we crash after this, find_true_tail
         // will return the newly-added item as the tail.
+        // possible optimization: only update the tail every X operations, this reduces the expected
+        // number of IOs at the expense of more walking when inserting
         let this_chain = Chain {
-            next: PartedHash::INVALID,
             prev: tail_ph,
+            next: PartedHash::INVALID,
+            anticollision_bits: 0,
         };
         val.extend_from_slice(bytes_of(&this_chain));
 
@@ -316,6 +336,7 @@ impl VickyStore {
         let new_list = LinkedList {
             head: curr_list.head,
             tail: item_ph,
+            anticollision_bits: 0,
         };
 
         if !self
@@ -744,6 +765,10 @@ impl VickyStore {
 
         Ok(())
     }
+
+    // optimization: add singly-linked lists that allow removing only from the head and inserting
+    // only at the tail, but support O(1) access (by index) and update of existing elements.
+    // this would require only 2 IOs instead of 3 when inserting new elements.
 
     pub fn peek_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_peek_list_head(list_key.as_ref().to_owned())
