@@ -58,6 +58,7 @@ pub struct Config {
     pub expected_number_of_keys: usize, // hint for creating number of shards accordingly)
     pub merge_small_shards: bool, // whether or not to merge small shards when items are removed
     pub max_concurrent_list_ops: u32, // number of keyed locks for concurrent list ops
+    pub truncate_up: bool, // whether or not to truncate up shard files to their max size (spare files)
 }
 
 impl Default for Config {
@@ -69,6 +70,7 @@ impl Default for Config {
             expected_number_of_keys: 0,
             merge_small_shards: false,
             max_concurrent_list_ops: 64,
+            truncate_up: true,
         }
     }
 }

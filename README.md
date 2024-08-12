@@ -82,7 +82,7 @@ disk every so often. This allows us to forgo a journal or write-ahead log (WAL).
 The default parameters (chosen by simulations) are of shards with 64 rows, each with 512 entries. The chances 
 of collisions with these parameters are minimal, and they allow for ~90% utilization of the shard, while
 requiring relatively small header tables (32K entries, taking up 384KB). With the expected 90% utilization, 
-you should be expect to hold 29.5K keys per shard. For a shardm file of 64MB, that's 0.6% overhead.
+you should be expect to hold 29.5K keys per shard. For a shard file of 64MB, that's 0.6% overhead.
 
 Because the data structure is a hash table rather than a search tree, insertion, lookup and removal are 
 all O(1) operations.
