@@ -284,6 +284,28 @@ where
         let list_key = Self::make_list_key(list_key);
         self.store.owned_discard_list(list_key)
     }
+
+    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((k, v)) = self.store.owned_pop_list_head(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+    }
+
+    pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((k, v)) = self.store.owned_pop_list_tail(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+    }
 }
 
 #[derive(Clone)]
