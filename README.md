@@ -8,8 +8,9 @@ on a novel sharding algorithm. Just how blazingly? It's over 9000!
 | Insert    | < 2us  |
 | Removal   | < 1us  |
 
-The algorithm can be thought of as a *zero-cost extension* to a hash table stored over files, as it's designed to minimizes IO operations.
-See [the benchmark](candy-perf/README.md) and [how to interpret the results*](#how-to-interpret-the-performance-results).
+The algorithm can be thought of as a "zero-overhead" extension to a hash table stored over files, 
+as it's designed to minimizes IO operations. See [the benchmark](candy-perf/README.md) and 
+[how to interpret the results*](#how-to-interpret-the-performance-results).
 
 ## Overview
 Being a hash-table, the key is hashed, producing a 64 bit number. The 16 most significant bits select 

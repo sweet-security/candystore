@@ -1,3 +1,51 @@
+//! A fast (*blazingly* :tm:, of course), persistent, in-process key-value store that relies on a novel sharding
+//! algorithm. Since Candy does not rely on log-structured merge (LSM) trees or B-Trees, not journal/WAL is needed
+//! and IOs go directly to file.
+//!
+//! The algorithm can be thought of as a "zero-overhead" extension to a hash table that's stored over files,
+//! as it's designed to minimizes disk IO operations. Most operations add an overhead of 1-2 microseconds
+//! to the disk IO latency, and operations generally require 1-4 disk IOs.
+//!
+//! The algorithm, for the most part, is crash-safe. That is, you can crash at any point and still be in a consistent
+//! state. You might lose the ongoing operation, but we consider this acceptable. Some operations, like
+//! `modify-inplace` or `set_promoting` are not crash safe, and are documented as such.
+//!
+//! Candy is designed to consume very little memory: entries are written directly to the shard-file, and only a
+//! table of ~380KB is kept `mmap`-ed (it is also file-backed, so can be evicted if needed). A shard-file can
+//! hold around 30K entries, and more shard-files are created as needed.
+//!
+//! A unique feature of Candy is the support of linked lists, which allow creating cheap collections.
+//!
+//! Notes:
+//! * the file format is not yet stable!
+//! * nightly is required for `simd_itertools`
+//!
+//! Example:
+//! ```
+//! use candystore::{CandyStore, Config, Result};
+//!
+//! fn main() -> Result<()> {
+//!     let db = CandyStore::open("/tmp/candy-dir", Config::default())?;
+//!     db.set("hello", "world")?;
+//!     assert_eq!(db.get("hello")?, Some("world".into()));
+//!     db.remove("hello")?;
+//!     assert_eq!(db.get("hello")?, None);
+//!
+//!     // lists
+//!     db.set_in_list("spanish", "bye", "adios")?;
+//!     db.set_in_list("spanish", "thanks", "gracias")?;
+//!     assert_eq!(db.get_from_list("italian", "bye")?, Some("arrivederci".into()));
+//!
+//!     db.set_in_list("italian", "bye", "arrivederci")?;
+//!     db.set_in_list("italian", "thanks", "grazie")?;
+//!
+//!     let items = db.iter_list("spanish").map(|res| res.unwrap().unwrap()).collect::<Vec<_>>();
+//!     assert_eq!(items, vec![("bye".into(), "adios".into()), ("thanks".into(), "gracias".into())]);
+//!
+//!     Ok(())
+//! }
+//! ```
+
 #![feature(btree_cursors)]
 
 mod hashing;
