@@ -245,6 +245,9 @@ impl VickyStore {
         if val.len() > MAX_VALUE_SIZE as usize {
             return Err(anyhow!(VickyError::ValueTooLong));
         }
+        if full_key.len() + val.len() > self.config.max_shard_size as usize {
+            return Err(anyhow!(VickyError::EntryCannotFitInShard));
+        }
 
         loop {
             let (status, shard_start, shard_end) = self.try_insert(ph, &full_key, val, mode)?;

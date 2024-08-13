@@ -92,11 +92,11 @@ fn test_typed_lists() -> Result<()> {
         let db = Arc::new(VickyStore::open(dir, Config::default())?);
 
         let typed = VickyTypedList::<String, u64, u32>::new(db);
-        typed.set("texas".into(), 108, 2005)?;
-        typed.set("texas".into(), 555, 2006)?;
-        typed.set("texas".into(), 827, 2007)?;
-        typed.set("texas".into(), 123, 2008)?;
-        typed.set("texas".into(), 555, 2009)?;
+        typed.set("texas", &108, &2005)?;
+        typed.set("texas", &555, &2006)?;
+        typed.set("texas", &827, &2007)?;
+        typed.set("texas", &123, &2008)?;
+        typed.set("texas", &555, &2009)?;
 
         assert_eq!(typed.get("texas", &555)?, Some(2009));
         assert_eq!(typed.get("texas", &66666666)?, None);
@@ -282,7 +282,7 @@ fn test_typed_queue() -> Result<()> {
         assert_eq!(queue.pop_head("orders")?, None);
 
         for i in 10..30 {
-            queue.push("orders", i)?;
+            queue.push("orders", &i)?;
         }
         for i in 10..20 {
             assert_eq!(queue.pop_head("orders")?, Some(i));
@@ -330,6 +330,79 @@ fn test_rev_iter() -> Result<()> {
             db.peek_list_htail("mylist")?,
             Some(("item4".into(), "xxx".into()))
         );
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_promote() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = VickyStore::open(dir, Config::default())?;
+
+        let items = || {
+            db.iter_list("mylist")
+                .map(|res| res.unwrap().unwrap().0)
+                .collect::<Vec<_>>()
+        };
+
+        db.set_in_list("mylist", "item1", "xxx")?;
+        db.set_in_list("mylist", "item2", "xxx")?;
+        db.set_in_list("mylist", "item3", "xxx")?;
+        db.set_in_list("mylist", "item4", "xxx")?;
+
+        assert_eq!(items(), vec![b"item1", b"item2", b"item3", b"item4"]);
+
+        // no promotion happens
+        db.set_in_list("mylist", "item2", "yyy")?;
+        assert_eq!(items(), vec![b"item1", b"item2", b"item3", b"item4"]);
+
+        // promote a middle element
+        db.set_in_list_promoting("mylist", "item2", "zzz")?;
+        assert_eq!(items(), vec![b"item1", b"item3", b"item4", b"item2"]);
+
+        // promote head element
+        db.set_in_list_promoting("mylist", "item1", "zzz")?;
+        assert_eq!(items(), vec![b"item3", b"item4", b"item2", b"item1"]);
+
+        // promote tail element
+        db.set_in_list_promoting("mylist", "item1", "zzz")?;
+        assert_eq!(items(), vec![b"item3", b"item4", b"item2", b"item1"]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_typed_promote() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+        let typed = VickyTypedList::<String, u32, String>::new(db);
+
+        let items = || {
+            typed
+                .iter("mylist")
+                .map(|res| res.unwrap().unwrap().0)
+                .collect::<Vec<_>>()
+        };
+
+        typed.set("mylist", &1, "xxx")?;
+        typed.set("mylist", &2, "xxx")?;
+        typed.set("mylist", &3, "xxx")?;
+        typed.set("mylist", &4, "xxx")?;
+        assert_eq!(items(), &[1, 2, 3, 4]);
+
+        typed.set("mylist", &2, "yyy")?;
+        assert_eq!(items(), &[1, 2, 3, 4]);
+
+        typed.set_promoting("mylist", &2, "zzz")?;
+        assert_eq!(items(), &[1, 3, 4, 2]);
+
+        typed.set_promoting("mylist", &1, "zzz")?;
+        assert_eq!(items(), &[3, 4, 2, 1]);
+
+        typed.set_promoting("mylist", &1, "zzz")?;
+        assert_eq!(items(), &[3, 4, 2, 1]);
 
         Ok(())
     })

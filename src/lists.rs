@@ -368,15 +368,37 @@ impl VickyStore {
             list_key.as_ref().to_owned(),
             item_key.as_ref().to_owned(),
             val.as_ref().to_owned(),
+            false,
         )
     }
 
+    pub fn set_in_list_promoting<
+        B1: AsRef<[u8]> + ?Sized,
+        B2: AsRef<[u8]> + ?Sized,
+        B3: AsRef<[u8]> + ?Sized,
+    >(
+        &self,
+        list_key: &B1,
+        item_key: &B2,
+        val: &B3,
+    ) -> Result<SetStatus> {
+        self.owned_set_in_list(
+            list_key.as_ref().to_owned(),
+            item_key.as_ref().to_owned(),
+            val.as_ref().to_owned(),
+            true,
+        )
+    }
     pub fn owned_set_in_list(
         &self,
         list_key: Vec<u8>,
         item_key: Vec<u8>,
         val: Vec<u8>,
+        promote: bool,
     ) -> Result<SetStatus> {
+        if promote {
+            self.owned_remove_from_list(list_key.clone(), item_key.clone())?;
+        }
         match self._insert_to_list(list_key, item_key, val, InsertMode::Set)? {
             GetOrCreateStatus::CreatedNew(_) => Ok(SetStatus::CreatedNew),
             GetOrCreateStatus::ExistingValue(v) => Ok(SetStatus::PrevValue(v)),

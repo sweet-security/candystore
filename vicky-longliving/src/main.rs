@@ -30,7 +30,7 @@ fn main() -> Result<()> {
                 if i % 10000 == 0 {
                     println!("thread {thd} at {i} {:?}", db.stats());
                 }
-                typed.set("mylist".into(), thd * num_iters + i, "xxx".into())?;
+                typed.set("mylist".into(), &(thd * num_iters + i), "xxx")?;
                 ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= tail_length {
                     typed.remove("mylist".into(), &(thd * num_iters + i - tail_length))?;

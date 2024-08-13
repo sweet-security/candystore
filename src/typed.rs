@@ -93,8 +93,16 @@ where
         }
     }
 
-    pub fn replace(&self, k: K, v: V) -> Result<Option<V>> {
-        let kbytes = Self::make_key(&k);
+    pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        k: &Q1,
+        v: &Q2,
+    ) -> Result<Option<V>>
+    where
+        K: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let kbytes = Self::make_key(k);
         let vbytes = v.to_bytes::<LE>();
         match self.store.replace_raw(&kbytes, &vbytes)? {
             ReplaceStatus::DoesNotExist => Ok(None),
@@ -102,8 +110,16 @@ where
         }
     }
 
-    pub fn replace_inplace(&self, k: K, v: V) -> Result<Option<V>> {
-        let kbytes = Self::make_key(&k);
+    pub fn replace_inplace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        k: &Q1,
+        v: &Q2,
+    ) -> Result<Option<V>>
+    where
+        K: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let kbytes = Self::make_key(k);
         let vbytes = v.to_bytes::<LE>();
         match self.store.replace_inplace_raw(&kbytes, &vbytes)? {
             ModifyStatus::DoesNotExist => Ok(None),
@@ -114,8 +130,12 @@ where
         }
     }
 
-    pub fn set(&self, k: K, v: V) -> Result<Option<V>> {
-        let kbytes = Self::make_key(&k);
+    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(&self, k: &Q1, v: &Q2) -> Result<Option<V>>
+    where
+        K: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let kbytes = Self::make_key(k);
         let vbytes = v.to_bytes::<LE>();
         match self.store.set_raw(&kbytes, &vbytes)? {
             SetStatus::CreatedNew => Ok(None),
@@ -123,8 +143,16 @@ where
         }
     }
 
-    pub fn get_or_create(&self, k: K, v: V) -> Result<V> {
-        let kbytes = Self::make_key(&k);
+    pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        k: &Q1,
+        v: &Q2,
+    ) -> Result<V>
+    where
+        K: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let kbytes = Self::make_key(k);
         Ok(from_bytes::<V>(
             &self
                 .store
@@ -209,18 +237,69 @@ where
         }
     }
 
-    pub fn set(&self, list_key: L, item_key: K, val: V) -> Result<Option<V>> {
-        let list_key = Self::make_list_key(&list_key);
+    fn _set<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        item_key: &Q2,
+        val: &Q3,
+        promote: bool,
+    ) -> Result<Option<V>>
+    where
+        L: Borrow<Q1>,
+        K: Borrow<Q2>,
+        V: Borrow<Q3>,
+    {
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
-        match self.store.owned_set_in_list(list_key, item_key, val)? {
+        match self
+            .store
+            .owned_set_in_list(list_key, item_key, val, promote)?
+        {
             SetStatus::CreatedNew => Ok(None),
             SetStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
         }
     }
 
-    pub fn get_or_create(&self, list_key: L, item_key: K, val: V) -> Result<V> {
-        let list_key = Self::make_list_key(&list_key);
+    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        item_key: &Q2,
+        val: &Q3,
+    ) -> Result<Option<V>>
+    where
+        L: Borrow<Q1>,
+        K: Borrow<Q2>,
+        V: Borrow<Q3>,
+    {
+        self._set(list_key, item_key, val, false)
+    }
+
+    pub fn set_promoting<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        item_key: &Q2,
+        val: &Q3,
+    ) -> Result<Option<V>>
+    where
+        L: Borrow<Q1>,
+        K: Borrow<Q2>,
+        V: Borrow<Q3>,
+    {
+        self._set(list_key, item_key, val, true)
+    }
+
+    pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        item_key: &Q2,
+        val: &Q3,
+    ) -> Result<V>
+    where
+        L: Borrow<Q1>,
+        K: Borrow<Q2>,
+    {
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
         let vbytes = self
@@ -230,8 +309,18 @@ where
         from_bytes::<V>(&vbytes)
     }
 
-    pub fn replace(&self, list_key: L, item_key: K, val: V) -> Result<Option<V>> {
-        let list_key = Self::make_list_key(&list_key);
+    pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        item_key: &Q2,
+        val: &Q3,
+    ) -> Result<Option<V>>
+    where
+        L: Borrow<Q1>,
+        K: Borrow<Q2>,
+        V: Borrow<Q3>,
+    {
+        let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
         match self.store.owned_replace_in_list(list_key, item_key, val)? {
@@ -335,9 +424,14 @@ where
         kbytes
     }
 
-    pub fn push<Q: ?Sized + Encode>(&self, list_key: &Q, v: V) -> Result<Uuid>
+    pub fn push<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        v: &Q2,
+    ) -> Result<Uuid>
     where
-        L: Borrow<Q>,
+        L: Borrow<Q1>,
+        V: Borrow<Q2>,
     {
         let list_key = Self::make_list_key(list_key);
         let val = v.to_bytes::<LE>();

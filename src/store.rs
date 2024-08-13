@@ -31,13 +31,20 @@ pub struct Stats {
     pub num_shards: usize,
     pub num_inserted: usize,
     pub num_deleted: usize,
-    pub total_bytes: usize,
     pub wasted_bytes: usize,
+    pub used_bytes: usize,
 }
 
 impl Stats {
+    pub const FILE_HEADER_SIZE: usize = HEADER_SIZE as usize;
     pub fn len(&self) -> usize {
         self.num_inserted - self.num_deleted
+    }
+    pub fn data_bytes(&self) -> usize {
+        self.used_bytes - self.wasted_bytes
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.used_bytes + Self::FILE_HEADER_SIZE
     }
 }
 
@@ -459,9 +466,8 @@ impl VickyStore {
         for (_, shard) in guard.iter() {
             stats.num_inserted += shard.header.num_inserted.load(Ordering::Relaxed) as usize;
             stats.num_deleted += shard.header.num_deleted.load(Ordering::Relaxed) as usize;
+            stats.used_bytes = shard.header.write_offset.load(Ordering::Relaxed) as usize;
             stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
-            stats.total_bytes +=
-                shard.header.write_offset.load(Ordering::Relaxed) as usize + HEADER_SIZE as usize;
         }
         stats
     }

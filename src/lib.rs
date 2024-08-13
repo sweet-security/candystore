@@ -13,11 +13,12 @@ use std::fmt::{Display, Formatter};
 pub use store::{Stats, VickyStore};
 pub use typed::{VickyTypedKey, VickyTypedList, VickyTypedQueue, VickyTypedStore};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum VickyError {
     WrongHashSeedLength,
     KeyTooLong,
     ValueTooLong,
+    EntryCannotFitInShard,
     KeyNotFound,
     CompactionFailed(String),
     SplitFailed(String),
@@ -33,6 +34,7 @@ impl Display for VickyError {
             Self::KeyTooLong => write!(f, "key too long"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong => write!(f, "value too long"),
+            Self::EntryCannotFitInShard => write!(f, "entry too big for a single shard file"),
             Self::CorruptedLinkedList(s) => write!(f, "corrupted linked list: {s}"),
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
