@@ -2,9 +2,9 @@ mod common;
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use vicky_store::{
-    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedDeque,
-    VickyTypedList,
+use candystore::{
+    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, CandyStore, CandyTypedDeque,
+    CandyTypedList,
 };
 
 use crate::common::run_in_tempdir;
@@ -12,7 +12,7 @@ use crate::common::run_in_tempdir;
 #[test]
 fn test_lists() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             dir,
             Config {
                 max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
@@ -89,9 +89,9 @@ fn test_lists() -> Result<()> {
 #[test]
 fn test_typed_lists() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+        let db = Arc::new(CandyStore::open(dir, Config::default())?);
 
-        let typed = VickyTypedList::<String, u64, u32>::new(db);
+        let typed = CandyTypedList::<String, u64, u32>::new(db);
         typed.set("texas", &108, &2005)?;
         typed.set("texas", &555, &2006)?;
         typed.set("texas", &827, &2007)?;
@@ -118,7 +118,7 @@ fn test_typed_lists() -> Result<()> {
 #[test]
 fn test_lists_multithreading() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+        let db = Arc::new(CandyStore::open(dir, Config::default())?);
 
         let removed = Arc::new(AtomicUsize::new(0));
         let created = Arc::new(AtomicUsize::new(0));
@@ -189,7 +189,7 @@ fn test_lists_multithreading() -> Result<()> {
 #[test]
 fn test_list_atomics() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         assert_eq!(
             db.get_or_create_in_list("xxx", "yyy", "1")?,
@@ -230,7 +230,7 @@ fn test_list_atomics() -> Result<()> {
 #[test]
 fn test_queues() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         db.push_to_list_tail("mylist", "hello1")?;
         db.push_to_list_tail("mylist", "hello2")?;
@@ -287,9 +287,9 @@ fn test_queues() -> Result<()> {
 #[test]
 fn test_typed_queue() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+        let db = Arc::new(CandyStore::open(dir, Config::default())?);
 
-        let queue = VickyTypedDeque::<String, u32>::new(db);
+        let queue = CandyTypedDeque::<String, u32>::new(db);
         assert_eq!(queue.pop_head("orders")?, None);
 
         for i in 10..30 {
@@ -332,7 +332,7 @@ fn test_typed_queue() -> Result<()> {
 #[test]
 fn test_rev_iter() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         db.set_in_list("mylist", "item1", "xxx")?;
         db.set_in_list("mylist", "item2", "xxx")?;
@@ -370,7 +370,7 @@ fn test_rev_iter() -> Result<()> {
 #[test]
 fn test_promote() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         let items = || {
             db.iter_list("mylist")
@@ -408,8 +408,8 @@ fn test_promote() -> Result<()> {
 #[test]
 fn test_typed_promote() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(dir, Config::default())?);
-        let typed = VickyTypedList::<String, u32, String>::new(db);
+        let db = Arc::new(CandyStore::open(dir, Config::default())?);
+        let typed = CandyTypedList::<String, u32, String>::new(db);
 
         let items = || {
             typed

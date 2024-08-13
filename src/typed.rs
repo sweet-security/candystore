@@ -5,13 +5,13 @@ use uuid::Uuid;
 use crate::{
     insertion::{ReplaceStatus, SetStatus},
     store::TYPED_NAMESPACE,
-    ModifyStatus, VickyStore,
+    CandyStore, ModifyStatus,
 };
 
 use crate::Result;
 use databuf::{config::num::LE, DecodeOwned, Encode};
 
-pub trait VickyTypedKey: Encode + DecodeOwned {
+pub trait CandyTypedKey: Encode + DecodeOwned {
     /// a random number that remains consistent (unlike [std::any::TypeId]), so that `MyPair(u32, u32)`
     /// is different from `YourPair(u32, u32)`
     const TYPE_ID: u32;
@@ -19,7 +19,7 @@ pub trait VickyTypedKey: Encode + DecodeOwned {
 
 macro_rules! typed_builtin {
     ($t:ty, $v:literal) => {
-        impl VickyTypedKey for $t {
+        impl CandyTypedKey for $t {
             const TYPE_ID: u32 = $v;
         }
     };
@@ -47,29 +47,29 @@ fn from_bytes<T: DecodeOwned>(bytes: &[u8]) -> Result<T> {
     T::from_bytes::<LE>(bytes).map_err(|e| anyhow!(e))
 }
 
-/// Typed stores are wrappers around an underlying [VickyStore], that serialize keys and values (using [databuf]).
+/// Typed stores are wrappers around an underlying [CandyStore], that serialize keys and values (using [databuf]).
 /// These are but thin wrappers, and multiple such wrappers can exist over the same store.
 ///
 /// The keys and values must support [Encode] and [DecodeOwned], with the addition that keys also provide
-/// a `TYPE_ID` const, via the [VickyTypedKey] trait.
+/// a `TYPE_ID` const, via the [CandyTypedKey] trait.
 ///
 /// Notes:
 /// * All APIs take keys and values by-ref, because they will serialize them, so taking owned values doesn't
 ///   make sense
-/// * [VickyStore::iter] will skip typed items, since it's meaningless to interpret them without the wrapper
+/// * [CandyStore::iter] will skip typed items, since it's meaningless to interpret them without the wrapper
 #[derive(Clone)]
-pub struct VickyTypedStore<K, V> {
-    store: Arc<VickyStore>,
+pub struct CandyTypedStore<K, V> {
+    store: Arc<CandyStore>,
     _phantom: PhantomData<(K, V)>,
 }
 
-impl<K, V> VickyTypedStore<K, V>
+impl<K, V> CandyTypedStore<K, V>
 where
-    K: VickyTypedKey,
+    K: CandyTypedKey,
     V: Encode + DecodeOwned,
 {
-    /// Constructs a typed wrapper over a VickyStore
-    pub fn new(store: Arc<VickyStore>) -> Self {
+    /// Constructs a typed wrapper over a CandyStore
+    pub fn new(store: Arc<CandyStore>) -> Self {
         Self {
             store,
             _phantom: Default::default(),
@@ -86,7 +86,7 @@ where
         kbytes
     }
 
-    /// Same as [VickyStore::contains] but serializes the key
+    /// Same as [CandyStore::contains] but serializes the key
     pub fn contains<Q: ?Sized + Encode>(&self, key: &Q) -> Result<bool>
     where
         K: Borrow<Q>,
@@ -94,7 +94,7 @@ where
         Ok(self.store.get_raw(&Self::make_key(key))?.is_some())
     }
 
-    /// Same as [VickyStore::get] but serializes the key and deserializes the value
+    /// Same as [CandyStore::get] but serializes the key and deserializes the value
     pub fn get<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
@@ -107,7 +107,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::replace] but serializes the key and the value
+    /// Same as [CandyStore::replace] but serializes the key and the value
     pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         key: &Q1,
@@ -125,7 +125,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::replace_inplace] but serializes the key and the value.
+    /// Same as [CandyStore::replace_inplace] but serializes the key and the value.
     /// Note: not crash safe!
     pub fn replace_inplace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
@@ -147,7 +147,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::set] but serializes the key and the value.
+    /// Same as [CandyStore::set] but serializes the key and the value.
     pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         key: &Q1,
@@ -165,7 +165,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::get_or_create] but serializes the key and the default value
+    /// Same as [CandyStore::get_or_create] but serializes the key and the default value
     pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         key: &Q1,
@@ -184,7 +184,7 @@ where
         )?)
     }
 
-    /// Same as [VickyStore::remove] but serializes the key
+    /// Same as [CandyStore::remove] but serializes the key
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
@@ -198,22 +198,22 @@ where
     }
 }
 
-/// A wrapper around [VickyStore] that exposes the linked-list API in a typed manner. See [VickyTypedStore] for more
+/// A wrapper around [CandyStore] that exposes the linked-list API in a typed manner. See [CandyTypedStore] for more
 /// info
 #[derive(Clone)]
-pub struct VickyTypedList<L, K, V> {
-    store: Arc<VickyStore>,
+pub struct CandyTypedList<L, K, V> {
+    store: Arc<CandyStore>,
     _phantom: PhantomData<(L, K, V)>,
 }
 
-impl<L, K, V> VickyTypedList<L, K, V>
+impl<L, K, V> CandyTypedList<L, K, V>
 where
-    L: VickyTypedKey,
+    L: CandyTypedKey,
     K: Encode + DecodeOwned,
     V: Encode + DecodeOwned,
 {
-    /// Constructs a [VickyTypedList] over an existing [VickyStore]
-    pub fn new(store: Arc<VickyStore>) -> Self {
+    /// Constructs a [CandyTypedList] over an existing [CandyStore]
+    pub fn new(store: Arc<CandyStore>) -> Self {
         Self {
             store,
             _phantom: PhantomData,
@@ -247,7 +247,7 @@ where
             .is_some())
     }
 
-    /// Same as [VickyStore::get_from_list], but `list_key` and `item_key` are typed
+    /// Same as [CandyStore::get_from_list], but `list_key` and `item_key` are typed
     pub fn get<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -290,7 +290,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::set_in_list], but `list_key`, `item_key` and `val` are typed
+    /// Same as [CandyStore::set_in_list], but `list_key`, `item_key` and `val` are typed
     pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -305,7 +305,7 @@ where
         self._set(list_key, item_key, val, false)
     }
 
-    /// Same as [VickyStore::set_in_list_promoting], but `list_key`, `item_key` and `val` are typed
+    /// Same as [CandyStore::set_in_list_promoting], but `list_key`, `item_key` and `val` are typed
     pub fn set_promoting<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -320,7 +320,7 @@ where
         self._set(list_key, item_key, val, true)
     }
 
-    /// Same as [VickyStore::get_or_create_in_list], but `list_key`, `item_key` and `default_val` are typed
+    /// Same as [CandyStore::get_or_create_in_list], but `list_key`, `item_key` and `default_val` are typed
     pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -341,7 +341,7 @@ where
         from_bytes::<V>(&vbytes)
     }
 
-    /// Same as [VickyStore::replace_in_list], but `list_key`, `item_key` and `val` are typed
+    /// Same as [CandyStore::replace_in_list], but `list_key`, `item_key` and `val` are typed
     pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -362,7 +362,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::remove_from_list], but `list_key` and `item_key`  are typed
+    /// Same as [CandyStore::remove_from_list], but `list_key` and `item_key`  are typed
     pub fn remove<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -381,7 +381,7 @@ where
         }
     }
 
-    /// Same as [VickyStore::iter_list], but `list_key` is typed
+    /// Same as [CandyStore::iter_list], but `list_key` is typed
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
@@ -401,7 +401,7 @@ where
         })
     }
 
-    /// Same as [VickyStore::iter_list_backwards], but `list_key` is typed
+    /// Same as [CandyStore::iter_list_backwards], but `list_key` is typed
     pub fn iter_backwards<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
@@ -423,7 +423,7 @@ where
             })
     }
 
-    /// Same as [VickyStore::discard_list], but `list_key` is typed
+    /// Same as [CandyStore::discard_list], but `list_key` is typed
     pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<()>
     where
         L: Borrow<Q>,
@@ -462,7 +462,7 @@ where
         self.store.owned_push_to_list_tail(list_key, val)
     }
 
-    /// Same as [VickyStore::pop_list_tail], but `list_key` is typed
+    /// Same as [CandyStore::pop_list_tail], but `list_key` is typed
     pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
@@ -474,7 +474,7 @@ where
         Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
     }
 
-    /// Same as [VickyStore::pop_list_head], but `list_key` is typed
+    /// Same as [CandyStore::pop_list_head], but `list_key` is typed
     pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
@@ -487,22 +487,22 @@ where
     }
 }
 
-/// A wrapper around [VickyTypedList] that's specialized for double-ended queues - only allows pushing
+/// A wrapper around [CandyTypedList] that's specialized for double-ended queues - only allows pushing
 /// and popping from either the end or the tail. The keys are auto-generated internally and are not exposed to
 /// the caller
 #[derive(Clone)]
-pub struct VickyTypedDeque<L, V> {
-    pub list: VickyTypedList<L, uuid::Bytes, V>,
+pub struct CandyTypedDeque<L, V> {
+    pub list: CandyTypedList<L, uuid::Bytes, V>,
 }
 
-impl<L, V> VickyTypedDeque<L, V>
+impl<L, V> CandyTypedDeque<L, V>
 where
-    L: VickyTypedKey,
+    L: CandyTypedKey,
     V: Encode + DecodeOwned,
 {
-    pub fn new(store: Arc<VickyStore>) -> Self {
+    pub fn new(store: Arc<CandyStore>) -> Self {
         Self {
-            list: VickyTypedList::new(store),
+            list: CandyTypedList::new(store),
         }
     }
 
@@ -550,7 +550,7 @@ where
         Ok(self.list.pop_tail(list_key)?.map(|kv| kv.1))
     }
 
-    /// See [VickyTypedList::iter]
+    /// See [CandyTypedList::iter]
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
@@ -565,7 +565,7 @@ where
         })
     }
 
-    /// See [VickyTypedList::iter_backwards]
+    /// See [CandyTypedList::iter_backwards]
     pub fn iter_backwards<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,

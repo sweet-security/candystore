@@ -1,10 +1,10 @@
 use core::str;
 use std::{sync::Arc, time::Duration};
 
-use vicky_store::{Config, Result, VickyStore};
+use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
-    let db = Arc::new(VickyStore::open("/tmp/vicky-dir-mt", Config::default())?);
+    let db = Arc::new(CandyStore::open("/tmp/candy-dir-mt", Config::default())?);
 
     // clear the DB just in case we has something there before. in real-life scenarios you would probably
     // not clear the DB every time

@@ -1,13 +1,13 @@
 mod common;
 
-use vicky_store::{Config, ModifyStatus, Result, VickyStore};
+use candystore::{Config, ModifyStatus, Result, CandyStore};
 
 use crate::common::run_in_tempdir;
 
 #[test]
 fn test_modify_inplace() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         db.set("aaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 

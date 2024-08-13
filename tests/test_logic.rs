@@ -2,14 +2,14 @@ mod common;
 
 use std::collections::HashSet;
 
-use vicky_store::{Config, Result, VickyStore};
+use candystore::{CandyStore, Config, Result};
 
 use crate::common::{run_in_tempdir, LONG_VAL};
 
 #[test]
 fn test_logic() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             dir,
             Config {
                 max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions

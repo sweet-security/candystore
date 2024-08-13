@@ -1,7 +1,7 @@
-use vicky_store::{Config, Result, VickyStore};
+use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
-    let db = VickyStore::open("/tmp/vicky-dir", Config::default())?;
+    let db = CandyStore::open("/tmp/candy-dir", Config::default())?;
 
     // clear the DB just in case we has something there before. in real-life scenarios you would probably
     // not clear the DB every time

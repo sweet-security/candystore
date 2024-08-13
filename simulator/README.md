@@ -1,4 +1,4 @@
-# Vicky Simulator
+# Candy Simulator
 
 * Tests the fill level that each shard can have using different params
 * Tests the number of collisions in the same row (signatures)

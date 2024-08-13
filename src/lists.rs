@@ -2,7 +2,7 @@ use crate::{
     hashing::PartedHash,
     shard::{InsertMode, KVPair},
     store::{ITEM_NAMESPACE, LIST_NAMESPACE},
-    GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyError, VickyStore,
+    CandyError, CandyStore, GetOrCreateStatus, ReplaceStatus, Result, SetStatus,
 };
 
 use anyhow::{anyhow, bail};
@@ -41,7 +41,7 @@ fn chain_of(buf: &[u8]) -> Chain {
 }
 
 pub struct LinkedListIterator<'a> {
-    store: &'a VickyStore,
+    store: &'a CandyStore,
     list_key: Vec<u8>,
     list_ph: PartedHash,
     next_ph: Option<PartedHash>,
@@ -96,7 +96,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
 // it doesn't really make sense to implement DoubleEndedIterator here, because we'd have to maintain both
 // pointers and the protocol says iteration ends when they meet in the middle
 pub struct RevLinkedListIterator<'a> {
-    store: &'a VickyStore,
+    store: &'a CandyStore,
     list_key: Vec<u8>,
     list_ph: PartedHash,
     next_ph: Option<PartedHash>,
@@ -150,7 +150,7 @@ impl<'a> Iterator for RevLinkedListIterator<'a> {
 
 macro_rules! corrupted_list {
     ($($arg:tt)*) => {
-        return Err(anyhow!(VickyError::CorruptedLinkedList(format!($($arg)*))));
+        return Err(anyhow!(CandyError::CorruptedLinkedList(format!($($arg)*))));
     };
 }
 
@@ -159,7 +159,7 @@ macro_rules! corrupted_if {
         if ($e1 == $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} == {:?})", $e1, $e2);
-            return Err(anyhow!(VickyError::CorruptedLinkedList(full)));
+            return Err(anyhow!(CandyError::CorruptedLinkedList(full)));
         }
     };
 }
@@ -174,12 +174,12 @@ macro_rules! corrupted_unless {
         if ($e1 != $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} != {:?})", $e1, $e2);
-            return Err(anyhow!(VickyError::CorruptedLinkedList(full)));
+            return Err(anyhow!(CandyError::CorruptedLinkedList(full)));
         }
     };
 }
 
-impl VickyStore {
+impl CandyStore {
     fn make_list_key(&self, mut list_key: Vec<u8>) -> (PartedHash, Vec<u8>) {
         list_key.extend_from_slice(LIST_NAMESPACE);
         (PartedHash::new(&self.config.hash_seed, &list_key), list_key)
@@ -314,7 +314,7 @@ impl VickyStore {
             //
             // although improbable, without enforcing this, list iteration and find_true_tail would end up
             // in an endless loop
-            bail!(VickyError::DuplicateHashInList(list_key, origk, item_key));
+            bail!(CandyError::DuplicateHashInList(list_key, origk, item_key));
         }
 
         // item does not exist, and the list itself might also not exist. get or create the list

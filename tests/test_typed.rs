@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use vicky_store::{Config, Result, VickyStore, VickyTypedKey, VickyTypedStore};
+use candystore::{CandyStore, CandyTypedKey, CandyTypedStore, Config, Result};
 
 use crate::common::run_in_tempdir;
 
@@ -15,7 +15,7 @@ struct MyKey {
     z: String,
 }
 
-impl VickyTypedKey for MyKey {
+impl CandyTypedKey for MyKey {
     const TYPE_ID: u32 = 0x3476a551;
 }
 
@@ -29,9 +29,9 @@ struct MyVal {
 #[test]
 fn test_typed() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = Arc::new(VickyStore::open(dir, Config::default())?);
+        let db = Arc::new(CandyStore::open(dir, Config::default())?);
 
-        let typed = VickyTypedStore::<MyKey, MyVal>::new(db.clone());
+        let typed = CandyTypedStore::<MyKey, MyVal>::new(db.clone());
         typed.set(
             &MyKey {
                 x: 12,
@@ -98,7 +98,7 @@ fn test_typed() -> Result<()> {
         );
 
         // two typed-stores can co-exist on the same underlying store
-        let typed2 = VickyTypedStore::<String, Vec<u32>>::new(db);
+        let typed2 = CandyTypedStore::<String, Vec<u32>>::new(db);
         typed2.set("hello", &vec![1, 2, 3])?;
         typed2.set("world", &vec![4, 5, 6, 7])?;
 

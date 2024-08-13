@@ -16,7 +16,7 @@ use crate::{
 };
 use crate::{
     shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH},
-    VickyError,
+    CandyError,
 };
 use crate::{Config, Result};
 
@@ -25,7 +25,7 @@ pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
 pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 
-/// Stats from VickyStore
+/// Stats from CandyStore
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Stats {
     /// number of shards in the store
@@ -65,8 +65,8 @@ impl Stats {
     }
 }
 
-/// The VickyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
-pub struct VickyStore {
+/// The CandyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
+pub struct CandyStore {
     pub(crate) shards: RwLock<BTreeMap<u32, Shard>>,
     pub(crate) config: Arc<Config>,
     pub(crate) dir_path: PathBuf,
@@ -79,18 +79,18 @@ pub struct VickyStore {
     pub(crate) keyed_locks: Vec<Mutex<()>>,
 }
 
-/// An iterator over a VickyStore. Note that it's safe to modify (insert/delete) keys while iterating,
+/// An iterator over a CandyStore. Note that it's safe to modify (insert/delete) keys while iterating,
 /// but the results of the iteration may or may not include these changes. This is considered a
 /// well-defined behavior of the store.
-pub struct VickyStoreIterator<'a> {
-    db: &'a VickyStore,
+pub struct CandyStoreIterator<'a> {
+    db: &'a CandyStore,
     shard_idx: u32,
     row_idx: usize,
     entry_idx: usize,
 }
 
-impl<'a> VickyStoreIterator<'a> {
-    fn new(db: &'a VickyStore) -> Self {
+impl<'a> CandyStoreIterator<'a> {
+    fn new(db: &'a CandyStore) -> Self {
         Self {
             db,
             shard_idx: 0,
@@ -108,7 +108,7 @@ impl<'a> VickyStoreIterator<'a> {
     }
 
     // Constructs an iterator starting at the given cookie
-    pub fn from_cookie(db: &'a VickyStore, cookie: u64) -> Self {
+    pub fn from_cookie(db: &'a CandyStore, cookie: u64) -> Self {
         Self {
             db,
             shard_idx: ((cookie >> 32) & 0xffff) as u32,
@@ -118,7 +118,7 @@ impl<'a> VickyStoreIterator<'a> {
     }
 }
 
-impl<'a> Iterator for VickyStoreIterator<'a> {
+impl<'a> Iterator for CandyStoreIterator<'a> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -164,10 +164,10 @@ impl<'a> Iterator for VickyStoreIterator<'a> {
     }
 }
 
-impl VickyStore {
+impl CandyStore {
     const END_OF_SHARDS: u32 = 1u32 << 16;
 
-    /// Opens or creates a new VickyStore.
+    /// Opens or creates a new CandyStore.
     /// * dir_path - the directory where shards will be kept
     /// * config - the configuration options for the store
     pub fn open(dir_path: impl AsRef<Path>, config: Config) -> Result<Self> {
@@ -239,7 +239,7 @@ impl VickyStore {
             let end = u32::from_str_radix(end, 16).expect(filename);
 
             if start > end || end > Self::END_OF_SHARDS {
-                return Err(anyhow!(VickyError::LoadingFailed(format!(
+                return Err(anyhow!(CandyError::LoadingFailed(format!(
                     "Bad span for {filename}"
                 ))));
             }
@@ -278,7 +278,7 @@ impl VickyStore {
                 let (next_start, next_end) = spans[i + 1];
                 if *start == next_start {
                     if next_end <= *end {
-                        return Err(anyhow!(VickyError::LoadingFailed(format!(
+                        return Err(anyhow!(CandyError::LoadingFailed(format!(
                             "Removing in-progress split with start={} end={} next_start={} next_end={}",
                             *start, *end, next_start, next_end
                         ))));
@@ -495,12 +495,12 @@ impl VickyStore {
     }
 
     /// Returns an iterator over the whole store (skipping linked lists or typed items)
-    pub fn iter(&self) -> VickyStoreIterator {
-        VickyStoreIterator::new(self)
+    pub fn iter(&self) -> CandyStoreIterator {
+        CandyStoreIterator::new(self)
     }
 
-    /// Returns an iterator starting from the specified cookie (obtained via [VickyStoreIterator::cookie])
-    pub fn iter_from_cookie(&self, cookie: u64) -> VickyStoreIterator {
-        VickyStoreIterator::from_cookie(self, cookie)
+    /// Returns an iterator starting from the specified cookie (obtained via [CandyStoreIterator::cookie])
+    pub fn iter_from_cookie(&self, cookie: u64) -> CandyStoreIterator {
+        CandyStoreIterator::from_cookie(self, cookie)
     }
 }

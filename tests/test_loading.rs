@@ -1,6 +1,6 @@
 mod common;
 
-use vicky_store::{Config, Result, VickyStore};
+use candystore::{CandyStore, Config, Result};
 
 use crate::common::{run_in_tempdir, LONG_VAL};
 
@@ -14,7 +14,7 @@ fn test_loading() -> Result<()> {
         };
 
         {
-            let db = VickyStore::open(dir, config.clone())?;
+            let db = CandyStore::open(dir, config.clone())?;
 
             for i in 0..1000 {
                 db.set(&format!("unique key {i}"), LONG_VAL)?;
@@ -25,7 +25,7 @@ fn test_loading() -> Result<()> {
         }
 
         {
-            let db = VickyStore::open(dir, config.clone())?;
+            let db = CandyStore::open(dir, config.clone())?;
 
             assert_eq!(db.iter().count(), 1000);
 
@@ -54,7 +54,7 @@ fn test_loading() -> Result<()> {
             std::fs::write(format!("{dir}/shard_{start:04x}-{mid:04x}"), "xxxx")?;
             std::fs::write(format!("{dir}/shard_{mid:04x}-{end:04x}"), "xxxx")?;
 
-            let db = VickyStore::open(dir, config)?;
+            let db = CandyStore::open(dir, config)?;
 
             assert!(!std::fs::exists(format!("{dir}/top_1234-5678"))?);
             assert!(!std::fs::exists(format!("{dir}/bottom_1234-5678"))?);

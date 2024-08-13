@@ -1,13 +1,13 @@
 mod common;
 
-use vicky_store::{Config, Result, VickyError, VickyStore};
+use candystore::{CandyError, CandyStore, Config, Result};
 
 use crate::common::run_in_tempdir;
 
 #[test]
 fn test_pre_split() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             dir,
             Config {
                 max_shard_size: 20 * 1024, // use small files to force lots of splits and compactions
@@ -68,7 +68,7 @@ fn test_pre_split() -> Result<()> {
 #[test]
 fn test_compaction() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             dir,
             Config {
                 max_shard_size: 1000,
@@ -107,7 +107,7 @@ fn test_compaction() -> Result<()> {
 #[test]
 fn test_too_large() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             dir,
             Config {
                 max_shard_size: 1000,
@@ -119,9 +119,9 @@ fn test_too_large() -> Result<()> {
         assert_eq!(
             db.set("yyy", &vec![7u8; 1000])
                 .unwrap_err()
-                .downcast::<VickyError>()
+                .downcast::<CandyError>()
                 .unwrap(),
-            VickyError::EntryCannotFitInShard
+            CandyError::EntryCannotFitInShard
         );
 
         db.set("yyy", &vec![7u8; 700])?;

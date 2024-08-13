@@ -2,15 +2,15 @@ use std::ptr::null_mut;
 use std::time::Duration;
 use std::{ops::Range, sync::atomic::AtomicU64};
 
+use candystore::{CandyStore, Config, Result};
 use rand::Rng;
-use vicky_store::{Config, Result, VickyStore};
 
 const TARGET: u32 = 1_000_000;
 
 fn child_inserts() -> Result<()> {
     // our job is to create 1M entries while being killed by our evil parent
 
-    let store = VickyStore::open("dbdir", Config::default())?;
+    let store = CandyStore::open("dbdir", Config::default())?;
     let highest_bytes = store.get("highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes([
         highest_bytes[0],
@@ -38,7 +38,7 @@ fn child_inserts() -> Result<()> {
 fn child_removals() -> Result<()> {
     // our job is to remove 1M entries while being killed by our evil parent
 
-    let store = VickyStore::open("dbdir", Config::default())?;
+    let store = CandyStore::open("dbdir", Config::default())?;
     let lowest_bytes = store.get("lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes([
         lowest_bytes[0],
@@ -66,7 +66,7 @@ fn child_removals() -> Result<()> {
 fn child_list_inserts() -> Result<()> {
     // our job is to insert 1M entries to a list while being killed by our evil parent
 
-    let store = VickyStore::open("dbdir", Config::default())?;
+    let store = CandyStore::open("dbdir", Config::default())?;
 
     let highest_bytes = store.get("list_highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes([
@@ -95,7 +95,7 @@ fn child_list_inserts() -> Result<()> {
 fn child_list_removals() -> Result<()> {
     // our job is to remove 1M entries to a list while being killed by our evil parent
 
-    let store = VickyStore::open("dbdir", Config::default())?;
+    let store = CandyStore::open("dbdir", Config::default())?;
 
     let lowest_bytes = store.get("list_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes([
@@ -223,7 +223,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = VickyStore::open("dbdir", Config::default())?;
+        let store = CandyStore::open("dbdir", Config::default())?;
         assert_eq!(
             store.remove("highest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -246,7 +246,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = VickyStore::open("dbdir", Config::default())?;
+        let store = CandyStore::open("dbdir", Config::default())?;
         assert_eq!(
             store.remove("lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -261,7 +261,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = VickyStore::open("dbdir", Config::default())?;
+        let store = CandyStore::open("dbdir", Config::default())?;
         assert_eq!(
             store.remove("list_highest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -281,7 +281,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = VickyStore::open("dbdir", Config::default())?;
+        let store = CandyStore::open("dbdir", Config::default())?;
         assert_eq!(
             store.remove("list_lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())

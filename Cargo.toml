@@ -1,9 +1,9 @@
 [package]
-name = "vicky-store"
+name = "candystore"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-keywords = ["key-value", "persistent", "store"]
+keywords = ["key-value", "database", "persistent", "store", "rocksdb"]
 description = "A lean, efficient and fast peristent in-process key-value store"
 
 [dependencies]
@@ -22,4 +22,4 @@ rand = "0.8.5"
 [workspace]
 members = [
     "simulator"
-    , "vicky-crasher", "vicky-longliving", "vicky-perf"]
+    , "candy-crasher", "candy-longliving", "candy-perf"]

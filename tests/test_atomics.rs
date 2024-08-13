@@ -1,13 +1,13 @@
 mod common;
 
-use vicky_store::{Config, GetOrCreateStatus, Result, SetStatus, VickyStore};
+use candystore::{Config, GetOrCreateStatus, Result, SetStatus, CandyStore};
 
 use crate::common::run_in_tempdir;
 
 #[test]
 fn test_atomics() -> Result<()> {
     run_in_tempdir(|dir| {
-        let db = VickyStore::open(dir, Config::default())?;
+        let db = CandyStore::open(dir, Config::default())?;
 
         assert!(db.get_or_create("aaa", "1111")?.was_created());
 

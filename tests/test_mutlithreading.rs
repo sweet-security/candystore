@@ -3,7 +3,7 @@ mod common;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use rand::random;
-use vicky_store::{Config, Result, VickyStore};
+use candystore::{Config, Result, CandyStore};
 
 use crate::common::run_in_tempdir;
 
@@ -11,7 +11,7 @@ use crate::common::run_in_tempdir;
 fn test_multithreaded() -> Result<()> {
     run_in_tempdir(|dir| {
         for attempt in 0..10 {
-            let db = Arc::new(VickyStore::open(
+            let db = Arc::new(CandyStore::open(
                 dir,
                 Config {
                     max_shard_size: 20 * 1024,

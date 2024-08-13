@@ -47,6 +47,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "candy-crasher"
+version = "0.1.0"
+dependencies = [
+ "candystore",
+ "libc",
+ "rand",
+]
+
+[[package]]
+name = "candy-longliving"
+version = "0.1.0"
+dependencies = [
+ "candystore",
+]
+
+[[package]]
+name = "candy-perf"
+version = "0.1.0"
+dependencies = [
+ "candystore",
+]
+
+[[package]]
+name = "candystore"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "databuf",
+ "memmap",
+ "parking_lot",
+ "rand",
+ "simd-itertools",
+ "siphasher",
+ "uuid",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,44 +336,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81dfa00651efa65069b0b6b651f4aaa31ba9e3c3ce0137aaad053604ee7e0314"
 dependencies = [
  "getrandom",
-]
-
-[[package]]
-name = "vicky-crasher"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rand",
- "vicky-store",
-]
-
-[[package]]
-name = "vicky-longliving"
-version = "0.1.0"
-dependencies = [
- "vicky-store",
-]
-
-[[package]]
-name = "vicky-perf"
-version = "0.1.0"
-dependencies = [
- "vicky-store",
-]
-
-[[package]]
-name = "vicky-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "databuf",
- "memmap",
- "parking_lot",
- "rand",
- "simd-itertools",
- "siphasher",
- "uuid",
 ]
 
 [[package]]

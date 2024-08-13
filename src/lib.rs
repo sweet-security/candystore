@@ -10,11 +10,11 @@ mod typed;
 pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ModifyStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
-pub use store::{Stats, VickyStore};
-pub use typed::{VickyTypedDeque, VickyTypedKey, VickyTypedList, VickyTypedStore};
+pub use store::{CandyStore, Stats};
+pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum VickyError {
+pub enum CandyError {
     WrongHashSeedLength,
     KeyTooLong,
     ValueTooLong,
@@ -27,7 +27,7 @@ pub enum VickyError {
     DuplicateHashInList(Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
-impl Display for VickyError {
+impl Display for CandyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             Self::WrongHashSeedLength => write!(f, "wrong hash seed length"),
@@ -47,11 +47,11 @@ impl Display for VickyError {
     }
 }
 
-impl std::error::Error for VickyError {}
+impl std::error::Error for CandyError {}
 
 pub type Result<T> = anyhow::Result<T>;
 
-/// The configuration options for VickyStore. Comes with sane defaults, feel free to use them
+/// The configuration options for CandyStore. Comes with sane defaults, feel free to use them
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_shard_size: u32, // we don't want huge shards, because splitting would be expensive

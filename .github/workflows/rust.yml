@@ -29,8 +29,8 @@ jobs:
     - name: Run typed example
       run: cargo run --example typed
     - name: Run perftest
-      run: cargo -Z unstable-options -C vicky-perf run --release
+      run: cargo -Z unstable-options -C candy-perf run --release
     - name: Run crasher
-      run: cargo -Z unstable-options -C vicky-crasher run --release
+      run: cargo -Z unstable-options -C candy-crasher run --release
     - name: Run longliving
-      run: cargo -Z unstable-options -C vicky-longliving run --release -- 10 40001 10000
+      run: cargo -Z unstable-options -C candy-longliving run --release -- 10 40001 10000

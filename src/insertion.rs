@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 
 use crate::hashing::PartedHash;
 use crate::shard::{InsertMode, InsertStatus, Shard};
-use crate::store::VickyStore;
-use crate::{Result, VickyError, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
+use crate::store::CandyStore;
+use crate::{CandyError, Result, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplaceStatus {
@@ -81,7 +81,7 @@ impl GetOrCreateStatus {
     }
 }
 
-impl VickyStore {
+impl CandyStore {
     fn compact(&self, shard_end: u32, write_offset: u32) -> Result<bool> {
         let mut guard = self.shards.write();
         // it's possible that another thread already compacted this shard
@@ -121,7 +121,7 @@ impl VickyStore {
             let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
             if !matches!(status, InsertStatus::Added) {
-                return Err(anyhow!(VickyError::CompactionFailed(format!(
+                return Err(anyhow!(CandyError::CompactionFailed(format!(
                     "{ph:?} [{}..{}] shard {status:?} k={k:?} v={v:?}",
                     removed_shard.span.start, removed_shard.span.end
                 ))));
@@ -175,7 +175,7 @@ impl VickyStore {
                 top_shard.insert(ph, &k, &v, InsertMode::Set)?
             };
             if !matches!(status, InsertStatus::Added) {
-                return Err(anyhow!(VickyError::SplitFailed(format!(
+                return Err(anyhow!(CandyError::SplitFailed(format!(
                     "{ph:?} {status:?} [{shard_start} {midpoint} {shard_end}] k={k:?} v={v:?}",
                 ))));
             }
@@ -240,13 +240,13 @@ impl VickyStore {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
         if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
-            return Err(anyhow!(VickyError::KeyTooLong));
+            return Err(anyhow!(CandyError::KeyTooLong));
         }
         if val.len() > MAX_VALUE_SIZE as usize {
-            return Err(anyhow!(VickyError::ValueTooLong));
+            return Err(anyhow!(CandyError::ValueTooLong));
         }
         if full_key.len() + val.len() > self.config.max_shard_size as usize {
-            return Err(anyhow!(VickyError::EntryCannotFitInShard));
+            return Err(anyhow!(CandyError::EntryCannotFitInShard));
         }
 
         loop {

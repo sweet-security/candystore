@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use vicky_store::{Config, Result, VickyStore, VickyTypedStore};
+use candystore::{CandyStore, CandyTypedStore, Config, Result};
 
 fn main() -> Result<()> {
-    let db = Arc::new(VickyStore::open("/tmp/vicky-dir", Config::default())?);
+    let db = Arc::new(CandyStore::open("/tmp/candy-dir", Config::default())?);
 
-    let typed = VickyTypedStore::<String, Vec<u32>>::new(db);
+    let typed = CandyTypedStore::<String, Vec<u32>>::new(db);
     typed.set("hello", &vec![1, 2, 3])?;
 
     println!("{:?}", typed.get("hello")?); // Some([1, 2, 3])

@@ -1,9 +1,9 @@
+use candystore::{CandyStore, Config, Result};
 use std::{
     hint::black_box,
     sync::{atomic::AtomicU64, Arc},
     time::Instant,
 };
-use vicky_store::{Config, Result, VickyStore};
 
 fn run2(msg: &str, iters: u32, mut func: impl FnMut() -> Result<()>) -> Result<()> {
     let t0 = Instant::now();
@@ -27,7 +27,7 @@ fn run(msg: &str, iters: u32, mut func: impl FnMut(u32) -> Result<()>) -> Result
 
 fn test_small_keys(num_keys: u32) -> Result<()> {
     for pre_split in [true, false] {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             "./dbdir",
             Config {
                 expected_number_of_keys: if pre_split { num_keys as usize } else { 0 },
@@ -86,7 +86,7 @@ fn test_small_keys(num_keys: u32) -> Result<()> {
 
 fn test_large_keys(num_keys: u32) -> Result<()> {
     for pre_split in [true, false] {
-        let db = VickyStore::open(
+        let db = CandyStore::open(
             "./dbdir",
             Config {
                 expected_number_of_keys: if pre_split { num_keys as usize } else { 0 },
@@ -133,7 +133,7 @@ fn test_large_keys(num_keys: u32) -> Result<()> {
 }
 
 fn test_lists(num_lists: u32, num_items_per_list: u32) -> Result<()> {
-    let db = VickyStore::open(
+    let db = CandyStore::open(
         "./dbdir",
         Config {
             expected_number_of_keys: (num_lists * num_items_per_list) as usize,
@@ -209,7 +209,7 @@ fn test_lists(num_lists: u32, num_items_per_list: u32) -> Result<()> {
 
 fn test_concurrency_without_contention(num_threads: u32, num_keys: u32) -> Result<()> {
     for pre_split in [true, false] {
-        let db = Arc::new(VickyStore::open(
+        let db = Arc::new(CandyStore::open(
             "./dbdir",
             Config {
                 expected_number_of_keys: if pre_split {
@@ -305,7 +305,7 @@ fn do_inserts(
     thd: u32,
     num_keys: u32,
     insert_time_ns: &Arc<AtomicU64>,
-    db: &Arc<VickyStore>,
+    db: &Arc<CandyStore>,
 ) -> Result<()> {
     let t0 = Instant::now();
     for i in 0..num_keys {
@@ -318,7 +318,7 @@ fn do_inserts(
     Ok(())
 }
 
-fn do_gets(num_keys: u32, get_time_ns: &Arc<AtomicU64>, db: &Arc<VickyStore>) -> Result<()> {
+fn do_gets(num_keys: u32, get_time_ns: &Arc<AtomicU64>, db: &Arc<CandyStore>) -> Result<()> {
     let t0 = Instant::now();
     for i in 0..num_keys {
         let val = db.get(&i.to_le_bytes())?;
@@ -334,7 +334,7 @@ fn do_gets(num_keys: u32, get_time_ns: &Arc<AtomicU64>, db: &Arc<VickyStore>) ->
 fn do_removals(
     num_keys: u32,
     removal_time_ns: &Arc<AtomicU64>,
-    db: &Arc<VickyStore>,
+    db: &Arc<CandyStore>,
 ) -> Result<()> {
     let t0 = Instant::now();
     for i in 0..num_keys {
@@ -350,7 +350,7 @@ fn do_removals(
 
 fn test_concurrency_with_contention(num_threads: u32, num_keys: u32) -> Result<()> {
     for pre_split in [true, false] {
-        let db = Arc::new(VickyStore::open(
+        let db = Arc::new(CandyStore::open(
             "./dbdir",
             Config {
                 expected_number_of_keys: if pre_split {
