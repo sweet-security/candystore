@@ -32,12 +32,12 @@
 //!     assert_eq!(db.get("hello")?, None);
 //!
 //!     // linked lists
-//!     db.set_in_list("spanish", "bye", "adios")?;
-//!     db.set_in_list("spanish", "thanks", "gracias")?;
-//!     assert_eq!(db.get_from_list("italian", "bye")?, Some("arrivederci".into()));
-//!
 //!     db.set_in_list("italian", "bye", "arrivederci")?;
 //!     db.set_in_list("italian", "thanks", "grazie")?;
+//!     assert_eq!(db.get_from_list("italian", "bye")?, Some("arrivederci".into()));
+//!
+//!     db.set_in_list("spanish", "bye", "adios")?;
+//!     db.set_in_list("spanish", "thanks", "gracias")?;
 //!
 //!     let items = db.iter_list("spanish").map(|res| res.unwrap().unwrap()).collect::<Vec<_>>();
 //!     assert_eq!(items, vec![("bye".into(), "adios".into()), ("thanks".into(), "gracias".into())]);
