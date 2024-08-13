@@ -1,10 +1,11 @@
 [package]
 name = "candystore"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 keywords = ["key-value", "database", "persistent", "store", "rocksdb"]
 description = "A lean, efficient and fast peristent in-process key-value store"
+repository = "https://github.com/sweet-security/candystore"
 
 [dependencies]
 bytemuck = { version = "1.16.3", features = ["derive"] }
@@ -20,6 +21,4 @@ uuid = { version = "1.10.0", features = ["v4"] }
 rand = "0.8.5"
 
 [workspace]
-members = [
-    "simulator"
-    , "candy-crasher", "candy-longliving", "candy-perf"]
+members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf"]
