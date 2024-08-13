@@ -52,7 +52,7 @@ fn test_pre_split() -> Result<()> {
         db.remove("aaa")?;
         let stats = db.stats();
         assert_eq!(stats.num_inserted, 2);
-        assert_eq!(stats.num_deleted, 1);
+        assert_eq!(stats.num_removed, 1);
         assert_eq!(
             stats.wasted_bytes,
             "aaa?".len()

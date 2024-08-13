@@ -12,8 +12,8 @@ use crate::Result;
 use databuf::{config::num::LE, DecodeOwned, Encode};
 
 pub trait VickyTypedKey: Encode + DecodeOwned {
-    /// a random number that remains consistent (unlike `TypeId`), so that `MyPair(u32, u32)` is different than
-    /// `YourPair(u32, u32)``
+    /// a random number that remains consistent (unlike [std::any::TypeId]), so that `MyPair(u32, u32)`
+    /// is different from `YourPair(u32, u32)`
     const TYPE_ID: u32;
 }
 
@@ -46,6 +46,16 @@ fn from_bytes<T: DecodeOwned>(bytes: &[u8]) -> Result<T> {
     T::from_bytes::<LE>(bytes).map_err(|e| anyhow!(e))
 }
 
+/// Typed stores are wrappers around an underlying [VickyStore], that serialize keys and values (using [databuf]).
+/// These are but thin wrappers, and multiple such wrappers can exist over the same store.
+///
+/// The keys and values must support [Encode] and [DecodeOwned], with the addition that keys also provide
+/// a `TYPE_ID` const, via the [VickyTypedKey] trait.
+///
+/// Notes:
+/// * All APIs take keys and values by-ref, because they will serialize them, so taking owned values doesn't
+///   make sense
+/// * [VickyStore::iter] will skip typed items, since it's meaningless to interpret them without the wrapper
 #[derive(Clone)]
 pub struct VickyTypedStore<K, V> {
     store: Arc<VickyStore>,
@@ -57,6 +67,7 @@ where
     K: VickyTypedKey,
     V: Encode + DecodeOwned,
 {
+    /// Constructs a typed wrapper over a VickyStore
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
@@ -64,28 +75,30 @@ where
         }
     }
 
-    fn make_key<Q: ?Sized + Encode>(k: &Q) -> Vec<u8>
+    fn make_key<Q: ?Sized + Encode>(key: &Q) -> Vec<u8>
     where
         K: Borrow<Q>,
     {
-        let mut kbytes = k.to_bytes::<LE>();
+        let mut kbytes = key.to_bytes::<LE>();
         kbytes.extend_from_slice(&K::TYPE_ID.to_le_bytes());
         kbytes.extend_from_slice(TYPED_NAMESPACE);
         kbytes
     }
 
-    pub fn contains<Q: ?Sized + Encode>(&self, k: &Q) -> Result<bool>
+    /// Same as [VickyStore::contains] but serializes the key
+    pub fn contains<Q: ?Sized + Encode>(&self, key: &Q) -> Result<bool>
     where
         K: Borrow<Q>,
     {
-        Ok(self.store.get_raw(&Self::make_key(k))?.is_some())
+        Ok(self.store.get_raw(&Self::make_key(key))?.is_some())
     }
 
-    pub fn get<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
+    /// Same as [VickyStore::get] but serializes the key and deserializes the value
+    pub fn get<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
     {
-        let kbytes = Self::make_key(k);
+        let kbytes = Self::make_key(key);
         if let Some(vbytes) = self.store.get_raw(&kbytes)? {
             Ok(Some(from_bytes::<V>(&vbytes)?))
         } else {
@@ -93,34 +106,37 @@ where
         }
     }
 
+    /// Same as [VickyStore::replace] but serializes the key and the value
     pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        k: &Q1,
-        v: &Q2,
+        key: &Q1,
+        val: &Q2,
     ) -> Result<Option<V>>
     where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let kbytes = Self::make_key(k);
-        let vbytes = v.to_bytes::<LE>();
+        let kbytes = Self::make_key(key);
+        let vbytes = val.to_bytes::<LE>();
         match self.store.replace_raw(&kbytes, &vbytes)? {
             ReplaceStatus::DoesNotExist => Ok(None),
             ReplaceStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
         }
     }
 
+    /// Same as [VickyStore::replace_inplace] but serializes the key and the value.
+    /// Note: not crash safe!
     pub fn replace_inplace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        k: &Q1,
-        v: &Q2,
+        key: &Q1,
+        val: &Q2,
     ) -> Result<Option<V>>
     where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let kbytes = Self::make_key(k);
-        let vbytes = v.to_bytes::<LE>();
+        let kbytes = Self::make_key(key);
+        let vbytes = val.to_bytes::<LE>();
         match self.store.replace_inplace_raw(&kbytes, &vbytes)? {
             ModifyStatus::DoesNotExist => Ok(None),
             ModifyStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
@@ -130,37 +146,44 @@ where
         }
     }
 
-    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(&self, k: &Q1, v: &Q2) -> Result<Option<V>>
+    /// Same as [VickyStore::set] but serializes the key and the value.
+    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        key: &Q1,
+        val: &Q2,
+    ) -> Result<Option<V>>
     where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let kbytes = Self::make_key(k);
-        let vbytes = v.to_bytes::<LE>();
+        let kbytes = Self::make_key(key);
+        let vbytes = val.to_bytes::<LE>();
         match self.store.set_raw(&kbytes, &vbytes)? {
             SetStatus::CreatedNew => Ok(None),
             SetStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
         }
     }
 
+    /// Same as [VickyStore::get_or_create] but serializes the key and the default value
     pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        k: &Q1,
-        v: &Q2,
+        key: &Q1,
+        default_val: &Q2,
     ) -> Result<V>
     where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let kbytes = Self::make_key(k);
+        let kbytes = Self::make_key(key);
         Ok(from_bytes::<V>(
             &self
                 .store
-                .get_or_create_raw(&kbytes, v.to_bytes::<LE>())?
+                .get_or_create_raw(&kbytes, default_val.to_bytes::<LE>())?
                 .value(),
         )?)
     }
 
+    /// Same as [VickyStore::remove] but serializes the key
     pub fn remove<Q: ?Sized + Encode>(&self, k: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
@@ -174,6 +197,8 @@ where
     }
 }
 
+/// A wrapper around [VickyStore] that exposes the linked-list API in a typed manner. See [VickyTypedStore] for more
+/// info
 #[derive(Clone)]
 pub struct VickyTypedList<L, K, V> {
     store: Arc<VickyStore>,
@@ -186,6 +211,7 @@ where
     K: Encode + DecodeOwned,
     V: Encode + DecodeOwned,
 {
+    /// Constructs a [VickyTypedList] over an existing [VickyStore]
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
             store,
@@ -193,15 +219,16 @@ where
         }
     }
 
-    fn make_list_key<Q: ?Sized + Encode>(k: &Q) -> Vec<u8>
+    fn make_list_key<Q: ?Sized + Encode>(list_key: &Q) -> Vec<u8>
     where
         L: Borrow<Q>,
     {
-        let mut kbytes = k.to_bytes::<LE>();
+        let mut kbytes = list_key.to_bytes::<LE>();
         kbytes.extend_from_slice(&L::TYPE_ID.to_le_bytes());
         kbytes
     }
 
+    /// Tests if the given typed `item_key` exists in this list (identified by `list_key`)
     pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -219,6 +246,7 @@ where
             .is_some())
     }
 
+    /// Same as [VickyStore::get_from_list], but `list_key` and `item_key` are typed
     pub fn get<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -261,6 +289,7 @@ where
         }
     }
 
+    /// Same as [VickyStore::set_in_list], but `list_key`, `item_key` and `val` are typed
     pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -275,6 +304,7 @@ where
         self._set(list_key, item_key, val, false)
     }
 
+    /// Same as [VickyStore::set_in_list_promoting], but `list_key`, `item_key` and `val` are typed
     pub fn set_promoting<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -289,11 +319,12 @@ where
         self._set(list_key, item_key, val, true)
     }
 
+    /// Same as [VickyStore::get_or_create_in_list], but `list_key`, `item_key` and `default_val` are typed
     pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
-        val: &Q3,
+        default_val: &Q3,
     ) -> Result<V>
     where
         L: Borrow<Q1>,
@@ -301,14 +332,15 @@ where
     {
         let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
-        let val = val.to_bytes::<LE>();
+        let default_val = default_val.to_bytes::<LE>();
         let vbytes = self
             .store
-            .owned_get_or_create_in_list(list_key, item_key, val)?
+            .owned_get_or_create_in_list(list_key, item_key, default_val)?
             .value();
         from_bytes::<V>(&vbytes)
     }
 
+    /// Same as [VickyStore::replace_in_list], but `list_key`, `item_key` and `val` are typed
     pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -329,6 +361,7 @@ where
         }
     }
 
+    /// Same as [VickyStore::remove_from_list], but `list_key` and `item_key`  are typed
     pub fn remove<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -347,6 +380,7 @@ where
         }
     }
 
+    /// Same as [VickyStore::iter_list], but `list_key` is typed
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
@@ -366,6 +400,7 @@ where
         })
     }
 
+    /// Same as [VickyStore::discard_list], but `list_key` is typed
     pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<()>
     where
         L: Borrow<Q>,
@@ -374,6 +409,7 @@ where
         self.store.owned_discard_list(list_key)
     }
 
+    /// Same as [VickyStore::pop_list_head], but `list_key` is typed
     pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
@@ -385,6 +421,7 @@ where
         Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
     }
 
+    /// Same as [VickyStore::pop_list_tail], but `list_key` is typed
     pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
@@ -397,6 +434,8 @@ where
     }
 }
 
+/// A version [VickyTypedList] that's specialized for queues - only allows pushing at the tail and popping
+/// from either the head or the tail
 #[derive(Clone)]
 pub struct VickyTypedQueue<L, V> {
     store: Arc<VickyStore>,
@@ -415,15 +454,16 @@ where
         }
     }
 
-    fn make_list_key<Q: ?Sized + Encode>(k: &Q) -> Vec<u8>
+    fn make_list_key<Q: ?Sized + Encode>(list_key: &Q) -> Vec<u8>
     where
         L: Borrow<Q>,
     {
-        let mut kbytes = k.to_bytes::<LE>();
+        let mut kbytes = list_key.to_bytes::<LE>();
         kbytes.extend_from_slice(&L::TYPE_ID.to_le_bytes());
         kbytes
     }
 
+    /// Pushes a value at the end (tail) of the queue. Returns the auto-generated uuid of the item.
     pub fn push<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
@@ -438,6 +478,7 @@ where
         self.store.owned_push_to_list(list_key, val)
     }
 
+    /// Pops a value from the beginning (head) of the queue
     pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
@@ -449,6 +490,7 @@ where
         Ok(Some(from_bytes::<V>(&v)?))
     }
 
+    /// Pops a value from the end (tail) of the queue
     pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,

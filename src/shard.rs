@@ -91,7 +91,7 @@ pub(crate) struct PageAligned<T>(pub T);
 #[repr(C)]
 pub(crate) struct ShardHeader {
     pub num_inserted: AtomicU64,
-    pub num_deleted: AtomicU64,
+    pub num_removed: AtomicU64,
     pub wasted_bytes: AtomicU64,
     pub write_offset: AtomicU32,
     pub rows: PageAligned<[ShardRow; NUM_ROWS]>,
@@ -444,7 +444,7 @@ impl Shard {
 
             row.signatures[idx] = INVALID_SIG;
             // we managed to remove this key
-            shard.header.num_deleted.fetch_add(1, Ordering::Relaxed);
+            shard.header.num_removed.fetch_add(1, Ordering::Relaxed);
             shard
                 .header
                 .wasted_bytes

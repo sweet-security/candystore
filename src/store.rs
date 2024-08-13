@@ -28,23 +28,40 @@ pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 /// Stats from VickyStore
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Stats {
+    /// number of shards in the store
     pub num_shards: usize,
+    /// number of items inserted (including ones that were later removed)
     pub num_inserted: usize,
-    pub num_deleted: usize,
+    /// number of items removed
+    pub num_removed: usize,
+    /// total number of bytes wasted by overwrites or removed items, before being compacted
     pub wasted_bytes: usize,
+    /// total number of bytes used for the data, including wasted bytes but not including file headers
     pub used_bytes: usize,
 }
 
 impl Stats {
+    /// the size of the shard file's headers
     pub const FILE_HEADER_SIZE: usize = HEADER_SIZE as usize;
+
+    /// the number of items in the store
     pub fn len(&self) -> usize {
-        self.num_inserted - self.num_deleted
+        self.num_inserted - self.num_removed
     }
+
+    /// the total number of bytes used by the items in the store
     pub fn data_bytes(&self) -> usize {
         self.used_bytes - self.wasted_bytes
     }
+
+    /// compute the average entry size
+    pub fn average_entry_size(&self) -> usize {
+        self.data_bytes() / self.len()
+    }
+
+    /// total bytes consumed by the store (including headers and wasted bytes)
     pub fn total_bytes(&self) -> usize {
-        self.used_bytes + Self::FILE_HEADER_SIZE
+        self.used_bytes + Self::FILE_HEADER_SIZE * self.num_shards
     }
 }
 
@@ -305,7 +322,7 @@ impl VickyStore {
         Ok(())
     }
 
-    /// Attempts for sync all in-memory changes of all shards to disk. Concurrent changes are allowed while
+    /// Syncs all in-memory changes of all shards to disk. Concurrent changes are allowed while
     /// flushing, and may result in partially-sync'ed store. Use sparingly, as this is a costly operaton.
     pub fn flush(&self) -> Result<()> {
         let guard = self.shards.read();
@@ -315,7 +332,7 @@ impl VickyStore {
         Ok(())
     }
 
-    /// Clears the store (erasing all keys)
+    /// Clears the store (erasing all keys), and removing all shard files
     pub fn clear(&self) -> Result<()> {
         let mut guard = self.shards.write();
 
@@ -405,6 +422,7 @@ impl VickyStore {
         self.owned_get(key.as_ref().to_owned())
     }
 
+    /// Same as [Self::get] but takes an owned key
     pub fn owned_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         self.get_raw(&self.make_user_key(key))
     }
@@ -414,6 +432,7 @@ impl VickyStore {
         self.owned_contains(key.as_ref().to_owned())
     }
 
+    /// Same as [Self::contains] but takes an owned key
     pub fn owned_contains(&self, key: Vec<u8>) -> Result<bool> {
         Ok(self.get_raw(&self.make_user_key(key))?.is_some())
     }
@@ -441,22 +460,25 @@ impl VickyStore {
         self.owned_remove(key.as_ref().to_owned())
     }
 
+    /// Same as [Self::remove] but takes an owned key
     pub fn owned_remove(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         self.remove_raw(&self.make_user_key(key))
     }
 
-    /// Returns some stats, useful for debugging. Note that stats are local to the VickyStore instance and
-    /// are not persisted, so closing and opening the store will reset the stats.
+    /// Ephemeral stats: number of inserts
     pub fn _num_entries(&self) -> usize {
         self.num_entries.load(Ordering::Acquire)
     }
+    /// Ephemeral stats: number of compactions performed
     pub fn _num_compactions(&self) -> usize {
         self.num_compactions.load(Ordering::Acquire)
     }
+    /// Ephemeral stats: number of splits performed
     pub fn _num_splits(&self) -> usize {
         self.num_splits.load(Ordering::Acquire)
     }
 
+    /// Returns useful stats about the store
     pub fn stats(&self) -> Stats {
         let guard = self.shards.read();
         let mut stats = Stats {
@@ -465,20 +487,19 @@ impl VickyStore {
         };
         for (_, shard) in guard.iter() {
             stats.num_inserted += shard.header.num_inserted.load(Ordering::Relaxed) as usize;
-            stats.num_deleted += shard.header.num_deleted.load(Ordering::Relaxed) as usize;
+            stats.num_removed += shard.header.num_removed.load(Ordering::Relaxed) as usize;
             stats.used_bytes = shard.header.write_offset.load(Ordering::Relaxed) as usize;
             stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
         }
         stats
     }
 
-    /// Returns an iterator over the whole store
+    /// Returns an iterator over the whole store (skipping linked lists or typed items)
     pub fn iter(&self) -> VickyStoreIterator {
         VickyStoreIterator::new(self)
     }
 
-    /// Returns an iterator starting from the specified cookie (obtained from `get_cookie` of a
-    /// previously created `VickyStoreIterator`
+    /// Returns an iterator starting from the specified cookie (obtained via [VickyStoreIterator::cookie])
     pub fn iter_from_cookie(&self, cookie: u64) -> VickyStoreIterator {
         VickyStoreIterator::from_cookie(self, cookie)
     }

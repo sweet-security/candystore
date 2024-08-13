@@ -327,7 +327,7 @@ fn test_rev_iter() -> Result<()> {
         );
 
         assert_eq!(
-            db.peek_list_htail("mylist")?,
+            db.peek_list_tail("mylist")?,
             Some(("item4".into(), "xxx".into()))
         );
 

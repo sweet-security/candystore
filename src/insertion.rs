@@ -302,11 +302,12 @@ impl VickyStore {
         self.owned_set(key.as_ref().to_owned(), val.as_ref())
     }
 
+    /// Same as [Self::set], but the key passed owned to this function
     pub fn owned_set(&self, key: Vec<u8>, val: &[u8]) -> Result<SetStatus> {
         self.set_raw(&self.make_user_key(key), val)
     }
 
-    pub fn replace_raw(&self, full_key: &[u8], val: &[u8]) -> Result<ReplaceStatus> {
+    pub(crate) fn replace_raw(&self, full_key: &[u8], val: &[u8]) -> Result<ReplaceStatus> {
         if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Replace)? {
             Ok(ReplaceStatus::PrevValue(prev))
         } else {
@@ -327,6 +328,7 @@ impl VickyStore {
         self.owned_replace(key.as_ref().to_owned(), val.as_ref())
     }
 
+    /// Same as [Self::replace], but the key passed owned to this function
     pub fn owned_replace(&self, key: Vec<u8>, val: &[u8]) -> Result<ReplaceStatus> {
         self.replace_raw(&self.make_user_key(key), val.as_ref())
     }
@@ -358,6 +360,7 @@ impl VickyStore {
         self.owned_get_or_create(key.as_ref().to_owned(), default_val.as_ref().to_owned())
     }
 
+    /// Same as [Self::get_or_create], but the `key` and `default_val` are passed owned to this function
     pub fn owned_get_or_create(
         &self,
         key: Vec<u8>,
@@ -453,6 +456,7 @@ impl VickyStore {
         self.owned_replace_inplace(key.as_ref().to_owned(), new_value.as_ref())
     }
 
+    /// Same as [Self::replace_inplace], but the key passed owned to this function
     pub fn owned_replace_inplace(&self, key: Vec<u8>, new_value: &[u8]) -> Result<ModifyStatus> {
         self.replace_inplace_raw(&self.make_user_key(key), new_value)
     }

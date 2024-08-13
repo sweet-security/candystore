@@ -354,6 +354,13 @@ impl VickyStore {
         Ok(GetOrCreateStatus::CreatedNew(val))
     }
 
+    /// Sets (or replaces) an item (identified by `item_key`) in a linked-list (identified by `list_key`) -
+    /// placing the item at the tail (end) of the list. Linked lists are created when the first item is
+    /// inserted to them, and removed when the last item is removed.
+    ///
+    /// If the item already exists in the list, its value is replaced but it keeps is relative position.
+    ///
+    /// See also [Self::set]
     pub fn set_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -372,6 +379,16 @@ impl VickyStore {
         )
     }
 
+    /// Sets (or replaces) an item (identified by `item_key`) in a linked-list (identified by `list_key`) -
+    /// placing the item at the tail (end) of the list. If the item already exists in the list,
+    /// it is re-inserted at the end.
+    ///
+    /// This allows for the implementation of LRUs, where older items stay at the beginning and more
+    /// recent ones are at the end.
+    ///
+    /// Note: this operation is not crash-safe, as it removes and inserts the item.
+    ///
+    /// See also [Self::set], [Self::set_in_list]
     pub fn set_in_list_promoting<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -389,6 +406,8 @@ impl VickyStore {
             true,
         )
     }
+
+    // Owned version of set_in_list, takes `promote` as a parameter instead
     pub fn owned_set_in_list(
         &self,
         list_key: Vec<u8>,
@@ -405,6 +424,8 @@ impl VickyStore {
         }
     }
 
+    /// Same as [Self::set_in_list], but will only replace an existing item (will not create one if the key
+    /// does not already exist). See also [Self::replace]
     pub fn replace_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -422,6 +443,7 @@ impl VickyStore {
         )
     }
 
+    /// Owned version of [Self::replace_in_list]
     pub fn owned_replace_in_list(
         &self,
         list_key: Vec<u8>,
@@ -434,6 +456,10 @@ impl VickyStore {
         }
     }
 
+    /// Returns the existing value of the element in the list, if it exists, or create it with the given
+    /// default value.
+    ///
+    /// See also [Self::get_or_create]
     pub fn get_or_create_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -451,6 +477,7 @@ impl VickyStore {
         )
     }
 
+    /// Owned version of [Self::get_or_create_in_list]
     pub fn owned_get_or_create_in_list(
         &self,
         list_key: Vec<u8>,
@@ -460,6 +487,8 @@ impl VickyStore {
         self._insert_to_list(list_key, item_key, val, InsertMode::GetOrCreate)
     }
 
+    ///
+    /// See also [Self::get]
     pub fn get_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
@@ -468,6 +497,7 @@ impl VickyStore {
         self.owned_get_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::get_from_list]
     pub fn owned_get_from_list(
         &self,
         list_key: Vec<u8>,
@@ -689,6 +719,7 @@ impl VickyStore {
         self.owned_remove_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::remove_from_list]
     pub fn owned_remove_from_list(
         &self,
         list_key: Vec<u8>,
@@ -729,9 +760,14 @@ impl VickyStore {
         Ok(Some(v))
     }
 
+    /// Iterates over the elements of the linked list (identified by `list_key`) from the beginning (head)
+    /// to the end (tail). Note that if items are removed at random locations in the list, the iterator
+    /// may not be able to progress and will return an early stop.
     pub fn iter_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> LinkedListIterator {
         self.owned_iter_list(list_key.as_ref().to_owned())
     }
+
+    /// Owned version of [Self::iter_list]
     pub fn owned_iter_list(&self, list_key: Vec<u8>) -> LinkedListIterator {
         let (list_ph, list_key) = self.make_list_key(list_key);
         LinkedListIterator {
@@ -742,6 +778,7 @@ impl VickyStore {
         }
     }
 
+    /// Same as [Self::iter_list], but goes from the end (tail) to the beginning (head)
     pub fn iter_list_backwards<B: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B,
@@ -749,6 +786,7 @@ impl VickyStore {
         self.owned_iter_list_backwards(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::iter_list_backwards]
     pub fn owned_iter_list_backwards(&self, list_key: Vec<u8>) -> RevLinkedListIterator {
         let (list_ph, list_key) = self.make_list_key(list_key);
         RevLinkedListIterator {
@@ -765,6 +803,7 @@ impl VickyStore {
         self.owned_discard_list(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::discard_list]
     pub fn owned_discard_list(&self, list_key: Vec<u8>) -> Result<()> {
         let (list_ph, list_key) = self.make_list_key(list_key);
 
@@ -792,30 +831,38 @@ impl VickyStore {
     // only at the tail, but support O(1) access (by index) and update of existing elements.
     // this would require only 2 IOs instead of 3 when inserting new elements.
 
+    /// Returns the first (head) element of the list. Note that it's prone to spurious false positives
+    /// (returning an element that no longer exists) or false negatives (returning `None` when an element
+    /// exists) in case different threads pop the head
     pub fn peek_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_peek_list_head(list_key.as_ref().to_owned())
     }
 
-    // may have suprious false positives/false negatives if another thread pops
+    /// Owned version of [Self::peek_list_head]
     pub fn owned_peek_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         self.owned_iter_list(list_key).next().unwrap_or(Ok(None))
     }
 
-    pub fn peek_list_htail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
+    /// Returns the last (tail) element of the list. Note that it's prone to spurious false positives
+    /// (returning an element that no longer exists) or false negatives (returning `None` when an element
+    /// exists) in case different threads pop the tail
+    pub fn peek_list_tail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_peek_list_tail(list_key.as_ref().to_owned())
     }
 
-    // may have suprious false positives/false negatives if another thread pops
+    /// Owned version of [Self::peek_list_tail]
     pub fn owned_peek_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         self.owned_iter_list_backwards(list_key)
             .next()
             .unwrap_or(Ok(None))
     }
 
+    /// Removes and returns the first (head) element from the list
     pub fn pop_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_pop_list_head(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::pop_list_head]
     pub fn owned_pop_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         let (list_ph, list_key) = self.make_list_key(list_key);
 
@@ -841,10 +888,12 @@ impl VickyStore {
         Ok(Some((item_key, item_val)))
     }
 
+    /// Removes and returns the last (tail) element from the list
     pub fn pop_list_tail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_pop_list_tail(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::pop_list_tail]
     pub fn owned_pop_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         let (list_ph, list_key) = self.make_list_key(list_key);
 
@@ -870,6 +919,13 @@ impl VickyStore {
         Ok(Some((item_key, item_val)))
     }
 
+    /// In case you only want to store values in a list (the keys are immaterial), this function
+    /// generates a random UUID and inserts the given element to the end (tai) of the list.
+    /// Can be used to implement queues, where elements are pushed at the back and popped from
+    /// the front.
+    ///
+    /// The function returns the generated UUID, and you can use it to access the item
+    /// using functions like [Self::remove_from_list], etc., but it's not the canonical use case
     pub fn push_to_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
@@ -878,6 +934,7 @@ impl VickyStore {
         self.owned_push_to_list(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::push_to_list]
     pub fn owned_push_to_list(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
         let uuid = Uuid::new_v4();
         let status = self._insert_to_list(
