@@ -41,6 +41,7 @@ typed_builtin!(isize, 13);
 typed_builtin!(char, 14);
 typed_builtin!(String, 15);
 typed_builtin!(Vec<u8>, 16);
+typed_builtin!(uuid::Bytes, 17);
 
 fn from_bytes<T: DecodeOwned>(bytes: &[u8]) -> Result<T> {
     T::from_bytes::<LE>(bytes).map_err(|e| anyhow!(e))
@@ -400,6 +401,28 @@ where
         })
     }
 
+    /// Same as [VickyStore::iter_list_backwards], but `list_key` is typed
+    pub fn iter_backwards<'a, Q: ?Sized + Encode>(
+        &'a self,
+        list_key: &Q,
+    ) -> impl Iterator<Item = Result<Option<(K, V)>>> + 'a
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        self.store
+            .owned_iter_list_backwards(list_key)
+            .map(|res| match res {
+                Err(e) => Err(e),
+                Ok(None) => Ok(None),
+                Ok(Some((k, v))) => {
+                    let key = from_bytes::<K>(&k)?;
+                    let val = from_bytes::<V>(&v)?;
+                    Ok(Some((key, val)))
+                }
+            })
+    }
+
     /// Same as [VickyStore::discard_list], but `list_key` is typed
     pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<()>
     where
@@ -409,16 +432,34 @@ where
         self.store.owned_discard_list(list_key)
     }
 
-    /// Same as [VickyStore::pop_list_head], but `list_key` is typed
-    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    // only available if K == Uuid
+    fn _push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        val: &Q2,
+    ) -> Result<Uuid>
     where
-        L: Borrow<Q>,
+        L: Borrow<Q1>,
+        V: Borrow<Q2>,
     {
         let list_key = Self::make_list_key(list_key);
-        let Some((k, v)) = self.store.owned_pop_list_head(list_key)? else {
-            return Ok(None);
-        };
-        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+        let val = val.to_bytes::<LE>();
+        self.store.owned_push_to_list_head(list_key, val)
+    }
+
+    // only available if K == Uuid
+    fn _push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        val: &Q2,
+    ) -> Result<Uuid>
+    where
+        L: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let val = val.to_bytes::<LE>();
+        self.store.owned_push_to_list_tail(list_key, val)
     }
 
     /// Same as [VickyStore::pop_list_tail], but `list_key` is typed
@@ -432,50 +473,65 @@ where
         };
         Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
     }
+
+    /// Same as [VickyStore::pop_list_head], but `list_key` is typed
+    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((k, v)) = self.store.owned_pop_list_head(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+    }
 }
 
-/// A version [VickyTypedList] that's specialized for queues - only allows pushing at the tail and popping
-/// from either the head or the tail
+/// A wrapper around [VickyTypedList] that's specialized for double-ended queues - only allows pushing
+/// and popping from either the end or the tail. The keys are auto-generated internally and are not exposed to
+/// the caller
 #[derive(Clone)]
-pub struct VickyTypedQueue<L, V> {
-    store: Arc<VickyStore>,
-    _phantom: PhantomData<(L, V)>,
+pub struct VickyTypedDeque<L, V> {
+    pub list: VickyTypedList<L, uuid::Bytes, V>,
 }
 
-impl<L, V> VickyTypedQueue<L, V>
+impl<L, V> VickyTypedDeque<L, V>
 where
     L: VickyTypedKey,
     V: Encode + DecodeOwned,
 {
     pub fn new(store: Arc<VickyStore>) -> Self {
         Self {
-            store,
-            _phantom: PhantomData,
+            list: VickyTypedList::new(store),
         }
     }
 
-    fn make_list_key<Q: ?Sized + Encode>(list_key: &Q) -> Vec<u8>
-    where
-        L: Borrow<Q>,
-    {
-        let mut kbytes = list_key.to_bytes::<LE>();
-        kbytes.extend_from_slice(&L::TYPE_ID.to_le_bytes());
-        kbytes
-    }
-
-    /// Pushes a value at the end (tail) of the queue. Returns the auto-generated uuid of the item.
-    pub fn push<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    /// Pushes a value at the beginning (head) of the queue
+    pub fn push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
-        v: &Q2,
-    ) -> Result<Uuid>
+        val: &Q2,
+    ) -> Result<()>
     where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let list_key = Self::make_list_key(list_key);
-        let val = v.to_bytes::<LE>();
-        self.store.owned_push_to_list(list_key, val)
+        self.list._push_head(list_key, val)?;
+        Ok(())
+    }
+
+    /// Pushes a value at the end (tail) of the queue
+    pub fn push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        list_key: &Q1,
+        val: &Q2,
+    ) -> Result<()>
+    where
+        L: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        self.list._push_tail(list_key, val)?;
+        Ok(())
     }
 
     /// Pops a value from the beginning (head) of the queue
@@ -483,11 +539,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let list_key = Self::make_list_key(list_key);
-        let Some((_, v)) = self.store.owned_pop_list_head(list_key)? else {
-            return Ok(None);
-        };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(self.list.pop_head(list_key)?.map(|kv| kv.1))
     }
 
     /// Pops a value from the end (tail) of the queue
@@ -495,10 +547,36 @@ where
     where
         L: Borrow<Q>,
     {
-        let list_key = Self::make_list_key(list_key);
-        let Some((_, v)) = self.store.owned_pop_list_tail(list_key)? else {
-            return Ok(None);
-        };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(self.list.pop_tail(list_key)?.map(|kv| kv.1))
+    }
+
+    /// See [VickyTypedList::iter]
+    pub fn iter<'a, Q: ?Sized + Encode>(
+        &'a self,
+        list_key: &Q,
+    ) -> impl Iterator<Item = Result<Option<V>>> + 'a
+    where
+        L: Borrow<Q>,
+    {
+        self.list.iter(list_key).map(|res| match res {
+            Err(e) => Err(e),
+            Ok(None) => Ok(None),
+            Ok(Some((_, v))) => Ok(Some(v)),
+        })
+    }
+
+    /// See [VickyTypedList::iter_backwards]
+    pub fn iter_backwards<'a, Q: ?Sized + Encode>(
+        &'a self,
+        list_key: &Q,
+    ) -> impl Iterator<Item = Result<Option<V>>> + 'a
+    where
+        L: Borrow<Q>,
+    {
+        self.list.iter_backwards(list_key).map(|res| match res {
+            Err(e) => Err(e),
+            Ok(None) => Ok(None),
+            Ok(Some((_, v))) => Ok(Some(v)),
+        })
     }
 }

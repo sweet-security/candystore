@@ -3,8 +3,8 @@ mod common;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use vicky_store::{
-    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedList,
-    VickyTypedQueue,
+    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, VickyStore, VickyTypedDeque,
+    VickyTypedList,
 };
 
 use crate::common::run_in_tempdir;
@@ -232,10 +232,10 @@ fn test_queues() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = VickyStore::open(dir, Config::default())?;
 
-        db.push_to_list("mylist", "hello1")?;
-        db.push_to_list("mylist", "hello2")?;
-        db.push_to_list("mylist", "hello3")?;
-        db.push_to_list("mylist", "hello4")?;
+        db.push_to_list_tail("mylist", "hello1")?;
+        db.push_to_list_tail("mylist", "hello2")?;
+        db.push_to_list_tail("mylist", "hello3")?;
+        db.push_to_list_tail("mylist", "hello4")?;
 
         let mut items = vec![];
         while let Some((_uuid, v)) = db.pop_list_head("mylist")? {
@@ -243,10 +243,10 @@ fn test_queues() -> Result<()> {
         }
         assert_eq!(items, vec![b"hello1", b"hello2", b"hello3", b"hello4"]);
 
-        db.push_to_list("mylist", "hello5")?;
-        db.push_to_list("mylist", "hello6")?;
-        db.push_to_list("mylist", "hello7")?;
-        db.push_to_list("mylist", "hello8")?;
+        db.push_to_list_tail("mylist", "hello5")?;
+        db.push_to_list_tail("mylist", "hello6")?;
+        db.push_to_list_tail("mylist", "hello7")?;
+        db.push_to_list_tail("mylist", "hello8")?;
 
         let mut items = vec![];
         while let Some((_uuid, v)) = db.pop_list_tail("mylist")? {
@@ -254,12 +254,12 @@ fn test_queues() -> Result<()> {
         }
         assert_eq!(items, vec![b"hello8", b"hello7", b"hello6", b"hello5"]);
 
-        db.push_to_list("mylist", "hello9")?;
-        db.push_to_list("mylist", "hello10")?;
-        db.push_to_list("mylist", "hello11")?;
-        db.push_to_list("mylist", "hello12")?;
-        db.push_to_list("mylist", "hello13")?;
-        db.push_to_list("mylist", "hello14")?;
+        db.push_to_list_tail("mylist", "hello9")?;
+        db.push_to_list_tail("mylist", "hello10")?;
+        db.push_to_list_tail("mylist", "hello11")?;
+        db.push_to_list_tail("mylist", "hello12")?;
+        db.push_to_list_tail("mylist", "hello13")?;
+        db.push_to_list_tail("mylist", "hello14")?;
 
         assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello9");
         assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello14");
@@ -267,6 +267,17 @@ fn test_queues() -> Result<()> {
         assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello13");
         assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello11");
         assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello12");
+        assert_eq!(db.pop_list_head("mylist")?, None);
+
+        db.push_to_list_head("mylist", "hello15")?;
+        db.push_to_list_head("mylist", "hello16")?;
+        db.push_to_list_head("mylist", "hello17")?;
+        db.push_to_list_head("mylist", "hello18")?;
+
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello18");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello17");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello16");
+        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello15");
         assert_eq!(db.pop_list_head("mylist")?, None);
 
         Ok(())
@@ -278,11 +289,11 @@ fn test_typed_queue() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = Arc::new(VickyStore::open(dir, Config::default())?);
 
-        let queue = VickyTypedQueue::<String, u32>::new(db);
+        let queue = VickyTypedDeque::<String, u32>::new(db);
         assert_eq!(queue.pop_head("orders")?, None);
 
         for i in 10..30 {
-            queue.push("orders", &i)?;
+            queue.push_tail("orders", &i)?;
         }
         for i in 10..20 {
             assert_eq!(queue.pop_head("orders")?, Some(i));
@@ -292,6 +303,27 @@ fn test_typed_queue() -> Result<()> {
         }
 
         assert_eq!(queue.pop_head("orders")?, None);
+
+        queue.push_tail("orders", &100)?;
+        queue.push_tail("orders", &101)?;
+        queue.push_tail("orders", &102)?;
+        queue.push_head("orders", &103)?;
+        queue.push_head("orders", &104)?;
+        queue.push_head("orders", &105)?;
+
+        let items = queue
+            .iter("orders")
+            .map(|res| res.unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(items, vec![105, 104, 103, 100, 101, 102]);
+
+        let items = queue
+            .iter_backwards("orders")
+            .map(|res| res.unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(items, vec![102, 101, 100, 103, 104, 105]);
 
         Ok(())
     })

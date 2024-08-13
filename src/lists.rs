@@ -59,7 +59,14 @@ impl<'a> Iterator for LinkedListIterator<'a> {
                 return None;
             };
             let list = *from_bytes::<LinkedList>(&buf);
-            self.next_ph = Some(list.head);
+            match self.store.find_true_head(self.list_ph, list.head) {
+                Ok((true_head_ph, _, _)) => {
+                    self.next_ph = Some(true_head_ph);
+                }
+                Err(e) => {
+                    return Some(Err(e));
+                }
+            }
         }
         let Some(curr) = self.next_ph else {
             return None;
@@ -107,7 +114,14 @@ impl<'a> Iterator for RevLinkedListIterator<'a> {
                 return None;
             };
             let list = *from_bytes::<LinkedList>(&buf);
-            self.next_ph = Some(list.tail);
+            match self.store.find_true_tail(self.list_ph, list.tail) {
+                Ok((true_tail_ph, _, _)) => {
+                    self.next_ph = Some(true_tail_ph);
+                }
+                Err(e) => {
+                    return Some(Err(e));
+                }
+            }
         }
         let Some(curr) = self.next_ph else {
             return None;
@@ -148,6 +162,11 @@ macro_rules! corrupted_if {
             return Err(anyhow!(VickyError::CorruptedLinkedList(full)));
         }
     };
+}
+
+enum InsertPosition {
+    Head,
+    Tail,
 }
 
 macro_rules! corrupted_unless {
@@ -218,12 +237,41 @@ impl VickyStore {
         }
     }
 
+    fn find_true_head(
+        &self,
+        list_ph: PartedHash,
+        head: PartedHash,
+    ) -> Result<(PartedHash, Vec<u8>, Vec<u8>)> {
+        let mut curr = head;
+        let mut prev = None;
+        loop {
+            if let Some((k, v)) = self._list_get(list_ph, curr)? {
+                let chain = chain_of(&v);
+                if chain.prev == PartedHash::INVALID {
+                    // curr is the true head
+                    return Ok((curr, k, v));
+                }
+                prev = Some((curr, k, v));
+                curr = chain.next;
+            } else if let Some(prev) = prev {
+                // prev is the true head
+                assert_ne!(curr, head);
+                return Ok(prev);
+            } else {
+                // if prev=None, it means we weren't able to find list.head. this should never happen
+                assert_eq!(curr, head);
+                corrupted_list!("head {:?} does not exist", head);
+            }
+        }
+    }
+
     fn _insert_to_list(
         &self,
         list_key: Vec<u8>,
         item_key: Vec<u8>,
         mut val: Vec<u8>,
         mode: InsertMode,
+        pos: InsertPosition,
     ) -> Result<GetOrCreateStatus> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
@@ -294,6 +342,96 @@ impl VickyStore {
             return Ok(GetOrCreateStatus::CreatedNew(val));
         }
 
+        let v = match pos {
+            InsertPosition::Tail => {
+                self._insert_to_list_tail(list_ph, list_key, item_ph, item_key, val, curr_list)?
+            }
+            InsertPosition::Head => {
+                self._insert_to_list_head(list_ph, list_key, item_ph, item_key, val, curr_list)?
+            }
+        };
+
+        Ok(GetOrCreateStatus::CreatedNew(v))
+    }
+
+    fn _insert_to_list_head(
+        &self,
+        list_ph: PartedHash,
+        list_key: Vec<u8>,
+        item_ph: PartedHash,
+        item_key: Vec<u8>,
+        mut val: Vec<u8>,
+        curr_list: LinkedList,
+    ) -> Result<Vec<u8>> {
+        // the list already exists. start at list.head and find the true head (it's possible list.
+        // isn't up to date because of crashes)
+        let (head_ph, head_k, head_v) = self.find_true_head(list_ph, curr_list.head)?;
+
+        // modify the last item to point to the new item. if we crash after this, everything is okay because
+        // find_true_tail will stop at this item
+        let mut head_chain = chain_of(&head_v);
+        head_chain.prev = item_ph;
+
+        if !self
+            .modify_inplace_raw(
+                &head_k,
+                bytes_of(&head_chain),
+                head_v.len() - size_of::<Chain>(),
+                Some(&head_v[head_v.len() - size_of::<Chain>()..]),
+            )?
+            .was_replaced()
+        {
+            corrupted_list!(
+                "failed to update previous element {head_k:?} to point to this one {item_key:?}"
+            );
+        }
+
+        // now add item, with prev pointing to the old tail. if we crash after this, find_true_tail
+        // will return the newly-added item as the tail.
+        // possible optimization: only update the tail every X operations, this reduces the expected
+        // number of IOs at the expense of more walking when inserting
+        let this_chain = Chain {
+            prev: PartedHash::INVALID,
+            next: head_ph,
+            anticollision_bits: 0,
+        };
+        val.extend_from_slice(bytes_of(&this_chain));
+
+        if self.set_raw(&item_key, &val)?.was_replaced() {
+            corrupted_list!("tail element {item_key:?} already exists");
+        }
+
+        // now update the list to point to the new tail. if we crash before it's committed, all's good
+        let new_list = LinkedList {
+            head: item_ph,
+            tail: curr_list.tail,
+            anticollision_bits: 0,
+        };
+
+        if !self
+            .modify_inplace_raw(
+                &list_key,
+                bytes_of(&new_list),
+                0,
+                Some(bytes_of(&curr_list)),
+            )?
+            .was_replaced()
+        {
+            corrupted_list!("failed to update list tail to point to {item_key:?}");
+        }
+        val.truncate(val.len() - size_of::<Chain>());
+        Ok(val)
+    }
+
+    fn _insert_to_list_tail(
+        &self,
+        list_ph: PartedHash,
+        list_key: Vec<u8>,
+        item_ph: PartedHash,
+        item_key: Vec<u8>,
+        mut val: Vec<u8>,
+        curr_list: LinkedList,
+    ) -> Result<Vec<u8>> {
         // the list already exists. start at list.tail and find the true tail (it's possible list.tail
         // isn't up to date because of crashes)
         let (tail_ph, tail_k, tail_v) = self.find_true_tail(list_ph, curr_list.tail)?;
@@ -313,7 +451,7 @@ impl VickyStore {
             .was_replaced()
         {
             corrupted_list!(
-                "failed to update previous element {tail_v:?} to point to this one {item_key:?}"
+                "failed to update previous element {tail_k:?} to point to this one {item_key:?}"
             );
         }
 
@@ -351,7 +489,7 @@ impl VickyStore {
             corrupted_list!("failed to update list tail to point to {item_key:?}");
         }
         val.truncate(val.len() - size_of::<Chain>());
-        Ok(GetOrCreateStatus::CreatedNew(val))
+        Ok(val)
     }
 
     /// Sets (or replaces) an item (identified by `item_key`) in a linked-list (identified by `list_key`) -
@@ -418,7 +556,13 @@ impl VickyStore {
         if promote {
             self.owned_remove_from_list(list_key.clone(), item_key.clone())?;
         }
-        match self._insert_to_list(list_key, item_key, val, InsertMode::Set)? {
+        match self._insert_to_list(
+            list_key,
+            item_key,
+            val,
+            InsertMode::Set,
+            InsertPosition::Tail,
+        )? {
             GetOrCreateStatus::CreatedNew(_) => Ok(SetStatus::CreatedNew),
             GetOrCreateStatus::ExistingValue(v) => Ok(SetStatus::PrevValue(v)),
         }
@@ -450,7 +594,13 @@ impl VickyStore {
         item_key: Vec<u8>,
         val: Vec<u8>,
     ) -> Result<ReplaceStatus> {
-        match self._insert_to_list(list_key, item_key, val, InsertMode::Replace)? {
+        match self._insert_to_list(
+            list_key,
+            item_key,
+            val,
+            InsertMode::Replace,
+            InsertPosition::Tail,
+        )? {
             GetOrCreateStatus::CreatedNew(_) => Ok(ReplaceStatus::DoesNotExist),
             GetOrCreateStatus::ExistingValue(v) => Ok(ReplaceStatus::PrevValue(v)),
         }
@@ -484,7 +634,13 @@ impl VickyStore {
         item_key: Vec<u8>,
         val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
-        self._insert_to_list(list_key, item_key, val, InsertMode::GetOrCreate)
+        self._insert_to_list(
+            list_key,
+            item_key,
+            val,
+            InsertMode::GetOrCreate,
+            InsertPosition::Tail,
+        )
     }
 
     ///
@@ -920,28 +1076,60 @@ impl VickyStore {
     }
 
     /// In case you only want to store values in a list (the keys are immaterial), this function
-    /// generates a random UUID and inserts the given element to the end (tai) of the list.
+    /// generates a random UUID and inserts the given element to the end (tail) of the list.
     /// Can be used to implement queues, where elements are pushed at the back and popped from
     /// the front.
     ///
     /// The function returns the generated UUID, and you can use it to access the item
     /// using functions like [Self::remove_from_list], etc., but it's not the canonical use case
-    pub fn push_to_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    pub fn push_to_list_tail<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
         val: &B2,
     ) -> Result<Uuid> {
-        self.owned_push_to_list(list_key.as_ref().to_owned(), val.as_ref().to_owned())
+        self.owned_push_to_list_tail(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
     /// Owned version of [Self::push_to_list]
-    pub fn owned_push_to_list(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
+    pub fn owned_push_to_list_tail(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
         let uuid = Uuid::new_v4();
         let status = self._insert_to_list(
             list_key,
             uuid.as_bytes().to_vec(),
             val,
             InsertMode::GetOrCreate,
+            InsertPosition::Tail,
+        )?;
+        if !status.was_created() {
+            corrupted_list!("uuid collision {uuid}");
+        }
+        Ok(uuid)
+    }
+
+    /// In case you only want to store values in a list (the keys are immaterial), this function
+    /// generates a random UUID and inserts the given element to the head (head) of the list.
+    /// Can be used to implement queues, where elements are pushed at the back and popped from
+    /// the front.
+    ///
+    /// The function returns the generated UUID, and you can use it to access the item
+    /// using functions like [Self::remove_from_list], etc., but it's not the canonical use case
+    pub fn push_to_list_head<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        list_key: &B1,
+        val: &B2,
+    ) -> Result<Uuid> {
+        self.owned_push_to_list_head(list_key.as_ref().to_owned(), val.as_ref().to_owned())
+    }
+
+    /// Owned version of [Self::push_to_list_head]
+    pub fn owned_push_to_list_head(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
+        let uuid = Uuid::new_v4();
+        let status = self._insert_to_list(
+            list_key,
+            uuid.as_bytes().to_vec(),
+            val,
+            InsertMode::GetOrCreate,
+            InsertPosition::Head,
         )?;
         if !status.was_created() {
             corrupted_list!("uuid collision {uuid}");
