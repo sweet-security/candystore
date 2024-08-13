@@ -57,10 +57,18 @@ fn from_bytes<T: DecodeOwned>(bytes: &[u8]) -> Result<T> {
 /// * All APIs take keys and values by-ref, because they will serialize them, so taking owned values doesn't
 ///   make sense
 /// * [CandyStore::iter] will skip typed items, since it's meaningless to interpret them without the wrapper
-#[derive(Clone)]
 pub struct CandyTypedStore<K, V> {
     store: Arc<CandyStore>,
     _phantom: PhantomData<(K, V)>,
+}
+
+impl<K, V> Clone for CandyTypedStore<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            _phantom: Default::default(),
+        }
+    }
 }
 
 impl<K, V> CandyTypedStore<K, V>
@@ -200,10 +208,18 @@ where
 
 /// A wrapper around [CandyStore] that exposes the linked-list API in a typed manner. See [CandyTypedStore] for more
 /// info
-#[derive(Clone)]
 pub struct CandyTypedList<L, K, V> {
     store: Arc<CandyStore>,
     _phantom: PhantomData<(L, K, V)>,
+}
+
+impl<L, K, V> Clone for CandyTypedList<L, K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            _phantom: Default::default(),
+        }
+    }
 }
 
 impl<L, K, V> CandyTypedList<L, K, V>
@@ -490,9 +506,14 @@ where
 /// A wrapper around [CandyTypedList] that's specialized for double-ended queues - only allows pushing
 /// and popping from either the end or the tail. The keys are auto-generated internally and are not exposed to
 /// the caller
-#[derive(Clone)]
 pub struct CandyTypedDeque<L, V> {
     pub list: CandyTypedList<L, uuid::Bytes, V>,
+}
+
+impl<L, V> Clone for CandyTypedDeque<L, V> {
+    fn clone(&self) -> Self {
+        Self { list: self.list.clone() }
+    }
 }
 
 impl<L, V> CandyTypedDeque<L, V>
