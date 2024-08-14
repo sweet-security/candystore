@@ -89,11 +89,64 @@ fn test_row_lookup() -> Result<()> {
 pub(crate) struct PageAligned<T>(pub T);
 
 #[repr(C)]
+pub(crate) struct ShardSizeHistogram {
+    pub counts_64b: [AtomicU32; 16],
+    pub counts_1kb: [AtomicU32; 15],
+    pub counts_16kb: [AtomicU32; 4],
+}
+
+impl ShardSizeHistogram {
+    fn insert(&self, sz: usize) {
+        if sz < 1024 {
+            self.counts_64b[sz / 64].fetch_add(1, Ordering::Relaxed);
+        } else if sz < 16 * 1024 {
+            self.counts_1kb[(sz - 1024) / 1024].fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counts_16kb[(sz - 16 * 1024) / (16 * 1024)].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[test]
+fn test_shard_size_histogram() {
+    let hist = ShardSizeHistogram {
+        counts_64b: Default::default(),
+        counts_1kb: Default::default(),
+        counts_16kb: Default::default(),
+    };
+    hist.insert(0);
+    hist.insert(63);
+    hist.insert(1022);
+    hist.insert(1023);
+    assert_eq!(hist.counts_64b[0].load(Ordering::Relaxed), 2);
+    assert_eq!(hist.counts_64b[15].load(Ordering::Relaxed), 2);
+
+    hist.insert(1024);
+    hist.insert(1025);
+    hist.insert(16382);
+    hist.insert(16383);
+    assert_eq!(hist.counts_1kb[0].load(Ordering::Relaxed), 2);
+    assert_eq!(hist.counts_1kb[14].load(Ordering::Relaxed), 2);
+
+    hist.insert(16384);
+    hist.insert(16385);
+    hist.insert(65534);
+    hist.insert(65535);
+    assert_eq!(hist.counts_16kb[0].load(Ordering::Relaxed), 2);
+    assert_eq!(hist.counts_16kb[2].load(Ordering::Relaxed), 2);
+
+    hist.insert(65536);
+    hist.insert(65537);
+    assert_eq!(hist.counts_16kb[3].load(Ordering::Relaxed), 2);
+}
+
+#[repr(C)]
 pub(crate) struct ShardHeader {
     pub num_inserted: AtomicU64,
     pub num_removed: AtomicU64,
     pub wasted_bytes: AtomicU64,
     pub write_offset: AtomicU32,
+    pub size_histogram: ShardSizeHistogram,
     pub rows: PageAligned<[ShardRow; NUM_ROWS]>,
 }
 
@@ -237,7 +290,8 @@ impl Shard {
 
     // writing doesn't require holding any locks since we write with an offset
     fn write_kv(&self, key: &[u8], val: &[u8]) -> Result<u64> {
-        let mut buf = vec![0u8; key.len() + val.len()];
+        let entry_size = key.len() + val.len();
+        let mut buf = vec![0u8; entry_size];
         buf[..key.len()].copy_from_slice(key);
         buf[key.len()..].copy_from_slice(val);
 
@@ -250,6 +304,7 @@ impl Shard {
 
         // now writing can be non-atomic (pwrite)
         self.write_raw(&buf, write_offset)?;
+        self.header.size_histogram.insert(entry_size);
 
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
     }

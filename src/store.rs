@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::BTreeMap,
-    ops::Bound,
+    ops::{Bound, Range},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -62,6 +62,75 @@ impl Stats {
     /// total bytes consumed by the store (including headers and wasted bytes)
     pub fn total_bytes(&self) -> usize {
         self.used_bytes + Self::FILE_HEADER_SIZE * self.num_shards
+    }
+}
+
+/// A histogram of inserted entry sizes, in three bucket sizes:
+/// * up to 1KB we keep 64-byte resolution
+/// * from 1KB-16K, we keep in 1KB resolution
+/// * over 16K, we keep in 16K resolution
+///
+/// Notes:
+/// * Entry sizes are rounded down to the nearest bucket, e.g., 100 goes to the bucket of [64..128)
+/// * Counts are updated on insert, and are unchanged by removals. They represent the entry sizes "seen" by this
+///   store, not the currently existing ones. When a shard is split or compacted, only the existing entries remain
+///   in the histogram.
+/// * Use [Self::iter] to get a user-friendly representation of the histogram
+#[derive(Clone, Debug, Default)]
+pub struct SizeHistogram {
+    pub counts_64b: [usize; 16],
+    pub counts_1kb: [usize; 15],
+    pub counts_16kb: [usize; 4],
+}
+
+impl SizeHistogram {
+    /// return the count of the bucket for the given `sz`
+    pub fn get(&self, sz: usize) -> usize {
+        if sz < 1024 {
+            self.counts_64b[sz / 64]
+        } else if sz < 16 * 1024 {
+            self.counts_1kb[(sz - 1024) / 1024]
+        } else {
+            self.counts_16kb[(sz - 16 * 1024) / (16 * 1024)]
+        }
+    }
+
+    /// iterate over all non-empty buckets, and return their spans and counts
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
+        self.counts_64b
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| {
+                if c == 0 {
+                    return None;
+                }
+                Some((i * 64..(i + 1) * 64, c))
+            })
+            .chain(self.counts_1kb.iter().enumerate().filter_map(|(i, &c)| {
+                if c == 0 {
+                    return None;
+                }
+                Some(((i + 1) * 1024..(i + 2) * 1024, c))
+            }))
+            .chain(self.counts_16kb.iter().enumerate().filter_map(|(i, &c)| {
+                if c == 0 {
+                    return None;
+                }
+                Some(((i + 1) * 16 * 1024..(i + 2) * 16 * 1024, c))
+            }))
+    }
+}
+
+impl std::fmt::Display for SizeHistogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (r, c) in self.iter() {
+            if r.end == usize::MAX {
+                write!(f, "[{}..): {c}\n", r.start)?;
+            } else {
+                write!(f, "[{}..{}): {c}\n", r.start, r.end)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -492,6 +561,23 @@ impl CandyStore {
             stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
         }
         stats
+    }
+
+    pub fn size_histogram(&self) -> SizeHistogram {
+        let guard = self.shards.read();
+        let mut hist = SizeHistogram::default();
+        for (_, shard) in guard.iter() {
+            for (i, h) in shard.header.size_histogram.counts_64b.iter().enumerate() {
+                hist.counts_64b[i] += h.load(Ordering::Relaxed) as usize;
+            }
+            for (i, h) in shard.header.size_histogram.counts_1kb.iter().enumerate() {
+                hist.counts_1kb[i] += h.load(Ordering::Relaxed) as usize;
+            }
+            for (i, h) in shard.header.size_histogram.counts_16kb.iter().enumerate() {
+                hist.counts_16kb[i] += h.load(Ordering::Relaxed) as usize;
+            }
+        }
+        hist
     }
 
     /// Returns an iterator over the whole store (skipping linked lists or typed items)

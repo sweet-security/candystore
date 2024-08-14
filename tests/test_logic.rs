@@ -106,3 +106,41 @@ fn test_logic() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn test_histogram() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = CandyStore::open(
+            dir,
+            Config {
+                expected_number_of_keys: 100_000, // pre-split
+                ..Default::default()
+            },
+        )?;
+
+        db.set("k1", "bbb")?;
+        db.set("k2", &vec![b'b'; 100])?;
+        db.set("k3", &vec![b'b'; 500])?;
+        db.set("k4", &vec![b'b'; 5000])?;
+        db.set("k4", &vec![b'b'; 4500])?;
+        db.set("k5", &vec![b'b'; 50000])?;
+        db.set("kkkkkkkkkkkkkkk", &vec![b'b'; 0xffff])?;
+
+        let hist = db.size_histogram();
+        assert_eq!(
+            hist.iter().collect::<Vec<_>>(),
+            vec![
+                (0..64, 1),
+                (64..128, 1),
+                (448..512, 1),
+                (4096..5120, 2),
+                (49152..65536, 1),
+                (65536..81920, 1)
+            ]
+        );
+
+        assert!(hist.to_string().contains("[64..128): 1"));
+
+        Ok(())
+    })
+}
