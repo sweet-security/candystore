@@ -21,4 +21,4 @@ uuid = { version = "1.10.0", features = ["v4"] }
 rand = "0.8.5"
 
 [workspace]
-members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf"]
+members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf", "mini-candy"]

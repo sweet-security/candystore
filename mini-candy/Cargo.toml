@@ -1,0 +1,8 @@
+[package]
+name = "mini-candy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap = "0.7.0"
+siphasher = "1.0.1"
