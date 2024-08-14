@@ -48,6 +48,7 @@
 
 #![feature(btree_cursors)]
 
+mod encodable;
 mod hashing;
 mod insertion;
 mod lists;

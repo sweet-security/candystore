@@ -2,8 +2,8 @@ mod common;
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
+use candystore::{CandyStore, Config, Result};
 use rand::random;
-use candystore::{Config, Result, CandyStore};
 
 use crate::common::run_in_tempdir;
 

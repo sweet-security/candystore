@@ -1,6 +1,6 @@
 mod common;
 
-use candystore::{Config, ModifyStatus, Result, CandyStore};
+use candystore::{CandyStore, Config, ModifyStatus, Result};
 
 use crate::common::run_in_tempdir;
 
