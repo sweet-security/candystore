@@ -59,7 +59,7 @@ mod typed;
 pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ModifyStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
-pub use store::{CandyStore, Stats};
+pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
 
 #[derive(Debug, PartialEq, Eq, Clone)]

@@ -83,6 +83,17 @@ pub struct SizeHistogram {
     pub counts_16kb: [usize; 4],
 }
 
+/// A coarse version of [SizeHistogram]
+#[derive(Clone, Debug, Default)]
+pub struct CoarseHistogram {
+    pub under512: usize,
+    pub under1k: usize,
+    pub under4k: usize,
+    pub under16k: usize,
+    pub under32k: usize,
+    pub xlarge: usize,
+}
+
 impl SizeHistogram {
     /// return the count of the bucket for the given `sz`
     pub fn get(&self, sz: usize) -> usize {
@@ -93,6 +104,23 @@ impl SizeHistogram {
         } else {
             self.counts_16kb[(sz - 16 * 1024) / (16 * 1024)]
         }
+    }
+
+    pub fn to_coarse(&self) -> CoarseHistogram {
+        let mut coarse = CoarseHistogram::default();
+        for (r, c) in self.iter() {
+            let which = match r.end {
+                0..=512 => &mut coarse.under512,
+                513..=1024 => &mut coarse.under1k,
+                1025..=4096 => &mut coarse.under4k,
+                4097..=16384 => &mut coarse.under16k,
+                16385..=32768 => &mut coarse.under32k,
+                _ => &mut coarse.xlarge,
+            };
+            *which += c;
+        }
+
+        coarse
     }
 
     /// iterate over all non-empty buckets, and return their spans and counts

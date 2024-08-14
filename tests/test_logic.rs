@@ -141,6 +141,11 @@ fn test_histogram() -> Result<()> {
 
         assert!(hist.to_string().contains("[64..128): 1"));
 
+        let coarse = hist.to_coarse();
+        assert_eq!(coarse.under512, 3);
+        assert_eq!(coarse.under16k, 2);
+        assert_eq!(coarse.xlarge, 2);
+
         Ok(())
     })
 }
