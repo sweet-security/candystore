@@ -116,13 +116,13 @@ fn test_too_large() -> Result<()> {
             },
         )?;
 
-        assert_eq!(
+        assert!(matches!(
             db.set("yyy", &vec![7u8; 1000])
                 .unwrap_err()
                 .downcast::<CandyError>()
                 .unwrap(),
-            CandyError::EntryCannotFitInShard
-        );
+            CandyError::EntryCannotFitInShard(_, _)
+        ));
 
         db.set("yyy", &vec![7u8; 700])?;
         assert_eq!(db._num_splits(), 0);

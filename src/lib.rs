@@ -64,9 +64,9 @@ pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore}
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CandyError {
     WrongHashSeedLength,
-    KeyTooLong,
-    ValueTooLong,
-    EntryCannotFitInShard,
+    KeyTooLong(usize),
+    ValueTooLong(usize),
+    EntryCannotFitInShard(usize, usize),
     KeyNotFound,
     CompactionFailed(String),
     SplitFailed(String),
@@ -79,10 +79,12 @@ impl Display for CandyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             Self::WrongHashSeedLength => write!(f, "wrong hash seed length"),
-            Self::KeyTooLong => write!(f, "key too long"),
+            Self::KeyTooLong(sz) => write!(f, "key too long {sz}"),
             Self::KeyNotFound => write!(f, "key not found"),
-            Self::ValueTooLong => write!(f, "value too long"),
-            Self::EntryCannotFitInShard => write!(f, "entry too big for a single shard file"),
+            Self::ValueTooLong(sz) => write!(f, "value too long {sz}"),
+            Self::EntryCannotFitInShard(sz, max) => {
+                write!(f, "entry too big ({sz}) for a single shard file ({max})")
+            }
             Self::CorruptedLinkedList(s) => write!(f, "corrupted linked list: {s}"),
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),

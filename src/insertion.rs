@@ -240,13 +240,16 @@ impl CandyStore {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
         if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
-            return Err(anyhow!(CandyError::KeyTooLong));
+            return Err(anyhow!(CandyError::KeyTooLong(full_key.len())));
         }
         if val.len() > MAX_VALUE_SIZE as usize {
-            return Err(anyhow!(CandyError::ValueTooLong));
+            return Err(anyhow!(CandyError::ValueTooLong(val.len())));
         }
         if full_key.len() + val.len() > self.config.max_shard_size as usize {
-            return Err(anyhow!(CandyError::EntryCannotFitInShard));
+            return Err(anyhow!(CandyError::EntryCannotFitInShard(
+                full_key.len() + val.len(),
+                self.config.max_shard_size as usize
+            )));
         }
 
         loop {
