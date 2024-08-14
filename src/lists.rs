@@ -1123,16 +1123,20 @@ impl CandyStore {
         &self,
         list_key: &B1,
         val: &B2,
-    ) -> Result<Uuid> {
+    ) -> Result<EncodableUuid> {
         self.owned_push_to_list_head(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
     /// Owned version of [Self::push_to_list_head]
-    pub fn owned_push_to_list_head(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
-        let uuid = Uuid::new_v4();
+    pub fn owned_push_to_list_head(
+        &self,
+        list_key: Vec<u8>,
+        val: Vec<u8>,
+    ) -> Result<EncodableUuid> {
+        let uuid = EncodableUuid::from(Uuid::new_v4());
         let status = self._insert_to_list(
             list_key,
-            uuid.as_bytes().to_vec(),
+            uuid.to_bytes::<LE>(),
             val,
             InsertMode::GetOrCreate,
             InsertPosition::Head,
