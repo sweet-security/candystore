@@ -1,6 +1,5 @@
 use anyhow::anyhow;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
-use uuid::Uuid;
 
 use crate::{
     insertion::{ReplaceStatus, SetStatus},
@@ -449,14 +448,15 @@ where
         self.store.owned_discard_list(list_key)
     }
 
-    // only available if K == Uuid
-    fn _push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    /// Same as [CandyStore::push_to_list_head], but `list_key` is typed
+    pub fn push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
         val: &Q2,
-    ) -> Result<Uuid>
+    ) -> Result<EncodableUuid>
     where
         L: Borrow<Q1>,
+        EncodableUuid: From<K>,
         V: Borrow<Q2>,
     {
         let list_key = Self::make_list_key(list_key);
@@ -464,14 +464,15 @@ where
         self.store.owned_push_to_list_head(list_key, val)
     }
 
-    // only available if K == Uuid
-    fn _push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    /// Same as [CandyStore::push_to_list_tail], but `list_key` is typed
+    pub fn push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
         list_key: &Q1,
         val: &Q2,
     ) -> Result<EncodableUuid>
     where
         L: Borrow<Q1>,
+        EncodableUuid: From<K>,
         V: Borrow<Q2>,
     {
         let list_key = Self::make_list_key(list_key);
@@ -532,7 +533,7 @@ where
 /// and popping from either the head or the tail. The keys are auto-generated internally and are not exposed to
 /// the caller
 pub struct CandyTypedDeque<L, V> {
-    pub list: CandyTypedList<L, uuid::Bytes, V>,
+    pub list: CandyTypedList<L, EncodableUuid, V>,
 }
 
 impl<L, V> Clone for CandyTypedDeque<L, V> {
@@ -564,7 +565,7 @@ where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        self.list._push_head(list_key, val)?;
+        self.list.push_head(list_key, val)?;
         Ok(())
     }
 
@@ -578,7 +579,7 @@ where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        self.list._push_tail(list_key, val)?;
+        self.list.push_tail(list_key, val)?;
         Ok(())
     }
 
