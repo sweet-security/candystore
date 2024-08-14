@@ -5,8 +5,10 @@ use crate::{
     CandyError, CandyStore, GetOrCreateStatus, ReplaceStatus, Result, SetStatus,
 };
 
+use crate::encodable::EncodableUuid;
 use anyhow::{anyhow, bail};
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
+use databuf::{config::num::LE, Encode};
 use parking_lot::MutexGuard;
 use uuid::Uuid;
 
@@ -1086,16 +1088,20 @@ impl CandyStore {
         &self,
         list_key: &B1,
         val: &B2,
-    ) -> Result<Uuid> {
+    ) -> Result<EncodableUuid> {
         self.owned_push_to_list_tail(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
     /// Owned version of [Self::push_to_list]
-    pub fn owned_push_to_list_tail(&self, list_key: Vec<u8>, val: Vec<u8>) -> Result<Uuid> {
-        let uuid = Uuid::new_v4();
+    pub fn owned_push_to_list_tail(
+        &self,
+        list_key: Vec<u8>,
+        val: Vec<u8>,
+    ) -> Result<EncodableUuid> {
+        let uuid = EncodableUuid::from(Uuid::new_v4());
         let status = self._insert_to_list(
             list_key,
-            uuid.as_bytes().to_vec(),
+            uuid.to_bytes::<LE>(),
             val,
             InsertMode::GetOrCreate,
             InsertPosition::Tail,

@@ -8,6 +8,7 @@ use crate::{
     CandyStore, ModifyStatus,
 };
 
+use crate::encodable::EncodableUuid;
 use crate::Result;
 use databuf::{config::num::LE, DecodeOwned, Encode};
 
@@ -468,7 +469,7 @@ where
         &self,
         list_key: &Q1,
         val: &Q2,
-    ) -> Result<Uuid>
+    ) -> Result<EncodableUuid>
     where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
@@ -501,10 +502,34 @@ where
         };
         Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
     }
+
+    /// Same as [CandyStore::peek_list_tail], but `list_key` is typed
+    pub fn peek_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((k, v)) = self.store.owned_peek_list_tail(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+    }
+
+    /// Same as [CandyStore::peek_list_head], but `list_key` is typed
+    pub fn peek_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        let Some((k, v)) = self.store.owned_peek_list_head(list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
+    }
 }
 
 /// A wrapper around [CandyTypedList] that's specialized for double-ended queues - only allows pushing
-/// and popping from either the end or the tail. The keys are auto-generated internally and are not exposed to
+/// and popping from either the head or the tail. The keys are auto-generated internally and are not exposed to
 /// the caller
 pub struct CandyTypedDeque<L, V> {
     pub list: CandyTypedList<L, uuid::Bytes, V>,
@@ -512,7 +537,9 @@ pub struct CandyTypedDeque<L, V> {
 
 impl<L, V> Clone for CandyTypedDeque<L, V> {
     fn clone(&self) -> Self {
-        Self { list: self.list.clone() }
+        Self {
+            list: self.list.clone(),
+        }
     }
 }
 
@@ -569,6 +596,22 @@ where
         L: Borrow<Q>,
     {
         Ok(self.list.pop_tail(list_key)?.map(|kv| kv.1))
+    }
+
+    /// Peek at the value from the beginning (head) of the queue
+    pub fn peek_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        Ok(self.list.peek_head(list_key)?.map(|kv| kv.1))
+    }
+
+    /// Peek at the value from the end (tail) of the queue
+    pub fn peek_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        Ok(self.list.peek_tail(list_key)?.map(|kv| kv.1))
     }
 
     /// See [CandyTypedList::iter]

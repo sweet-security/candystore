@@ -1,6 +1,6 @@
 use core::str;
 
-use candystore::{Config, Result, CandyStore};
+use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
     let db = CandyStore::open("/tmp/candy-dir", Config::default())?;

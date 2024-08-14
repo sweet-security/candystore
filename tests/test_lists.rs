@@ -3,8 +3,8 @@ mod common;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use candystore::{
-    Config, GetOrCreateStatus, ReplaceStatus, Result, SetStatus, CandyStore, CandyTypedDeque,
-    CandyTypedList,
+    CandyStore, CandyTypedDeque, CandyTypedList, Config, GetOrCreateStatus, ReplaceStatus, Result,
+    SetStatus,
 };
 
 use crate::common::run_in_tempdir;

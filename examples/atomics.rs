@@ -1,7 +1,7 @@
 use core::str;
 use std::{sync::Arc, time::Duration};
 
-use candystore::{Config, GetOrCreateStatus, Result, CandyStore};
+use candystore::{CandyStore, Config, GetOrCreateStatus, Result};
 
 // prints:
 //   thread 2 owns the lock
