@@ -202,12 +202,12 @@ fn test_list_atomics() -> Result<()> {
         );
 
         assert_eq!(
-            db.replace_in_list("xxx", "yyy", "3")?,
+            db.replace_in_list("xxx", "yyy", "3", None)?,
             ReplaceStatus::PrevValue("1".into())
         );
 
         assert_eq!(
-            db.replace_in_list("xxx", "zzz", "3")?,
+            db.replace_in_list("xxx", "zzz", "3", None)?,
             ReplaceStatus::DoesNotExist
         );
 

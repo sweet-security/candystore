@@ -10,40 +10,21 @@ use crate::{CandyError, Result, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplaceStatus {
     PrevValue(Vec<u8>),
+    WrongValue(Vec<u8>),
     DoesNotExist,
 }
 impl ReplaceStatus {
     pub fn was_replaced(&self) -> bool {
         matches!(*self, Self::PrevValue(_))
     }
-    pub fn is_key_missing(&self) -> bool {
-        matches!(*self, Self::DoesNotExist)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModifyStatus {
-    PrevValue(Vec<u8>),
-    DoesNotExist,
-    WrongLength(usize, usize),
-    ValueTooLong(usize, usize, usize),
-    ValueMismatch(Vec<u8>),
-}
-impl ModifyStatus {
-    pub fn was_replaced(&self) -> bool {
-        matches!(*self, Self::PrevValue(_))
-    }
-    pub fn is_mismatch(&self) -> bool {
-        matches!(*self, Self::ValueMismatch(_))
-    }
-    pub fn is_too_long(&self) -> bool {
-        matches!(*self, Self::ValueTooLong(_, _, _))
-    }
-    pub fn is_wrong_length(&self) -> bool {
-        matches!(*self, Self::WrongLength(_, _))
+    pub fn failed(&self) -> bool {
+        !matches!(*self, Self::PrevValue(_))
     }
     pub fn is_key_missing(&self) -> bool {
         matches!(*self, Self::DoesNotExist)
+    }
+    pub fn is_wrong_value(&self) -> bool {
+        matches!(*self, Self::WrongValue(_))
     }
 }
 
@@ -236,7 +217,7 @@ impl CandyStore {
         full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<InsertStatus> {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
         if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
@@ -258,16 +239,16 @@ impl CandyStore {
             match status {
                 InsertStatus::Added => {
                     self.num_entries.fetch_add(1, Ordering::SeqCst);
-                    return Ok(None);
+                    return Ok(status);
                 }
                 InsertStatus::KeyDoesNotExist => {
-                    return Ok(None);
+                    return Ok(status);
                 }
-                InsertStatus::Replaced(existing_val) => {
-                    return Ok(Some(existing_val));
+                InsertStatus::Replaced(_) => {
+                    return Ok(status);
                 }
-                InsertStatus::AlreadyExists(existing_val) => {
-                    return Ok(Some(existing_val));
+                InsertStatus::AlreadyExists(_) => {
+                    return Ok(status);
                 }
                 InsertStatus::CompactionNeeded(write_offset) => {
                     self.compact(shard_end, write_offset)?;
@@ -282,10 +263,13 @@ impl CandyStore {
     }
 
     pub(crate) fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
-        if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Set)? {
-            Ok(SetStatus::PrevValue(prev))
-        } else {
-            Ok(SetStatus::CreatedNew)
+        match self.insert_internal(full_key, val, InsertMode::Set)? {
+            InsertStatus::Added => Ok(SetStatus::CreatedNew),
+            InsertStatus::Replaced(v) => Ok(SetStatus::PrevValue(v)),
+            InsertStatus::AlreadyExists(v) => Ok(SetStatus::PrevValue(v)),
+            InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
         }
     }
 
@@ -310,11 +294,19 @@ impl CandyStore {
         self.set_raw(&self.make_user_key(key), val)
     }
 
-    pub(crate) fn replace_raw(&self, full_key: &[u8], val: &[u8]) -> Result<ReplaceStatus> {
-        if let Some(prev) = self.insert_internal(full_key, val, InsertMode::Replace)? {
-            Ok(ReplaceStatus::PrevValue(prev))
-        } else {
-            Ok(ReplaceStatus::DoesNotExist)
+    pub(crate) fn replace_raw(
+        &self,
+        full_key: &[u8],
+        val: &[u8],
+        expected_val: Option<&[u8]>,
+    ) -> Result<ReplaceStatus> {
+        match self.insert_internal(full_key, val, InsertMode::Replace(expected_val))? {
+            InsertStatus::Added => unreachable!(),
+            InsertStatus::Replaced(v) => Ok(ReplaceStatus::PrevValue(v)),
+            InsertStatus::AlreadyExists(v) => Ok(ReplaceStatus::WrongValue(v)),
+            InsertStatus::KeyDoesNotExist => Ok(ReplaceStatus::DoesNotExist),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
         }
     }
 
@@ -327,13 +319,23 @@ impl CandyStore {
         &self,
         key: &B1,
         val: &B2,
+        expected_val: Option<&B2>,
     ) -> Result<ReplaceStatus> {
-        self.owned_replace(key.as_ref().to_owned(), val.as_ref())
+        self.owned_replace(
+            key.as_ref().to_owned(),
+            val.as_ref(),
+            expected_val.map(|ev| ev.as_ref()),
+        )
     }
 
     /// Same as [Self::replace], but the key passed owned to this function
-    pub fn owned_replace(&self, key: Vec<u8>, val: &[u8]) -> Result<ReplaceStatus> {
-        self.replace_raw(&self.make_user_key(key), val.as_ref())
+    pub fn owned_replace(
+        &self,
+        key: Vec<u8>,
+        val: &[u8],
+        expected_val: Option<&[u8]>,
+    ) -> Result<ReplaceStatus> {
+        self.replace_raw(&self.make_user_key(key), val.as_ref(), expected_val)
     }
 
     pub(crate) fn get_or_create_raw(
@@ -341,11 +343,13 @@ impl CandyStore {
         full_key: &[u8],
         default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
-        let res = self.insert_internal(&full_key, &default_val, InsertMode::GetOrCreate)?;
-        if let Some(prev) = res {
-            Ok(GetOrCreateStatus::ExistingValue(prev))
-        } else {
-            Ok(GetOrCreateStatus::CreatedNew(default_val))
+        match self.insert_internal(full_key, &default_val, InsertMode::GetOrCreate)? {
+            InsertStatus::Added => Ok(GetOrCreateStatus::CreatedNew(default_val)),
+            InsertStatus::AlreadyExists(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
+            InsertStatus::Replaced(_) => unreachable!(),
+            InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
         }
     }
 
@@ -370,97 +374,5 @@ impl CandyStore {
         default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
         self.get_or_create_raw(&self.make_user_key(key), default_val)
-    }
-
-    // this is NOT crash safe (may produce inconsistent results)
-    pub(crate) fn modify_inplace_raw(
-        &self,
-        full_key: &[u8],
-        patch: &[u8],
-        patch_offset: usize,
-        expected: Option<&[u8]>,
-    ) -> Result<ModifyStatus> {
-        self.operate_on_key_mut(full_key, |shard, row, _ph, idx_kv| {
-            let Some((idx, _k, v)) = idx_kv else {
-                return Ok(ModifyStatus::DoesNotExist);
-            };
-
-            let (klen, vlen, offset) = Shard::extract_offset_and_size(row.offsets_and_sizes[idx]);
-            if patch_offset + patch.len() > vlen as usize {
-                return Ok(ModifyStatus::ValueTooLong(patch_offset, patch.len(), vlen));
-            }
-
-            if let Some(expected) = expected {
-                if &v[patch_offset..patch_offset + patch.len()] != expected {
-                    return Ok(ModifyStatus::ValueMismatch(v));
-                }
-            }
-
-            shard.write_raw(patch, offset + klen as u64 + patch_offset as u64)?;
-            Ok(ModifyStatus::PrevValue(v))
-        })
-    }
-
-    /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist
-    /// and `patch.len() + patch_offset` must be less than or equal to the current value's length.
-    ///
-    /// This is operation is NOT crash-safe as it overwrites existing data, and thus may produce inconsistent
-    /// results on crashes (reading part old data, part new data).
-    ///
-    /// This method will never trigger a shard split or a shard compaction.
-    pub fn modify_inplace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        key: &B1,
-        patch: &B2,
-        patch_offset: usize,
-        expected: Option<&B2>,
-    ) -> Result<ModifyStatus> {
-        self.modify_inplace_raw(
-            &self.make_user_key(key.as_ref().to_owned()),
-            patch.as_ref(),
-            patch_offset,
-            expected.map(|b| b.as_ref()),
-        )
-    }
-
-    pub(crate) fn replace_inplace_raw(
-        &self,
-        full_key: &[u8],
-        new_value: &[u8],
-    ) -> Result<ModifyStatus> {
-        self.operate_on_key_mut(full_key, |shard, row, _ph, idx_kv| {
-            let Some((idx, _k, v)) = idx_kv else {
-                return Ok(ModifyStatus::DoesNotExist);
-            };
-
-            let (klen, vlen, offset) = Shard::extract_offset_and_size(row.offsets_and_sizes[idx]);
-            if new_value.len() != vlen as usize {
-                return Ok(ModifyStatus::WrongLength(new_value.len(), vlen));
-            }
-
-            shard.write_raw(new_value, offset + klen as u64)?;
-            return Ok(ModifyStatus::PrevValue(v));
-        })
-    }
-
-    /// Modifies an existing entry in-place, instead of creating a new version. Note that the key must exist
-    /// and `new_value.len()` must match exactly the existing value's length. This is mostly useful for binary
-    /// data.
-    ///
-    /// This is operation is NOT crash-safe as it overwrites existing data, and thus may produce inconsistent
-    /// results on crashes (reading part old data, part new data).
-    ///
-    /// This method will never trigger a shard split or a shard compaction.
-    pub fn replace_inplace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        key: &B1,
-        new_value: &B2,
-    ) -> Result<ModifyStatus> {
-        self.owned_replace_inplace(key.as_ref().to_owned(), new_value.as_ref())
-    }
-
-    /// Same as [Self::replace_inplace], but the key passed owned to this function
-    pub fn owned_replace_inplace(&self, key: Vec<u8>, new_value: &[u8]) -> Result<ModifyStatus> {
-        self.replace_inplace_raw(&self.make_user_key(key), new_value)
     }
 }

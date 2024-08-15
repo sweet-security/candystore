@@ -15,7 +15,7 @@ use crate::{
     shard::{KVPair, HEADER_SIZE},
 };
 use crate::{
-    shard::{Shard, ShardRow, NUM_ROWS, ROW_WIDTH},
+    shard::{Shard, NUM_ROWS, ROW_WIDTH},
     CandyError,
 };
 use crate::{Config, Result};
@@ -292,9 +292,9 @@ impl CandyStore {
             config,
             dir_path,
             shards: RwLock::new(shards),
-            num_entries: 0.into(),
-            num_compactions: 0.into(),
-            num_splits: 0.into(),
+            num_entries: Default::default(),
+            num_compactions: Default::default(),
+            num_splits: Default::default(),
             keyed_locks_mask: num_keyed_locks - 1,
             keyed_locks,
         })
@@ -480,26 +480,6 @@ impl CandyStore {
             .1
             .iter_by_hash(ph)
             .collect::<Vec<_>>())
-    }
-
-    pub(crate) fn operate_on_key_mut<T>(
-        &self,
-        key: &[u8],
-        func: impl FnOnce(
-            &Shard,
-            &mut ShardRow,
-            PartedHash,
-            Option<(usize, Vec<u8>, Vec<u8>)>,
-        ) -> Result<T>,
-    ) -> Result<T> {
-        let ph = PartedHash::new(&self.config.hash_seed, key);
-        self.shards
-            .read()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
-            .peek_next()
-            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
-            .1
-            .operate_on_key_mut(ph, key, func)
     }
 
     pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {

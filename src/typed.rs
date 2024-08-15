@@ -4,7 +4,7 @@ use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 use crate::{
     insertion::{ReplaceStatus, SetStatus},
     store::TYPED_NAMESPACE,
-    CandyStore, ModifyStatus,
+    CandyStore,
 };
 
 use crate::encodable::EncodableUuid;
@@ -120,6 +120,7 @@ where
         &self,
         key: &Q1,
         val: &Q2,
+        expected_val: Option<&Q2>,
     ) -> Result<Option<V>>
     where
         K: Borrow<Q1>,
@@ -127,31 +128,14 @@ where
     {
         let kbytes = Self::make_key(key);
         let vbytes = val.to_bytes::<LE>();
-        match self.store.replace_raw(&kbytes, &vbytes)? {
+        let ebytes = expected_val.map(|ev| ev.to_bytes::<LE>()).unwrap_or(vec![]);
+        match self
+            .store
+            .replace_raw(&kbytes, &vbytes, expected_val.map(|_| &*ebytes))?
+        {
             ReplaceStatus::DoesNotExist => Ok(None),
             ReplaceStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
-        }
-    }
-
-    /// Same as [CandyStore::replace_inplace] but serializes the key and the value.
-    /// Note: not crash safe!
-    pub fn replace_inplace<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
-        &self,
-        key: &Q1,
-        val: &Q2,
-    ) -> Result<Option<V>>
-    where
-        K: Borrow<Q1>,
-        V: Borrow<Q2>,
-    {
-        let kbytes = Self::make_key(key);
-        let vbytes = val.to_bytes::<LE>();
-        match self.store.replace_inplace_raw(&kbytes, &vbytes)? {
-            ModifyStatus::DoesNotExist => Ok(None),
-            ModifyStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
-            ModifyStatus::ValueMismatch(_) => unreachable!(),
-            ModifyStatus::ValueTooLong(_, _, _) => Ok(None),
-            ModifyStatus::WrongLength(_, _) => Ok(None),
+            ReplaceStatus::WrongValue(_) => Ok(None),
         }
     }
 
@@ -363,6 +347,7 @@ where
         list_key: &Q1,
         item_key: &Q2,
         val: &Q3,
+        expected_val: Option<&Q3>,
     ) -> Result<Option<V>>
     where
         L: Borrow<Q1>,
@@ -372,9 +357,18 @@ where
         let list_key = Self::make_list_key(list_key);
         let item_key = item_key.to_bytes::<LE>();
         let val = val.to_bytes::<LE>();
-        match self.store.owned_replace_in_list(list_key, item_key, val)? {
+        let ebytes = expected_val
+            .map(|ev| ev.to_bytes::<LE>())
+            .unwrap_or_default();
+        match self.store.owned_replace_in_list(
+            list_key,
+            item_key,
+            val,
+            expected_val.map(|_| &*ebytes),
+        )? {
             ReplaceStatus::DoesNotExist => Ok(None),
             ReplaceStatus::PrevValue(v) => Ok(Some(from_bytes::<V>(&v)?)),
+            ReplaceStatus::WrongValue(_) => Ok(None),
         }
     }
 

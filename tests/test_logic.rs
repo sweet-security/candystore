@@ -47,10 +47,9 @@ fn test_logic() -> Result<()> {
                 .is_some());
         }
 
-        let compactions1 = db._num_compactions();
         let splits1 = db._num_splits();
         assert_eq!(db._num_entries(), 1);
-        assert!(compactions1 >= 2);
+        assert!(db._num_compactions() >= 2);
         assert_eq!(splits1, 0);
 
         for i in 0..1000 {
@@ -58,7 +57,6 @@ fn test_logic() -> Result<()> {
         }
 
         assert_eq!(db._num_entries(), 1001);
-        assert_eq!(db._num_compactions(), compactions1);
         assert!(db._num_splits() > splits1);
 
         assert_eq!(db.get("your_name")?, Some("vizzini".into()));

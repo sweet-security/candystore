@@ -7,8 +7,7 @@
 //! to the disk IO latency, and operations generally require 1-4 disk IOs.
 //!
 //! The algorithm, for the most part, is crash-safe. That is, you can crash at any point and still be in a consistent
-//! state. You might lose the ongoing operation, but we consider this acceptable. Some operations, like
-//! `modify_inplace` or `set_promoting` are not crash safe, and are documented as such.
+//! state. You might lose the ongoing operation, but we consider this acceptable.
 //!
 //! Candy is designed to consume very little memory: entries are written directly to the shard-file, and only a
 //! table of ~380KB is kept `mmap`-ed (it is also file-backed, so can be evicted if needed). A shard-file can
@@ -57,7 +56,7 @@ mod store;
 mod typed;
 
 pub use hashing::HashSeed;
-pub use insertion::{GetOrCreateStatus, ModifyStatus, ReplaceStatus, SetStatus};
+pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};

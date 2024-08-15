@@ -164,9 +164,9 @@ pub(crate) enum InsertStatus {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum InsertMode {
+pub(crate) enum InsertMode<'a> {
     Set,
-    Replace,
+    Replace(Option<&'a [u8]>),
     GetOrCreate,
 }
 
@@ -188,6 +188,40 @@ impl<'a> Iterator for ByHashIterator<'a> {
         } else {
             None
         }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct Backpointer(u32);
+
+impl Backpointer {
+    // MSB                  LSB
+    // +-----+-----+----------+
+    // + row | sig |  entry   |
+    // | idx | idx |  size    |
+    // | (6) | (9) |   (17)   |
+    // +-----+-----+----------+
+    fn new(row_idx: u16, sig_idx: u16, entry_size: usize) -> Self {
+        debug_assert!((row_idx as usize % NUM_ROWS) < (1 << 6), "{row_idx}");
+        debug_assert!(sig_idx < (1 << 9), "{sig_idx}");
+        Self(
+            (((row_idx % (NUM_ROWS as u16)) as u32) << 26)
+                | ((sig_idx as u32) << 17)
+                | (entry_size as u32 & 0x1ffff),
+        )
+    }
+
+    #[allow(dead_code)]
+    fn entry_size(&self) -> u32 {
+        self.0 & 0x1ffff
+    }
+    #[allow(dead_code)]
+    fn row(&self) -> usize {
+        (self.0 >> 26) as usize
+    }
+    #[allow(dead_code)]
+    fn sig_idx(&self) -> usize {
+        ((self.0 >> 17) & 0x1ff) as usize
     }
 }
 
@@ -231,9 +265,9 @@ impl Shard {
             .open(&filename)?;
         let md = file.metadata()?;
         if md.len() < HEADER_SIZE {
-            // when creating, set the file's length so that we won't need to extend it every time we write
             file.set_len(0)?;
             if config.truncate_up {
+                // when creating, set the file's length so that we won't need to extend it every time we write
                 file.set_len(HEADER_SIZE + config.max_shard_size as u64)?;
             }
         }
@@ -278,9 +312,12 @@ impl Shard {
 
     // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
     fn read_kv(&self, offset_and_size: u64) -> Result<KVPair> {
+        const BP: u64 = size_of::<Backpointer>() as u64;
+
         let (klen, vlen, offset) = Self::extract_offset_and_size(offset_and_size);
         let mut buf = vec![0u8; klen + vlen];
-        self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
+        self.file
+            .read_exact_at(&mut buf, HEADER_SIZE + BP + offset)?;
 
         let val = buf[klen..klen + vlen].to_owned();
         buf.truncate(klen);
@@ -289,11 +326,15 @@ impl Shard {
     }
 
     // writing doesn't require holding any locks since we write with an offset
-    fn write_kv(&self, key: &[u8], val: &[u8]) -> Result<u64> {
+    fn write_kv(&self, row_idx: u16, sig_idx: u16, key: &[u8], val: &[u8]) -> Result<u64> {
+        const BP: usize = size_of::<Backpointer>();
+
         let entry_size = key.len() + val.len();
-        let mut buf = vec![0u8; entry_size];
-        buf[..key.len()].copy_from_slice(key);
-        buf[key.len()..].copy_from_slice(val);
+        let mut buf = vec![0u8; BP + entry_size];
+        let bp = Backpointer::new(row_idx, sig_idx, entry_size);
+        buf[..BP].copy_from_slice(&bp.0.to_le_bytes());
+        buf[BP..BP + key.len()].copy_from_slice(key);
+        buf[BP + key.len()..].copy_from_slice(val);
 
         // atomically allocate some area. it may leak if the IO below fails or if we crash before updating the
         // offsets_and_size array, but we're okay with leaks
@@ -303,16 +344,10 @@ impl Shard {
             .fetch_add(buf.len() as u32, Ordering::SeqCst) as u64;
 
         // now writing can be non-atomic (pwrite)
-        self.write_raw(&buf, write_offset)?;
+        self.file.write_all_at(&buf, HEADER_SIZE + write_offset)?;
         self.header.size_histogram.insert(entry_size);
 
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
-    }
-
-    #[inline]
-    pub(crate) fn write_raw(&self, buf: &[u8], offset: u64) -> Result<()> {
-        self.file.write_all_at(&buf, HEADER_SIZE + offset)?;
-        Ok(())
     }
 
     pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<KVPair>> {
@@ -370,26 +405,37 @@ impl Shard {
     ) -> Result<TryReplaceStatus> {
         let mut start = 0;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
-            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
-            if key == k {
-                match mode {
-                    InsertMode::GetOrCreate => {
-                        // no-op, key already exists
-                        return Ok(TryReplaceStatus::KeyExistsNotReplaced(v));
-                    }
-                    InsertMode::Set | InsertMode::Replace => {
-                        // optimization
-                        if val != v {
-                            row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
-                            self.header
-                                .wasted_bytes
-                                .fetch_add((k.len() + v.len()) as u64, Ordering::SeqCst);
-                        }
-                        return Ok(TryReplaceStatus::KeyExistsReplaced(v));
+            let (k, existing_val) = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key != k {
+                continue;
+            }
+            match mode {
+                InsertMode::GetOrCreate => {
+                    // no-op, key already exists
+                    return Ok(TryReplaceStatus::KeyExistsNotReplaced(existing_val));
+                }
+                InsertMode::Set => {
+                    // fall through
+                }
+                InsertMode::Replace(expected_val) => {
+                    if expected_val.is_some_and(|expected_val| expected_val != existing_val) {
+                        return Ok(TryReplaceStatus::KeyExistsNotReplaced(existing_val));
                     }
                 }
             }
+
+            // optimization
+            if val != existing_val {
+                row.offsets_and_sizes[idx] =
+                    self.write_kv(ph.row_selector(), idx as u16, key, val)?;
+                self.header.wasted_bytes.fetch_add(
+                    (size_of::<Backpointer>() + k.len() + existing_val.len()) as u64,
+                    Ordering::SeqCst,
+                );
+            }
+            return Ok(TryReplaceStatus::KeyExistsReplaced(existing_val));
         }
+
         Ok(TryReplaceStatus::KeyDoesNotExist)
     }
 
@@ -404,14 +450,15 @@ impl Shard {
         (guard, row)
     }
 
-    pub(crate) fn insert_unlocked(
+    pub(crate) fn insert(
         &self,
-        row: &mut ShardRow,
         ph: PartedHash,
         full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
     ) -> Result<InsertStatus> {
+        let (_guard, row) = self.get_row_mut(ph);
+
         if self.header.write_offset.load(Ordering::Relaxed) as u64
             + (full_key.len() + val.len()) as u64
             > self.config.max_shard_size as u64
@@ -429,20 +476,20 @@ impl Shard {
 
         match self.try_replace(row, ph, &full_key, val, mode)? {
             TryReplaceStatus::KeyDoesNotExist => {
-                if matches!(mode, InsertMode::Replace) {
+                if matches!(mode, InsertMode::Replace(_)) {
                     return Ok(InsertStatus::KeyDoesNotExist);
                 }
 
                 // find an empty slot
                 let mut start = 0;
                 if let Some(idx) = row.lookup(INVALID_SIG, &mut start) {
-                    let new_off = self.write_kv(&full_key, val)?;
+                    let new_off = self.write_kv(ph.row_selector(), idx as u16, &full_key, val)?;
 
                     // we don't want a reorder to happen here - first write the offset, then the signature
                     row.offsets_and_sizes[idx] = new_off;
                     std::sync::atomic::fence(Ordering::SeqCst);
                     row.signatures[idx] = ph.signature();
-                    self.header.num_inserted.fetch_add(1, Ordering::SeqCst);
+                    self.header.num_inserted.fetch_add(1, Ordering::Relaxed);
                     Ok(InsertStatus::Added)
                 } else {
                     // no room in this row, must split
@@ -456,55 +503,24 @@ impl Shard {
         }
     }
 
-    pub(crate) fn insert(
-        &self,
-        ph: PartedHash,
-        full_key: &[u8],
-        val: &[u8],
-        mode: InsertMode,
-    ) -> Result<InsertStatus> {
-        let (_guard, row) = self.get_row_mut(ph);
-        self.insert_unlocked(row, ph, full_key, val, mode)
-    }
-
-    pub(crate) fn operate_on_key_mut<T>(
-        &self,
-        ph: PartedHash,
-        key: &[u8],
-        func: impl FnOnce(
-            &Shard,
-            &mut ShardRow,
-            PartedHash,
-            Option<(usize, Vec<u8>, Vec<u8>)>,
-        ) -> Result<T>,
-    ) -> Result<T> {
+    pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (_guard, row) = self.get_row_mut(ph);
 
         let mut start = 0;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
             let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
-                return func(&self, row, ph, Some((idx, k, v)));
+                row.signatures[idx] = INVALID_SIG;
+                // we managed to remove this key
+                self.header.num_removed.fetch_add(1, Ordering::Relaxed);
+                self.header.wasted_bytes.fetch_add(
+                    (size_of::<Backpointer>() + k.len() + v.len()) as u64,
+                    Ordering::Relaxed,
+                );
+                return Ok(Some(v));
             }
         }
 
-        func(&self, row, ph, None)
-    }
-
-    pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.operate_on_key_mut(ph, key, |shard, row, _, idx_kv| {
-            let Some((idx, k, v)) = idx_kv else {
-                return Ok(None);
-            };
-
-            row.signatures[idx] = INVALID_SIG;
-            // we managed to remove this key
-            shard.header.num_removed.fetch_add(1, Ordering::Relaxed);
-            shard
-                .header
-                .wasted_bytes
-                .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
-            Ok(Some(v))
-        })
+        Ok(None)
     }
 }

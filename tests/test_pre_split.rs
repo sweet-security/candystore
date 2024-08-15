@@ -46,7 +46,7 @@ fn test_pre_split() -> Result<()> {
         // namespace byte as well
         assert_eq!(
             stats.wasted_bytes,
-            "aaa?".len() + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
+            "????aaa?".len() + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
         );
 
         db.remove("aaa")?;
@@ -55,9 +55,9 @@ fn test_pre_split() -> Result<()> {
         assert_eq!(stats.num_removed, 1);
         assert_eq!(
             stats.wasted_bytes,
-            "aaa?".len()
+            "????aaa?".len()
                 + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
-                + "aaa?".len()
+                + "????aaa?".len()
                 + "xxx".len()
         );
 
@@ -77,19 +77,16 @@ fn test_compaction() -> Result<()> {
             },
         )?;
 
-        db.set("aaa", "111122223333444455556666777788889999000011112222333344445555666677778888999900001111222233334444")?;
-        let stats = db.stats();
-        assert_eq!(stats.num_inserted, 1);
-        assert_eq!(stats.used_bytes, 100);
-
         // fill the shard to the rim, creating waste
-        for i in 0..9 {
-            db.set("aaa", &format!("11112222333344445555666677778888999900001111222233334444555566667777888899990000111122223333xxx{i}"))?;
+        for i in 0..10 {
+            db.set("aaa", &format!("1111222233334444555566667777888899990000111122223333444455556666777788889999000011112222333{:x}", i))?;
+
+            let stats = db.stats();
+            assert_eq!(stats.num_inserted, 1, "i={i}");
+            assert_eq!(stats.used_bytes, 100 * (i + 1), "i={i}");
+            assert_eq!(stats.wasted_bytes, 100 * i, "i={i}");
         }
 
-        let stats = db.stats();
-        assert_eq!(stats.used_bytes, 1000);
-        assert_eq!(stats.wasted_bytes, 900);
         assert_eq!(db._num_compactions(), 0);
 
         // insert a new entry, which will cause a compaction
@@ -97,7 +94,7 @@ fn test_compaction() -> Result<()> {
         assert_eq!(db._num_compactions(), 1);
 
         let stats = db.stats();
-        assert_eq!(stats.used_bytes, 100 + "bbb?".len() + "x".len());
+        assert_eq!(stats.used_bytes, 100 + "????bbb?".len() + "x".len());
         assert_eq!(stats.wasted_bytes, 0);
 
         Ok(())

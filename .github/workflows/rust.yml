@@ -34,3 +34,5 @@ jobs:
       run: cargo -Z unstable-options -C candy-crasher run --release
     - name: Run longliving
       run: cargo -Z unstable-options -C candy-longliving run --release -- 10 40001 10000
+    - name: Run mini-candy
+      run: cargo -Z unstable-options -C mini-candy run

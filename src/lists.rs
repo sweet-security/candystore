@@ -6,7 +6,7 @@ use crate::{
 };
 
 use crate::encodable::EncodableUuid;
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 use databuf::{config::num::LE, Encode};
 use parking_lot::MutexGuard;
@@ -40,6 +40,18 @@ const ITEM_SUFFIX_LEN: usize = size_of::<PartedHash>() + ITEM_NAMESPACE.len();
 
 fn chain_of(buf: &[u8]) -> Chain {
     bytemuck::pod_read_unaligned(&buf[buf.len() - size_of::<Chain>()..])
+}
+fn update_chain_prev(val: &mut Vec<u8>, new_prev: PartedHash) {
+    let offset = val.len() - size_of::<Chain>();
+    let mut chain: Chain = bytemuck::pod_read_unaligned(&val[offset..]);
+    chain.prev = new_prev;
+    val[offset..].copy_from_slice(bytes_of(&chain));
+}
+fn update_chain_next(val: &mut Vec<u8>, new_next: PartedHash) {
+    let offset = val.len() - size_of::<Chain>();
+    let mut chain: Chain = bytemuck::pod_read_unaligned(&val[offset..]);
+    chain.next = new_next;
+    val[offset..].copy_from_slice(bytes_of(&chain));
 }
 
 pub struct LinkedListIterator<'a> {
@@ -152,7 +164,7 @@ impl<'a> Iterator for RevLinkedListIterator<'a> {
 
 macro_rules! corrupted_list {
     ($($arg:tt)*) => {
-        return Err(anyhow!(CandyError::CorruptedLinkedList(format!($($arg)*))));
+        bail!(CandyError::CorruptedLinkedList(format!($($arg)*)));
     };
 }
 
@@ -161,7 +173,7 @@ macro_rules! corrupted_if {
         if ($e1 == $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} == {:?})", $e1, $e2);
-            return Err(anyhow!(CandyError::CorruptedLinkedList(full)));
+            bail!(CandyError::CorruptedLinkedList(full));
         }
     };
 }
@@ -176,9 +188,17 @@ macro_rules! corrupted_unless {
         if ($e1 != $e2) {
             let tmp = format!($($arg)*);
             let full = format!("{tmp} ({:?} != {:?})", $e1, $e2);
-            return Err(anyhow!(CandyError::CorruptedLinkedList(full)));
+            bail!(CandyError::CorruptedLinkedList(full));
         }
     };
+}
+
+#[derive(Debug)]
+enum InsertToListStatus {
+    ExistingValue(Vec<u8>),
+    WrongValue(Vec<u8>),
+    CreatedNew(Vec<u8>),
+    DoesNotExist,
 }
 
 impl CandyStore {
@@ -274,7 +294,7 @@ impl CandyStore {
         mut val: Vec<u8>,
         mode: InsertMode,
         pos: InsertPosition,
-    ) -> Result<GetOrCreateStatus> {
+    ) -> Result<InsertToListStatus> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
 
@@ -283,27 +303,42 @@ impl CandyStore {
         // if the item already exists, it means it belongs to this list. we just need to update the value and
         // keep the existing chain part
         if let Some(mut old_val) = self.get_raw(&item_key)? {
-            if matches!(mode, InsertMode::GetOrCreate) {
-                // don't replace the existing value
-                old_val.truncate(old_val.len() - size_of::<Chain>());
-                return Ok(GetOrCreateStatus::ExistingValue(old_val));
+            match mode {
+                InsertMode::GetOrCreate => {
+                    // don't replace the existing value
+                    old_val.truncate(old_val.len() - size_of::<Chain>());
+                    return Ok(InsertToListStatus::ExistingValue(old_val));
+                }
+                InsertMode::Replace(ev) => {
+                    if ev.is_some_and(|ev| ev != &old_val[..old_val.len() - size_of::<Chain>()]) {
+                        old_val.truncate(old_val.len() - size_of::<Chain>());
+                        return Ok(InsertToListStatus::WrongValue(old_val));
+                    }
+                    // fall through
+                }
+                _ => {
+                    // fall through
+                }
             }
 
             val.extend_from_slice(&old_val[old_val.len() - size_of::<Chain>()..]);
-            match self.replace_raw(&item_key, &val)? {
+            match self.replace_raw(&item_key, &val, None)? {
                 ReplaceStatus::DoesNotExist => {
                     corrupted_list!("failed replacing existing item");
                 }
                 ReplaceStatus::PrevValue(mut v) => {
                     v.truncate(v.len() - size_of::<Chain>());
-                    return Ok(GetOrCreateStatus::ExistingValue(v));
+                    return Ok(InsertToListStatus::ExistingValue(v));
+                }
+                ReplaceStatus::WrongValue(_) => {
+                    unreachable!();
                 }
             }
         }
 
-        if matches!(mode, InsertMode::Replace) {
+        if matches!(mode, InsertMode::Replace(_)) {
             // not allowed to create
-            return Ok(GetOrCreateStatus::CreatedNew(val));
+            return Ok(InsertToListStatus::DoesNotExist);
         }
 
         if let Some((origk, _)) = self._list_get(list_ph, item_ph)? {
@@ -341,7 +376,7 @@ impl CandyStore {
                 corrupted_list!("expected to create {item_key:?}");
             }
             val.truncate(val.len() - size_of::<Chain>());
-            return Ok(GetOrCreateStatus::CreatedNew(val));
+            return Ok(InsertToListStatus::CreatedNew(val));
         }
 
         let v = match pos {
@@ -353,7 +388,7 @@ impl CandyStore {
             }
         };
 
-        Ok(GetOrCreateStatus::CreatedNew(v))
+        Ok(InsertToListStatus::CreatedNew(v))
     }
 
     fn _insert_to_list_head(
@@ -367,22 +402,13 @@ impl CandyStore {
     ) -> Result<Vec<u8>> {
         // the list already exists. start at list.head and find the true head (it's possible list.
         // isn't up to date because of crashes)
-        let (head_ph, head_k, head_v) = self.find_true_head(list_ph, curr_list.head)?;
+        let (head_ph, head_k, mut head_v) = self.find_true_head(list_ph, curr_list.head)?;
 
         // modify the last item to point to the new item. if we crash after this, everything is okay because
         // find_true_tail will stop at this item
-        let mut head_chain = chain_of(&head_v);
-        head_chain.prev = item_ph;
+        update_chain_prev(&mut head_v, item_ph);
 
-        if !self
-            .modify_inplace_raw(
-                &head_k,
-                bytes_of(&head_chain),
-                head_v.len() - size_of::<Chain>(),
-                Some(&head_v[head_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
+        if self.replace_raw(&head_k, &head_v, None)?.failed() {
             corrupted_list!(
                 "failed to update previous element {head_k:?} to point to this one {item_key:?}"
             );
@@ -399,7 +425,7 @@ impl CandyStore {
         };
         val.extend_from_slice(bytes_of(&this_chain));
 
-        if self.set_raw(&item_key, &val)?.was_replaced() {
+        if !self.set_raw(&item_key, &val)?.was_created() {
             corrupted_list!("tail element {item_key:?} already exists");
         }
 
@@ -410,14 +436,9 @@ impl CandyStore {
             anticollision_bits: 0,
         };
 
-        if !self
-            .modify_inplace_raw(
-                &list_key,
-                bytes_of(&new_list),
-                0,
-                Some(bytes_of(&curr_list)),
-            )?
-            .was_replaced()
+        if self
+            .replace_raw(&list_key, bytes_of(&new_list), Some(bytes_of(&curr_list)))?
+            .failed()
         {
             corrupted_list!("failed to update list tail to point to {item_key:?}");
         }
@@ -436,22 +457,13 @@ impl CandyStore {
     ) -> Result<Vec<u8>> {
         // the list already exists. start at list.tail and find the true tail (it's possible list.tail
         // isn't up to date because of crashes)
-        let (tail_ph, tail_k, tail_v) = self.find_true_tail(list_ph, curr_list.tail)?;
+        let (tail_ph, tail_k, mut tail_v) = self.find_true_tail(list_ph, curr_list.tail)?;
 
         // modify the last item to point to the new item. if we crash after this, everything is okay because
         // find_true_tail will stop at this item
-        let mut tail_chain = chain_of(&tail_v);
-        tail_chain.next = item_ph;
+        update_chain_next(&mut tail_v, item_ph);
 
-        if !self
-            .modify_inplace_raw(
-                &tail_k,
-                bytes_of(&tail_chain),
-                tail_v.len() - size_of::<Chain>(),
-                Some(&tail_v[tail_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
+        if self.replace_raw(&tail_k, &tail_v, None)?.failed() {
             corrupted_list!(
                 "failed to update previous element {tail_k:?} to point to this one {item_key:?}"
             );
@@ -479,14 +491,9 @@ impl CandyStore {
             anticollision_bits: 0,
         };
 
-        if !self
-            .modify_inplace_raw(
-                &list_key,
-                bytes_of(&new_list),
-                0,
-                Some(bytes_of(&curr_list)),
-            )?
-            .was_replaced()
+        if self
+            .replace_raw(&list_key, bytes_of(&new_list), Some(bytes_of(&curr_list)))?
+            .failed()
         {
             corrupted_list!("failed to update list tail to point to {item_key:?}");
         }
@@ -565,8 +572,10 @@ impl CandyStore {
             InsertMode::Set,
             InsertPosition::Tail,
         )? {
-            GetOrCreateStatus::CreatedNew(_) => Ok(SetStatus::CreatedNew),
-            GetOrCreateStatus::ExistingValue(v) => Ok(SetStatus::PrevValue(v)),
+            InsertToListStatus::CreatedNew(_) => Ok(SetStatus::CreatedNew),
+            InsertToListStatus::ExistingValue(v) => Ok(SetStatus::PrevValue(v)),
+            InsertToListStatus::DoesNotExist => unreachable!(),
+            InsertToListStatus::WrongValue(_) => unreachable!(),
         }
     }
 
@@ -581,11 +590,13 @@ impl CandyStore {
         list_key: &B1,
         item_key: &B2,
         val: &B3,
+        expected_val: Option<&B3>,
     ) -> Result<ReplaceStatus> {
         self.owned_replace_in_list(
             list_key.as_ref().to_owned(),
             item_key.as_ref().to_owned(),
             val.as_ref().to_owned(),
+            expected_val.map(|ev| ev.as_ref()),
         )
     }
 
@@ -595,16 +606,19 @@ impl CandyStore {
         list_key: Vec<u8>,
         item_key: Vec<u8>,
         val: Vec<u8>,
+        expected_val: Option<&[u8]>,
     ) -> Result<ReplaceStatus> {
         match self._insert_to_list(
             list_key,
             item_key,
             val,
-            InsertMode::Replace,
+            InsertMode::Replace(expected_val),
             InsertPosition::Tail,
         )? {
-            GetOrCreateStatus::CreatedNew(_) => Ok(ReplaceStatus::DoesNotExist),
-            GetOrCreateStatus::ExistingValue(v) => Ok(ReplaceStatus::PrevValue(v)),
+            InsertToListStatus::DoesNotExist => Ok(ReplaceStatus::DoesNotExist),
+            InsertToListStatus::ExistingValue(v) => Ok(ReplaceStatus::PrevValue(v)),
+            InsertToListStatus::WrongValue(v) => Ok(ReplaceStatus::WrongValue(v)),
+            InsertToListStatus::CreatedNew(_) => unreachable!(),
         }
     }
 
@@ -636,13 +650,18 @@ impl CandyStore {
         item_key: Vec<u8>,
         val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
-        self._insert_to_list(
+        match self._insert_to_list(
             list_key,
             item_key,
             val,
             InsertMode::GetOrCreate,
             InsertPosition::Tail,
-        )
+        )? {
+            InsertToListStatus::CreatedNew(v) => Ok(GetOrCreateStatus::CreatedNew(v)),
+            InsertToListStatus::ExistingValue(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
+            InsertToListStatus::DoesNotExist => unreachable!(),
+            InsertToListStatus::WrongValue(_) => unreachable!(),
+        }
     }
 
     ///
@@ -714,7 +733,7 @@ impl CandyStore {
         );
 
         // we surely have a next element
-        let Some((next_k, next_v)) = self._list_get(list_ph, chain.next)? else {
+        let Some((next_k, mut next_v)) = self._list_get(list_ph, chain.next)? else {
             corrupted_list!("failed getting next of {item_key:?}");
         };
 
@@ -722,25 +741,16 @@ impl CandyStore {
         // at the expected place. XXX: head.prev will not be INVALID, which might break asserts.
         // we will need to remove the asserts, or add find_true_head
         list.head = chain.next;
-        if !self
-            .modify_inplace_raw(&list_key, bytes_of(&list), 0, Some(&list_buf))?
-            .was_replaced()
+        if self
+            .replace_raw(&list_key, bytes_of(&list), Some(&list_buf))?
+            .failed()
         {
             corrupted_list!("failed updating list head to point to next");
         }
 
         // set the new head's prev link to INVALID. if we crash afterwards, everything is good.
-        let mut next_chain = chain_of(&next_v);
-        next_chain.prev = PartedHash::INVALID;
-        if !self
-            .modify_inplace_raw(
-                &next_k,
-                bytes_of(&next_chain),
-                next_v.len() - size_of::<Chain>(),
-                Some(&next_v[next_v.len() - size_of::<Chain>()..]),
-            )?
-            .was_replaced()
-        {
+        update_chain_prev(&mut next_v, PartedHash::INVALID);
+        if self.replace_raw(&next_k, &next_v, None)?.failed() {
             corrupted_list!("failed updating prev=INVALID on the now-first element");
         }
 
@@ -769,7 +779,7 @@ impl CandyStore {
             "last element must have a valid prev"
         );
 
-        let Some((prev_k, prev_v)) = self._list_get(list_ph, chain.prev)? else {
+        let Some((prev_k, mut prev_v)) = self._list_get(list_ph, chain.prev)? else {
             corrupted_list!("missing prev element {item_key:?}");
         };
 
@@ -777,7 +787,7 @@ impl CandyStore {
         // part of the list (find_true_tai will find it)
         list.tail = chain.prev;
         if !self
-            .modify_inplace_raw(&list_key, bytes_of(&list), 0, Some(&list_buf))?
+            .replace_raw(&list_key, bytes_of(&list), Some(&list_buf))?
             .was_replaced()
         {
             corrupted_list!("failed updating list tail to point to prev");
@@ -785,14 +795,10 @@ impl CandyStore {
 
         // update the new tail's next to INVALID. if we crash afterwards, the removed tail is no longer
         // considered part of the list
-        let mut prev_chain = chain_of(&prev_v);
-        prev_chain.next = PartedHash::INVALID;
-        self.modify_inplace_raw(
-            &prev_k,
-            bytes_of(&prev_chain),
-            prev_v.len() - size_of::<Chain>(),
-            Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
-        )?;
+        update_chain_next(&mut prev_v, PartedHash::INVALID);
+        if self.replace_raw(&prev_k, &prev_v, None)?.failed() {
+            corrupted_list!("failed updating next=INVALID on the now-last element");
+        }
 
         // finally remove the item, sealing the deal
         self.remove_raw(&item_key)?;
@@ -819,10 +825,10 @@ impl CandyStore {
             "a middle element must have a valid next"
         );
 
-        let Some((prev_k, prev_v)) = self._list_get(list_ph, chain.prev)? else {
+        let Some((prev_k, mut prev_v)) = self._list_get(list_ph, chain.prev)? else {
             corrupted_list!("missing prev element of {item_key:?}");
         };
-        let Some((next_k, next_v)) = self._list_get(list_ph, chain.next)? else {
+        let Some((next_k, mut next_v)) = self._list_get(list_ph, chain.next)? else {
             corrupted_list!("missing next element of {item_key:?}");
         };
 
@@ -830,36 +836,18 @@ impl CandyStore {
         // of the list, but will no longer appear in iterations.
         // note: we only do that if the previous item thinks that we're its next item, otherwise it means
         // we crashed in the middle of such an operation before
-        let mut prev_chain = chain_of(&prev_v);
-        if prev_chain.next == item_ph {
-            prev_chain.next = chain.next;
-            if !self
-                .modify_inplace_raw(
-                    &prev_k,
-                    bytes_of(&prev_chain),
-                    prev_v.len() - size_of::<Chain>(),
-                    Some(&prev_v[prev_v.len() - size_of::<Chain>()..]),
-                )?
-                .was_replaced()
-            {
+        if chain_of(&prev_v).next == item_ph {
+            update_chain_next(&mut prev_v, chain.next);
+            if self.replace_raw(&prev_k, &prev_v, None)?.failed() {
                 corrupted_list!("failed updating prev.next on {prev_k:?}");
             }
         }
 
         // disconnect the item from its next. if we crash afterwards, the item is truly no longer linked to the
         // list, so everything's good
-        let mut next_chain = chain_of(&next_v);
-        if next_chain.prev == item_ph {
-            next_chain.prev = chain.prev;
-            if !self
-                .modify_inplace_raw(
-                    &next_k,
-                    bytes_of(&next_chain),
-                    next_v.len() - size_of::<Chain>(),
-                    Some(&next_v[next_v.len() - size_of::<Chain>()..]),
-                )?
-                .was_replaced()
-            {
+        if chain_of(&next_v).prev == item_ph {
+            update_chain_prev(&mut next_v, chain.prev);
+            if self.replace_raw(&next_k, &next_v, None)?.failed() {
                 corrupted_list!("failed updating next.prev on {next_k:?}");
             }
         }
@@ -1106,8 +1094,8 @@ impl CandyStore {
             InsertMode::GetOrCreate,
             InsertPosition::Tail,
         )?;
-        if !status.was_created() {
-            corrupted_list!("uuid collision {uuid}");
+        if !matches!(status, InsertToListStatus::CreatedNew(_)) {
+            corrupted_list!("uuid collision {uuid} {status:?}");
         }
         Ok(uuid)
     }
@@ -1141,8 +1129,8 @@ impl CandyStore {
             InsertMode::GetOrCreate,
             InsertPosition::Head,
         )?;
-        if !status.was_created() {
-            corrupted_list!("uuid collision {uuid}");
+        if !matches!(status, InsertToListStatus::CreatedNew(_)) {
+            corrupted_list!("uuid collision {uuid} {status:?}");
         }
         Ok(uuid)
     }
