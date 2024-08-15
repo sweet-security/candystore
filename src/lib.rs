@@ -50,6 +50,8 @@
 mod encodable;
 mod hashing;
 mod insertion;
+mod list_insert;
+mod list_remove;
 mod lists;
 mod shard;
 mod store;
@@ -60,6 +62,9 @@ pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
 use std::fmt::{Display, Formatter};
 pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
+
+#[cfg(feature = "whitebox_testing")]
+pub use hashing::HASH_BITS_TO_KEEP;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CandyError {
@@ -72,7 +77,6 @@ pub enum CandyError {
     SplitFailed(String),
     LoadingFailed(String),
     CorruptedLinkedList(String),
-    DuplicateHashInList(Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl Display for CandyError {
@@ -89,10 +93,6 @@ impl Display for CandyError {
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
             Self::SplitFailed(s) => write!(f, "shard split failed: {s}"),
-            Self::DuplicateHashInList(list, origk, newk) => write!(
-                f,
-                "list {list:?} has an existing key {origk:?} that hashes the same as {newk:?}"
-            ),
         }
     }
 }

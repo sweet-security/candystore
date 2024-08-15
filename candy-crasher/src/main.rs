@@ -1,6 +1,6 @@
 use std::ptr::null_mut;
 use std::time::Duration;
-use std::{ops::Range, sync::atomic::AtomicU64};
+use std::{ops::Range, sync::atomic::AtomicU64, sync::atomic::Ordering::SeqCst};
 
 use candystore::{CandyStore, Config, Result};
 use rand::Rng;
@@ -152,9 +152,7 @@ fn parent_run(
         if pid == 0 {
             let res = child_func();
             if res.is_err() {
-                shared_stuff
-                    .failed
-                    .store(1, std::sync::atomic::Ordering::SeqCst);
+                shared_stuff.failed.store(1, SeqCst);
             }
             res.unwrap();
             unsafe { libc::exit(0) };
@@ -166,25 +164,23 @@ fn parent_run(
             let mut status = 0i32;
             let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
             if rc == 0 {
+                if shared_stuff.failed.load(SeqCst) != 0 {
+                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    panic!("child crashed at iteration {i}");
+                }
+
                 println!("[{i}] killing child");
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                     libc::wait(&mut status);
                 };
-                if shared_stuff
-                    .failed
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    != 0
-                {
+                if shared_stuff.failed.load(SeqCst) != 0 {
                     panic!("child crashed at iteration {i}");
                 }
             } else {
                 assert!(rc > 0);
                 if (!libc::WIFSIGNALED(status) && libc::WEXITSTATUS(status) != 0)
-                    || shared_stuff
-                        .failed
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                        != 0
+                    || shared_stuff.failed.load(SeqCst) != 0
                 {
                     panic!("child crashed at iteration {i}");
                 }
@@ -217,6 +213,15 @@ fn main() -> Result<()> {
     assert_ne!(map_addr, libc::MAP_FAILED);
 
     let shared_stuff = unsafe { &*(map_addr as *const SharedStuff) };
+
+    // let store = CandyStore::open(
+    //     "dbdir",
+    //     Config {
+    //         expected_number_of_keys: 1_000_000,
+    //         ..Default::default()
+    //     },
+    // )?;
+    // drop(store);
 
     parent_run(shared_stuff, child_inserts, 10..300)?;
 
@@ -288,6 +293,8 @@ fn main() -> Result<()> {
         );
 
         assert_eq!(store.iter_list("xxx").count(), 0);
+
+        assert_eq!(store.iter_raw().count(), 0);
 
         println!("DB validated successfully");
     }

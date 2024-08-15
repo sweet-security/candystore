@@ -29,7 +29,22 @@ use bytemuck::{Pod, Zeroable};
 #[repr(transparent)]
 pub(crate) struct PartedHash(u64);
 
+impl std::fmt::Display for PartedHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:04x}.{:04x}.{:08x}",
+            self.shard_selector(),
+            self.row_selector(),
+            self.signature()
+        )
+    }
+}
+
 pub(crate) const INVALID_SIG: u32 = 0;
+
+#[cfg(feature = "whitebox_testing")]
+pub static mut HASH_BITS_TO_KEEP: u64 = u64::MAX; // which bits to keep from the hash - for testing collisions
 
 impl PartedHash {
     pub const LEN: usize = size_of::<u64>();
@@ -40,13 +55,24 @@ impl PartedHash {
     }
 
     #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.signature() != INVALID_SIG
+    }
+    #[inline]
+    pub fn is_invalid(&self) -> bool {
+        self.signature() == INVALID_SIG
+    }
+
+    #[inline]
     pub fn shard_selector(&self) -> u16 {
         (self.0 >> 48) as u16
     }
+
     #[inline]
     pub fn row_selector(&self) -> u16 {
         (self.0 >> 32) as u16
     }
+
     #[inline]
     pub fn signature(&self) -> u32 {
         self.0 as u32
@@ -65,15 +91,11 @@ impl PartedHash {
         }
         let shard = h.h1 & 0xffff_0000_0000_0000;
         let row = h.h1 & 0x0000_ffff_0000_0000;
-        Self(shard | row | sig as u64)
-    }
+        let val = shard | row | (sig as u64);
 
-    #[cfg(test)]
-    fn to_u64(&self) -> u64 {
-        self.0
-    }
-    #[cfg(test)]
-    fn from_u64(val: u64) -> Self {
+        #[cfg(feature = "whitebox_testing")]
+        let val = (val & unsafe { HASH_BITS_TO_KEEP }) | 1 /* make sure sig != 0 */;
+
         Self(val)
     }
 }
@@ -87,11 +109,11 @@ fn test_parted_hash() -> Result<()> {
     let seed = HashSeed::new("aaaabbbbccccdddd")?;
 
     let h1 = PartedHash::new(&seed, b"hello world");
-    assert_eq!(h1.to_u64(), 13445180190757400308,);
-    let h2 = PartedHash::from_u64(13445180190757400308);
+    assert_eq!(h1.0, 13445180190757400308,);
+    let h2 = PartedHash(13445180190757400308);
     assert_eq!(PartedHash::new(&seed, b"hello world"), h2);
 
-    let h3 = PartedHash::from_u64(0x1020304050607080);
+    let h3 = PartedHash(0x1020304050607080);
     assert_eq!(
         bytes_of(&h3),
         [0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10]

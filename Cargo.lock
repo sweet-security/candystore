@@ -332,6 +332,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-list-collision"
+version = "0.1.0"
+dependencies = [
+ "candystore",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -184,15 +184,17 @@ pub struct CandyStoreIterator<'a> {
     shard_idx: u32,
     row_idx: usize,
     entry_idx: usize,
+    raw: bool,
 }
 
 impl<'a> CandyStoreIterator<'a> {
-    fn new(db: &'a CandyStore) -> Self {
+    fn new(db: &'a CandyStore, raw: bool) -> Self {
         Self {
             db,
             shard_idx: 0,
             row_idx: 0,
             entry_idx: 0,
+            raw,
         }
     }
 
@@ -205,12 +207,13 @@ impl<'a> CandyStoreIterator<'a> {
     }
 
     // Constructs an iterator starting at the given cookie
-    pub fn from_cookie(db: &'a CandyStore, cookie: u64) -> Self {
+    pub fn from_cookie(db: &'a CandyStore, cookie: u64, raw: bool) -> Self {
         Self {
             db,
             shard_idx: ((cookie >> 32) & 0xffff) as u32,
             row_idx: ((cookie >> 16) & 0xffff) as usize,
             entry_idx: (cookie & 0xffff) as usize,
+            raw,
         }
     }
 }
@@ -241,6 +244,9 @@ impl<'a> Iterator for CandyStoreIterator<'a> {
                 if let Some(res) = kvres {
                     match res {
                         Ok((mut k, v)) => {
+                            if self.raw {
+                                return Some(Ok((k, v)));
+                            }
                             // filter anything other than USER_NAMESPACE
                             if k.ends_with(USER_NAMESPACE) {
                                 k.truncate(k.len() - USER_NAMESPACE.len());
@@ -470,7 +476,7 @@ impl CandyStore {
     }
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<Result<KVPair>>> {
-        debug_assert_ne!(ph, PartedHash::INVALID);
+        debug_assert!(ph.is_valid());
         Ok(self
             .shards
             .read()
@@ -590,11 +596,15 @@ impl CandyStore {
 
     /// Returns an iterator over the whole store (skipping linked lists or typed items)
     pub fn iter(&self) -> CandyStoreIterator {
-        CandyStoreIterator::new(self)
+        CandyStoreIterator::new(self, false)
+    }
+
+    pub fn iter_raw(&self) -> CandyStoreIterator {
+        CandyStoreIterator::new(self, true)
     }
 
     /// Returns an iterator starting from the specified cookie (obtained via [CandyStoreIterator::cookie])
     pub fn iter_from_cookie(&self, cookie: u64) -> CandyStoreIterator {
-        CandyStoreIterator::from_cookie(self, cookie)
+        CandyStoreIterator::from_cookie(self, cookie, false)
     }
 }

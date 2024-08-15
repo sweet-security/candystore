@@ -1,0 +1,7 @@
+[package]
+name = "test-list-collision"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candystore={path="..", features=["whitebox_testing"]}
