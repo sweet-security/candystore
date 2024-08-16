@@ -36,3 +36,5 @@ jobs:
       run: cargo -Z unstable-options -C candy-longliving run --release -- 10 40001 10000
     - name: Run mini-candy
       run: cargo -Z unstable-options -C mini-candy run
+    - name: Run test-list-collisions
+      run: cargo -Z unstable-options -C test-list-collisions run --release

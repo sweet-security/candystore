@@ -7,24 +7,24 @@ fn main() -> Result<()> {
     // force many elements to end up with the same PartedHash
     unsafe { HASH_BITS_TO_KEEP = 0xf000_000f_0000_00ff };
 
-    for i in 0u32..10000 {
+    for i in 0u32..100_000 {
         //println!("push {i}");
         db.push_to_list_tail("xxx", &i.to_le_bytes())?;
     }
 
-    for i in 0u32..10000 {
+    for i in 0u32..100_000 {
         //println!("pop {i}");
         assert_eq!(db.pop_list_head("xxx")?.unwrap().1, &i.to_le_bytes());
     }
 
     assert!(db.pop_list_head("xxx")?.is_none());
 
-    for i in 0u32..10000 {
+    for i in 0u32..100_000 {
         //println!("push {i}");
         db.push_to_list_head("xxx", &i.to_le_bytes())?;
     }
 
-    for i in 0u32..10000 {
+    for i in 0u32..100_000 {
         //println!("pop {i}");
         assert_eq!(db.pop_list_tail("xxx")?.unwrap().1, &i.to_le_bytes());
     }
