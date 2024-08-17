@@ -20,7 +20,7 @@ impl CandyStore {
         item_key: &[u8],
     ) -> Result<()> {
         let Some((next_k, mut next_v)) = self._list_get(list_ph, chain.full_next())? else {
-            corrupted_list!("list {list_ph:?} failed getting next of {item_key:?}");
+            corrupted_list!("list {list_ph} failed getting next of {item_key:?}");
         };
 
         // update list.head from this to this.next. if we crash afterwards, the list will start
@@ -37,7 +37,7 @@ impl CandyStore {
         update_chain_prev(&mut next_v, FullPartedHash::INVALID);
         if self.replace_raw(&next_k, &next_v, None)?.failed() {
             corrupted_list!(
-                "list {list_ph:?} failed updating prev=INVALID on the now-first element"
+                "list {list_ph} failed updating prev=INVALID on the now-first {next_k:?} element"
             );
         }
 
@@ -55,25 +55,30 @@ impl CandyStore {
         item_key: &[u8],
     ) -> Result<()> {
         let Some((prev_k, mut prev_v)) = self._list_get(list_ph, chain.full_prev())? else {
-            corrupted_list!("list {list_ph:?} missing prev element {item_key:?}");
+            corrupted_list!("list {list_ph} missing prev element {item_key:?}");
         };
 
         // point list.tail to the prev item. if we crash afterwards, the removed tail is still considered
-        // part of the list (find_true_tai will find it)
+        // part of the list (find_true_tail will find it)
         list.set_full_tail(chain.full_prev());
         if !self
             .replace_raw(list_key, bytes_of(&list), None)?
             .was_replaced()
         {
-            corrupted_list!("failed updating list tail to point to prev");
+            corrupted_list!(
+                "failed updating list {list_ph} tail to point to prev {}",
+                chain.full_prev()
+            );
         }
+
+        // XXX clear the item's chain so we can scrub it later?
 
         // update the new tail's next to INVALID. if we crash afterwards, the removed tail is no longer
         // considered part of the list
         update_chain_next(&mut prev_v, FullPartedHash::INVALID);
         if self.replace_raw(&prev_k, &prev_v, None)?.failed() {
             corrupted_list!(
-                "list {list_ph:?} failed updating next=INVALID on the now-last element"
+                "list {list_ph} failed updating next=INVALID on the now-last {prev_k:?} element"
             );
         }
 
@@ -99,7 +104,7 @@ impl CandyStore {
                 if chain_of(&prev_v).full_next() == item_fph {
                     update_chain_next(&mut prev_v, chain.full_next());
                     if self.replace_raw(&prev_k, &prev_v, None)?.failed() {
-                        corrupted_list!("list {list_ph:?} failed updating prev.next on {prev_k:?}");
+                        corrupted_list!("list {list_ph} failed updating prev.next on {prev_k:?}");
                     }
                 }
             }
@@ -110,7 +115,7 @@ impl CandyStore {
                 if chain_of(&next_v).full_prev() == item_fph {
                     update_chain_prev(&mut next_v, chain.full_prev());
                     if self.replace_raw(&next_k, &next_v, None)?.failed() {
-                        corrupted_list!("list {list_ph:?} failed updating next.prev on {next_k:?}");
+                        corrupted_list!("list {list_ph} failed updating next.prev on {next_k:?}");
                     }
                 }
             }
@@ -139,14 +144,19 @@ impl CandyStore {
         chain: Chain,
     ) -> Result<()> {
         // because of the crash model, it's possible list.head and list.tail are not up to date.
+        // it's also possible that we'll leak some entries if we crash mid-operation, i.e., an item
+        // might have been unlinked from its prev or next, but still exists on its own.
+        // XXX: maybe background compaction can check for leaks and remove them?
+
         let mut head_fph = list.full_head();
-        let mut tail_fph = list.full_tail();
         if item_fph == head_fph && chain.full_prev().is_valid() {
-            let (true_head_fph, _, _) = self.find_true_head(list_ph, list.full_head())?;
+            let (true_head_fph, _, _) = self.find_true_head(list_ph, head_fph)?;
             head_fph = true_head_fph;
         }
+
+        let mut tail_fph = list.full_tail();
         if item_fph == tail_fph && chain.full_next().is_valid() {
-            let (true_tail_fph, _, _) = self.find_true_tail(list_ph, list.full_tail())?;
+            let (true_tail_fph, _, _) = self.find_true_tail(list_ph, tail_fph)?;
             tail_fph = true_tail_fph;
         }
 

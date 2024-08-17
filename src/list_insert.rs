@@ -1,6 +1,7 @@
 use bytemuck::{bytes_of, from_bytes};
 use databuf::config::num::LE;
 use databuf::Encode;
+use rand::Rng;
 use uuid::Uuid;
 
 use crate::encodable::EncodableUuid;
@@ -72,10 +73,12 @@ impl CandyStore {
         let item_fph = FullPartedHash::new(item_ph, item_collidx);
 
         // item does not exist, and the list itself might also not exist. get or create the list
-        let curr_list = LinkedList::new(item_fph, item_fph);
         let curr_list = *from_bytes::<LinkedList>(
             &self
-                .get_or_create_raw(&list_key, bytes_of(&curr_list).to_vec())?
+                .get_or_create_raw(
+                    &list_key,
+                    bytes_of(&LinkedList::new(item_fph, item_fph)).to_vec(),
+                )?
                 .value(),
         );
 
@@ -100,8 +103,6 @@ impl CandyStore {
             val.truncate(val.len() - size_of::<Chain>());
             return Ok(InsertToListStatus::CreatedNew(val));
         }
-
-        //self.fixup_true_ends(list_ph, curr_list)?;
 
         let v =
             match pos {
@@ -131,7 +132,7 @@ impl CandyStore {
         // find_true_head will stop at this item
         update_chain_prev(&mut head_v, item_fph);
         if self.replace_raw(&head_k, &head_v, None)?.failed() {
-            corrupted_list!("list {list_ph:?} failed to point {head_k:?}->prev to {item_key:?}");
+            corrupted_list!("list {list_ph} failed to point {head_k:?}->prev to {item_key:?}");
         }
 
         // now add item, with prev pointing to the old head. if we crash after this, find_head_tail
@@ -141,13 +142,13 @@ impl CandyStore {
         let this_chain = Chain::new(item_fph.collidx, head_fph, FullPartedHash::INVALID);
         val.extend_from_slice(bytes_of(&this_chain));
         if !self.set_raw(&item_key, &val)?.was_created() {
-            corrupted_list!("list {list_ph:?} tail {item_key:?} already exists");
+            corrupted_list!("list {list_ph} tail {item_key:?} already exists");
         }
 
         // now update the list to point to the new tail. if we crash before it's committed, all's good
         let new_list = LinkedList::new(item_fph, curr_list.full_tail());
         if self
-            .replace_raw(&list_key, bytes_of(&new_list), Some(bytes_of(&curr_list)))?
+            .replace_raw(&list_key, bytes_of(&new_list), None)?
             .failed()
         {
             corrupted_list!("list {item_fph} failed to point head to {item_key:?}");
@@ -175,7 +176,7 @@ impl CandyStore {
         update_chain_next(&mut tail_v, item_fph);
 
         if self.replace_raw(&tail_k, &tail_v, None)?.failed() {
-            corrupted_list!("list {list_ph:?} failed to point {tail_k:?}->next to {item_key:?}");
+            corrupted_list!("list {list_ph} failed to point {tail_k:?}->next to {item_key:?}");
         }
 
         // now add item, with prev pointing to the old tail. if we crash after this, find_true_tail
@@ -185,17 +186,16 @@ impl CandyStore {
         let this_chain = Chain::new(item_fph.collidx, FullPartedHash::INVALID, tail_fph);
         val.extend_from_slice(bytes_of(&this_chain));
         if self.set_raw(&item_key, &val)?.was_replaced() {
-            corrupted_list!("list {list_ph:?} tail {item_key:?} already exists");
+            corrupted_list!("list {list_ph} tail {item_key:?} already exists");
         }
 
         // now update the list to point to the new tail. if we crash before it's committed, all's good
-        let mut new_list = curr_list.clone();
-        new_list.set_full_tail(item_fph);
+        let new_list = LinkedList::new(curr_list.full_head(), item_fph);
         if self
-            .replace_raw(&list_key, bytes_of(&new_list), Some(bytes_of(&curr_list)))?
+            .replace_raw(&list_key, bytes_of(&new_list), None)?
             .failed()
         {
-            corrupted_list!("list {list_ph:?} failed to point tail to {item_key:?}");
+            corrupted_list!("list {list_ph} failed to point tail to {item_key:?}");
         }
 
         val.truncate(val.len() - size_of::<Chain>());
@@ -234,7 +234,7 @@ impl CandyStore {
     /// This allows for the implementation of LRUs, where older items stay at the beginning and more
     /// recent ones are at the end.
     ///
-    /// Note: this operation is not crash-safe, as it removes and inserts the item.
+    /// Note: this operation is **not crash-safe**, as it removes and inserts the item.
     ///
     /// See also [Self::set], [Self::set_in_list]
     pub fn set_in_list_promoting<
@@ -380,24 +380,35 @@ impl CandyStore {
         self.owned_push_to_list_tail(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
+    fn _owned_push_to_list(
+        &self,
+        list_key: Vec<u8>,
+        val: Vec<u8>,
+        pos: InsertPosition,
+    ) -> Result<EncodableUuid> {
+        // this rng does not produce "well formed UUID" like UUIDv4, but this is faster (because it doesn't
+        // use the OS rng) and produces 128 bits of entropy rather than 122 in UUIDv4
+        let uuid = EncodableUuid::from(Uuid::from_bytes(rand::thread_rng().gen()));
+        let status = self._insert_to_list(
+            list_key,
+            uuid.to_bytes::<LE>(),
+            val,
+            InsertMode::GetOrCreate,
+            pos,
+        )?;
+        if !matches!(status, InsertToListStatus::CreatedNew(_)) {
+            corrupted_list!("list uuid collision {uuid} {status:?}");
+        }
+        Ok(uuid)
+    }
+
     /// Owned version of [Self::push_to_list]
     pub fn owned_push_to_list_tail(
         &self,
         list_key: Vec<u8>,
         val: Vec<u8>,
     ) -> Result<EncodableUuid> {
-        let uuid = EncodableUuid::from(Uuid::new_v4());
-        let status = self._insert_to_list(
-            list_key,
-            uuid.to_bytes::<LE>(),
-            val,
-            InsertMode::GetOrCreate,
-            InsertPosition::Tail,
-        )?;
-        if !matches!(status, InsertToListStatus::CreatedNew(_)) {
-            corrupted_list!("list uuid collision {uuid} {status:?}");
-        }
-        Ok(uuid)
+        self._owned_push_to_list(list_key, val, InsertPosition::Tail)
     }
 
     /// In case you only want to store values in a list (the keys are immaterial), this function
@@ -421,17 +432,6 @@ impl CandyStore {
         list_key: Vec<u8>,
         val: Vec<u8>,
     ) -> Result<EncodableUuid> {
-        let uuid = EncodableUuid::from(Uuid::new_v4());
-        let status = self._insert_to_list(
-            list_key,
-            uuid.to_bytes::<LE>(),
-            val,
-            InsertMode::GetOrCreate,
-            InsertPosition::Head,
-        )?;
-        if !matches!(status, InsertToListStatus::CreatedNew(_)) {
-            corrupted_list!("uuid collision {uuid} {status:?}");
-        }
-        Ok(uuid)
+        self._owned_push_to_list(list_key, val, InsertPosition::Head)
     }
 }

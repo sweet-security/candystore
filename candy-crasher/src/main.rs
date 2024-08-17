@@ -141,6 +141,34 @@ fn child_list_removals() -> Result<()> {
     Ok(())
 }
 
+fn child_list_iterator_removals() -> Result<()> {
+    let store = CandyStore::open("dbdir", Config::default())?;
+
+    if rand::thread_rng().gen() {
+        for (i, res) in store.iter_list("xxx").enumerate() {
+            let (k, v) = res?.unwrap();
+            let v2 = u32::from_le_bytes(v.try_into().unwrap());
+            if i == 0 {
+                println!("FWD child starts at {v2}");
+            }
+            store.remove_from_list("xxx", &k)?;
+        }
+    } else {
+        for (i, res) in store.iter_list_backwards("xxx").enumerate() {
+            let (k, v) = res?.unwrap();
+            let v2 = u32::from_le_bytes(v.try_into().unwrap());
+            if i == 0 {
+                println!("BACK child starts at {v2}");
+            }
+            store.remove_from_list("xxx", &k)?;
+        }
+    }
+
+    println!("child finished");
+
+    Ok(())
+}
+
 fn parent_run(
     shared_stuff: &SharedStuff,
     mut child_func: impl FnMut() -> Result<()>,
@@ -295,6 +323,44 @@ fn main() -> Result<()> {
         assert_eq!(store.iter_list("xxx").count(), 0);
 
         assert_eq!(store.iter_raw().count(), 0);
+
+        println!("DB validated successfully");
+    }
+
+    {
+        println!("Parent creates 1M members in a list...");
+
+        let store = CandyStore::open(
+            "dbdir",
+            Config {
+                expected_number_of_keys: 1_000_000,
+                ..Default::default()
+            },
+        )?;
+        let t0 = std::time::Instant::now();
+        for i in 0u32..1_000_000 {
+            if i % 65536 == 0 {
+                println!("{i}");
+            }
+            store.push_to_list_tail("xxx", &i.to_le_bytes())?;
+        }
+        println!(
+            "{}us",
+            std::time::Instant::now().duration_since(t0).as_micros()
+        );
+    }
+
+    parent_run(shared_stuff, child_list_iterator_removals, 10..30)?;
+
+    {
+        println!("Parent starts validating the DB...");
+
+        let store = CandyStore::open("dbdir", Config::default())?;
+
+        assert_eq!(store.iter_list("xxx").count(), 0);
+
+        // we will surely leak some entries that were unlinked from the list before they were removed
+        println!("leaked: {}", store.iter_raw().count());
 
         println!("DB validated successfully");
     }

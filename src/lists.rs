@@ -20,6 +20,8 @@ pub(crate) struct LinkedList {
 
 impl LinkedList {
     pub fn new(head: FullPartedHash, tail: FullPartedHash) -> Self {
+        assert!(head.is_valid(), "creating a list with an invalid head");
+        assert!(tail.is_valid(), "creating a list with an invalid tail");
         Self {
             _head: head.ph,
             _head_collidx: head.collidx,
