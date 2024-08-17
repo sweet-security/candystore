@@ -138,6 +138,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
     type Item = Result<Option<KVPair>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.fph.is_none() {
+            let _guard = self.store._list_lock(self.list_ph);
             let buf = match self.store.get_raw(&self.list_key) {
                 Ok(buf) => buf,
                 Err(e) => return Some(Err(e)),
@@ -193,6 +194,7 @@ impl<'a> Iterator for RevLinkedListIterator<'a> {
     type Item = Result<Option<KVPair>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.fph.is_none() {
+            let _guard = self.store._list_lock(self.list_ph);
             let buf = match self.store.get_raw(&self.list_key) {
                 Ok(buf) => buf,
                 Err(e) => return Some(Err(e)),
