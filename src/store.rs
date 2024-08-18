@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
+use fslock::LockFile;
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::BTreeMap,
@@ -24,6 +25,7 @@ pub(crate) const USER_NAMESPACE: &[u8] = &[1];
 pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
 pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
+pub(crate) const CHAIN_NAMESPACE: u8 = 5;
 
 /// Stats from CandyStore
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -174,6 +176,7 @@ pub struct CandyStore {
     // locks for complicated operations
     pub(crate) keyed_locks_mask: u32,
     pub(crate) keyed_locks: Vec<Mutex<()>>,
+    _lockfile: LockFile,
 }
 
 /// An iterator over a CandyStore. Note that it's safe to modify (insert/delete) keys while iterating,
@@ -279,6 +282,12 @@ impl CandyStore {
         let dir_path: PathBuf = dir_path.as_ref().into();
 
         std::fs::create_dir_all(&dir_path)?;
+        let lockfilename = dir_path.join(".lock");
+        let mut lockfile = fslock::LockFile::open(&lockfilename)?;
+        if !lockfile.try_lock_with_pid()? {
+            bail!("Failed to lock {lockfilename:?}");
+        }
+
         Self::load_existing_dir(&dir_path, &config, &mut shards)?;
         if shards.is_empty() {
             Self::create_first_shards(&dir_path, &config, &mut shards)?;
@@ -303,6 +312,7 @@ impl CandyStore {
             num_splits: Default::default(),
             keyed_locks_mask: num_keyed_locks - 1,
             keyed_locks,
+            _lockfile: lockfile,
         })
     }
 

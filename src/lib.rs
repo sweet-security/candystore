@@ -38,7 +38,7 @@
 //!     db.set_in_list("spanish", "bye", "adios")?;
 //!     db.set_in_list("spanish", "thanks", "gracias")?;
 //!
-//!     let items = db.iter_list("spanish").map(|res| res.unwrap().unwrap()).collect::<Vec<_>>();
+//!     let items = db.iter_list("spanish").map(|res| res.unwrap()).collect::<Vec<_>>();
 //!     assert_eq!(items, vec![("bye".into(), "adios".into()), ("thanks".into(), "gracias".into())]);
 //!
 //!     Ok(())
@@ -50,8 +50,6 @@
 mod encodable;
 mod hashing;
 mod insertion;
-mod list_insert;
-mod list_remove;
 mod lists;
 mod shard;
 mod store;
@@ -59,6 +57,7 @@ mod typed;
 
 pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
+pub use lists::{LinkedListIterator, ListCompactionParams};
 use std::fmt::{Display, Formatter};
 pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};

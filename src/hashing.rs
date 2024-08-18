@@ -47,9 +47,6 @@ pub(crate) const INVALID_SIG: u32 = 0;
 pub static mut HASH_BITS_TO_KEEP: u64 = u64::MAX; // which bits to keep from the hash - for testing collisions
 
 impl PartedHash {
-    pub const LEN: usize = size_of::<u64>();
-    pub const INVALID: Self = Self(0);
-
     pub fn new(seed: &HashSeed, buf: &[u8]) -> Self {
         Self::from_hash(SipHasher24::new_with_key(&seed.0).hash(buf))
     }
@@ -57,10 +54,6 @@ impl PartedHash {
     #[inline]
     pub fn is_valid(&self) -> bool {
         self.signature() != INVALID_SIG
-    }
-    #[inline]
-    pub fn is_invalid(&self) -> bool {
-        self.signature() == INVALID_SIG
     }
 
     #[inline]

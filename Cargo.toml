@@ -17,6 +17,7 @@ anyhow = "1.0.86"
 parking_lot = "0.12.3"
 uuid = { version = "1.10.0" }
 rand = "0.8.5"
+fslock = "0.2.1"
 
 [features]
 whitebox_testing = []

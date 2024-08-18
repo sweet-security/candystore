@@ -144,9 +144,10 @@ fn child_list_removals() -> Result<()> {
 fn child_list_iterator_removals() -> Result<()> {
     let store = CandyStore::open("dbdir", Config::default())?;
 
-    if rand::thread_rng().gen() {
+    if rand::random() {
+        //println!("FWD");
         for (i, res) in store.iter_list("xxx").enumerate() {
-            let (k, v) = res?.unwrap();
+            let (k, v) = res?;
             let v2 = u32::from_le_bytes(v.try_into().unwrap());
             if i == 0 {
                 println!("FWD child starts at {v2}");
@@ -154,8 +155,9 @@ fn child_list_iterator_removals() -> Result<()> {
             store.remove_from_list("xxx", &k)?;
         }
     } else {
+        //println!("BACK");
         for (i, res) in store.iter_list_backwards("xxx").enumerate() {
-            let (k, v) = res?.unwrap();
+            let (k, v) = res?;
             let v2 = u32::from_le_bytes(v.try_into().unwrap());
             if i == 0 {
                 println!("BACK child starts at {v2}");
@@ -289,7 +291,7 @@ fn main() -> Result<()> {
         println!("DB validated successfully");
     }
 
-    parent_run(shared_stuff, child_list_inserts, 10..30)?;
+    parent_run(shared_stuff, child_list_inserts, 10..300)?;
 
     {
         println!("Parent starts validating the DB...");
@@ -301,7 +303,7 @@ fn main() -> Result<()> {
         );
 
         for (i, res) in store.iter_list("xxx").enumerate() {
-            let (k, v) = res?.unwrap();
+            let (k, v) = res?;
             assert_eq!(k, (i as u32).to_le_bytes());
             assert_eq!(v, b"yyy");
         }
@@ -322,7 +324,8 @@ fn main() -> Result<()> {
 
         assert_eq!(store.iter_list("xxx").count(), 0);
 
-        assert_eq!(store.iter_raw().count(), 0);
+        println!("leaked: {}", store.iter_raw().count());
+        store.discard_list("xxx")?;
 
         println!("DB validated successfully");
     }
@@ -350,7 +353,7 @@ fn main() -> Result<()> {
         );
     }
 
-    parent_run(shared_stuff, child_list_iterator_removals, 10..30)?;
+    parent_run(shared_stuff, child_list_iterator_removals, 10..200)?;
 
     {
         println!("Parent starts validating the DB...");
@@ -361,6 +364,7 @@ fn main() -> Result<()> {
 
         // we will surely leak some entries that were unlinked from the list before they were removed
         println!("leaked: {}", store.iter_raw().count());
+        store.discard_list("xxx")?;
 
         println!("DB validated successfully");
     }

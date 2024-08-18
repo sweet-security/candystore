@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     db.set_in_list("europe", "greece", "greek")?;
 
     for res in db.iter_list("asia") {
-        let (k, v) = res?.unwrap();
+        let (k, v) = res?;
         println!(
             "{} => {}",
             String::from_utf8(k).unwrap(),

@@ -402,8 +402,7 @@ where
         let list_key = Self::make_list_key(list_key);
         self.store.owned_iter_list(list_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok(None) => Ok(None),
-            Ok(Some((k, v))) => {
+            Ok((k, v)) => {
                 let key = from_bytes::<K>(&k)?;
                 let val = from_bytes::<V>(&v)?;
                 Ok(Some((key, val)))
@@ -424,8 +423,7 @@ where
             .owned_iter_list_backwards(list_key)
             .map(|res| match res {
                 Err(e) => Err(e),
-                Ok(None) => Ok(None),
-                Ok(Some((k, v))) => {
+                Ok((k, v)) => {
                     let key = from_bytes::<K>(&k)?;
                     let val = from_bytes::<V>(&v)?;
                     Ok(Some((key, val)))

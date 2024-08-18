@@ -1,4 +1,7 @@
-use std::sync::{atomic::AtomicU64, Arc};
+use std::{
+    sync::{atomic::AtomicU64, Arc},
+    time::Instant,
+};
 
 use candystore::{CandyStore, CandyTypedList, Config, Result};
 
@@ -26,14 +29,23 @@ fn main() -> Result<()> {
         let h = std::thread::spawn(move || {
             println!("started thread {thd}");
             let typed = CandyTypedList::<String, usize, String>::new(db.clone());
+            let listname = format!("mylist"); //format!("mylist{thd}");
+            let mut t0 = Instant::now();
             for i in 0..num_iters {
                 if i % 10000 == 0 {
-                    println!("thread {thd} at {i} {:?}", db.stats());
+                    let t1 = Instant::now();
+                    println!(
+                        "thread {thd} at {i} {:?} rate={}us",
+                        db.stats(),
+                        t1.duration_since(t0).as_micros() / 10_000,
+                    );
+                    t0 = t1;
                 }
-                typed.set("mylist".into(), &(thd * num_iters + i), "xxx")?;
+
+                typed.set(&listname, &(thd * num_iters + i), "xxx")?;
                 ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= tail_length {
-                    typed.remove("mylist".into(), &(thd * num_iters + i - tail_length))?;
+                    typed.remove(&listname, &(thd * num_iters + i - tail_length))?;
                     ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
