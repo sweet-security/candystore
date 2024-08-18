@@ -341,7 +341,9 @@ impl CandyStore {
                 last_valid = Some((curr, k, v));
                 curr = chain.full_next();
 
-                assert!(curr != fph, "loop detected");
+                if curr == fph {
+                    corrupted_list!("list {list_ph} loop detected {curr} (find_true_tail)");
+                }
             } else if let Some(last_valid) = last_valid {
                 // last_valid is the true tail
                 assert_ne!(curr, fph);
@@ -371,7 +373,10 @@ impl CandyStore {
                 }
                 last_valid = Some((curr, k, v));
                 curr = chain.full_prev();
-                assert!(curr != fph, "loop detected");
+
+                if curr == fph {
+                    corrupted_list!("list {list_ph} loop detected {curr} (find_true_head)");
+                }
             } else if let Some(last_valid) = last_valid {
                 // last_valid is the true head
                 assert_ne!(curr, fph);
