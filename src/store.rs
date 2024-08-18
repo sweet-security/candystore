@@ -91,7 +91,7 @@ pub struct CoarseHistogram {
     pub under4k: usize,
     pub under16k: usize,
     pub under32k: usize,
-    pub xlarge: usize,
+    pub over32k: usize,
 }
 
 impl SizeHistogram {
@@ -115,7 +115,7 @@ impl SizeHistogram {
                 1025..=4096 => &mut coarse.under4k,
                 4097..=16384 => &mut coarse.under16k,
                 16385..=32768 => &mut coarse.under32k,
-                _ => &mut coarse.xlarge,
+                _ => &mut coarse.over32k,
             };
             *which += c;
         }
