@@ -114,7 +114,7 @@ for res in db.iter() {
 
 assert_eq!(db.iter().count(), 0);
 
-// list API ("linked lists")
+// lists API
 
 db.set_in_list("mylist", "key1", "123")?;
 db.set_in_list("mylist", "key2", "456")?;
@@ -160,7 +160,7 @@ existing element requires two IOs, since it needs to compare the key before writ
 These IOs may return from the kernel's page cache, in which case it's practically immediate, or from disk,
 in which case you can expect it to take 1-2 round-trip times of your device.
 
-Inserting to/removing from a linked-lists require 2-3 IOs, since these operations need to update the list's 
+Inserting to/removing from a lists require 2-3 IOs, since these operations need to update the list's 
 head or tail, as well as link/unlink to their previous element. Such operations should really be done with a "large enough page cache". 
 Updating/fetching an existing element element in a list is a single IO as above.
 

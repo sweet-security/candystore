@@ -604,7 +604,7 @@ impl CandyStore {
         hist
     }
 
-    /// Returns an iterator over the whole store (skipping linked lists or typed items)
+    /// Returns an iterator over the whole store (skipping lists or typed items)
     pub fn iter(&self) -> CandyStoreIterator {
         CandyStoreIterator::new(self, false)
     }

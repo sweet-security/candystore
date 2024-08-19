@@ -37,7 +37,7 @@ Performance results from my machine
   Large entries removal: 0.139us
 ```
 
-### Linked-lists
+### Lists
 ```
 10 collections with 100000 items in each
   Inserts: 8.104us

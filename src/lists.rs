@@ -12,17 +12,17 @@ use uuid::Uuid;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
-struct LinkedList {
-    pub head_idx: u64, // inclusive
-    pub tail_idx: u64, // exclusive
-    pub holes: u64,
+struct List {
+    head_idx: u64, // inclusive
+    tail_idx: u64, // exclusive
+    holes: u64,
 }
 
-impl std::fmt::Debug for LinkedList {
+impl std::fmt::Debug for List {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "LinkedList(0x{:016x}..0x{:016x} len={} holes={})",
+            "List(0x{:016x}..0x{:016x} len={} holes={})",
             self.head_idx,
             self.tail_idx,
             self.tail_idx - self.head_idx,
@@ -31,7 +31,7 @@ impl std::fmt::Debug for LinkedList {
     }
 }
 
-impl LinkedList {
+impl List {
     fn len(&self) -> u64 {
         self.tail_idx - self.head_idx
     }
@@ -63,18 +63,18 @@ impl Default for ListCompactionParams {
     }
 }
 
-pub(crate) const ITEM_SUFFIX_LEN: usize = size_of::<PartedHash>() + ITEM_NAMESPACE.len();
+const ITEM_SUFFIX_LEN: usize = size_of::<PartedHash>() + ITEM_NAMESPACE.len();
 
-pub struct LinkedListIterator<'a> {
+pub struct ListIterator<'a> {
     store: &'a CandyStore,
     list_key: Vec<u8>,
     list_ph: PartedHash,
-    list: Option<LinkedList>,
+    list: Option<List>,
     idx: u64,
     fwd: bool,
 }
 
-impl<'a> Iterator for LinkedListIterator<'a> {
+impl<'a> Iterator for ListIterator<'a> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -85,7 +85,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
                 Ok(None) => return None,
                 Err(e) => return Some(Err(e)),
             };
-            let list = *from_bytes::<LinkedList>(&list_bytes);
+            let list = *from_bytes::<List>(&list_bytes);
             self.list = Some(list);
             self.idx = if self.fwd {
                 list.head_idx
@@ -122,7 +122,7 @@ impl<'a> Iterator for LinkedListIterator<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for LinkedListIterator<'a> {
+impl<'a> DoubleEndedIterator for ListIterator<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
         None
     }
@@ -208,7 +208,7 @@ impl CandyStore {
         // get of create the list
         let res = self.get_or_create_raw(
             &list_key,
-            bytes_of(&LinkedList {
+            bytes_of(&List {
                 head_idx: Self::FIRST_IDX,
                 tail_idx: Self::FIRST_IDX + 1,
                 holes: 0,
@@ -235,7 +235,7 @@ impl CandyStore {
                 self.set_raw(&item_key, &val)?;
             }
             crate::GetOrCreateStatus::ExistingValue(list_bytes) => {
-                let mut list = *from_bytes::<LinkedList>(&list_bytes);
+                let mut list = *from_bytes::<List>(&list_bytes);
 
                 let item_idx = match pos {
                     InsertToListPos::Tail => {
@@ -272,6 +272,10 @@ impl CandyStore {
         Ok(InsertToListStatus::Created(val))
     }
 
+    /// Inserts or updates an element `item_key` that belongs to list `list_key`. Returns [SetStatus::CreatedNew] if
+    /// the item did not exist, or [SetStatus::PrevValue] with the previous value of the item.
+    ///
+    /// See also [Self::set].
     pub fn set_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -290,6 +294,11 @@ impl CandyStore {
         )
     }
 
+    /// Like [Self::set_in_list] but "promotes" the element to the tail of the list: it's basically a
+    /// remove + insert operation. This can be usede to implement LRUs, where older elements are at the
+    /// beginning and newer ones at the end.
+    ///
+    /// Note: **not crash-safe**
     pub fn set_in_list_promoting<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -308,6 +317,7 @@ impl CandyStore {
         )
     }
 
+    /// Owned version of [Self::set_in_list], which also takes promote as a parameter
     pub fn owned_set_in_list(
         &self,
         list_key: Vec<u8>,
@@ -331,6 +341,8 @@ impl CandyStore {
         }
     }
 
+    /// Like [Self::set_in_list], but will only replace (update) an existing item, i.e., it will never create the
+    /// key
     pub fn replace_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -350,6 +362,7 @@ impl CandyStore {
         )
     }
 
+    /// Owned version of [Self::replace_in_list]
     pub fn owned_replace_in_list(
         &self,
         list_key: Vec<u8>,
@@ -371,6 +384,8 @@ impl CandyStore {
         }
     }
 
+    /// Like [Self::set_in_list] but will not replace (update) the element if it already exists - it will only
+    /// create the element with the default value if it did not exist.
     pub fn get_or_create_in_list<
         B1: AsRef<[u8]> + ?Sized,
         B2: AsRef<[u8]> + ?Sized,
@@ -388,6 +403,7 @@ impl CandyStore {
         )
     }
 
+    /// Owned version of [Self::get_or_create_in_list]
     pub fn owned_get_or_create_in_list(
         &self,
         list_key: Vec<u8>,
@@ -407,6 +423,9 @@ impl CandyStore {
         }
     }
 
+    /// Gets a list element identified by `list_key` and `item_key`. This is an O(1) operation.
+    ///
+    /// See also: [Self::get]
     pub fn get_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
@@ -415,6 +434,7 @@ impl CandyStore {
         self.owned_get_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::get_from_list]
     pub fn owned_get_from_list(
         &self,
         list_key: Vec<u8>,
@@ -429,6 +449,11 @@ impl CandyStore {
         Ok(Some(val))
     }
 
+    /// Removes a element from the list, identified by `list_key` and `item_key. The element can be
+    /// at any position in the list, not just the head or the tail, but in this case, it will create a "hole".
+    /// This means that iterations will go over the missing element's index every time, until the list is compacted.
+    ///
+    /// See also [Self::remove], [Self::compact_list_if_needed]
     pub fn remove_from_list<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
@@ -437,6 +462,7 @@ impl CandyStore {
         self.owned_remove_from_list(list_key.as_ref().to_owned(), item_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::remove_from_list]
     pub fn owned_remove_from_list(
         &self,
         list_key: Vec<u8>,
@@ -460,7 +486,7 @@ impl CandyStore {
 
         // update list, if the item was the head/tail
         let list_bytes = self.get_raw(&list_key)?.unwrap();
-        let mut list = *from_bytes::<LinkedList>(&list_bytes);
+        let mut list = *from_bytes::<List>(&list_bytes);
 
         if list.head_idx == item_idx || list.tail_idx == item_idx + 1 {
             if list.head_idx == item_idx {
@@ -543,7 +569,7 @@ impl CandyStore {
         let Some(list_bytes) = self.get_raw(&list_key)? else {
             return Ok(false);
         };
-        let list = *from_bytes::<LinkedList>(&list_bytes);
+        let list = *from_bytes::<List>(&list_bytes);
         if list.len() < params.min_length {
             return Ok(false);
         }
@@ -584,26 +610,37 @@ impl CandyStore {
             new_idx += 1;
         }
 
-        // update list head and tail, set holes=0
-        self.set_raw(
-            &list_key,
-            bytes_of(&LinkedList {
-                head_idx: list.tail_idx,
-                tail_idx: new_idx,
-                holes: 0,
-            }),
-        )?;
+        if list.tail_idx == new_idx {
+            // list is now empty
+            self.remove_raw(&list_key)?;
+        } else {
+            // update list head and tail, set holes=0
+            self.set_raw(
+                &list_key,
+                bytes_of(&List {
+                    head_idx: list.tail_idx,
+                    tail_idx: new_idx,
+                    holes: 0,
+                }),
+            )?;
+        }
 
         Ok(true)
     }
 
-    pub fn iter_list<'a, B: AsRef<[u8]> + ?Sized>(&'a self, list_key: &B) -> LinkedListIterator {
+    /// Iterates over the elements of the list (identified by `list_key`) from the beginning (head)
+    /// to the end (tail). Note that if items are removed at random locations in the list, the iterator
+    /// will need to skip these holes. If you remove elements from the middle (not head/tail) of the list
+    /// frequently, and wish to use iteration, consider compacting the list every so often using
+    /// [Self::compact_list_if_needed]
+    pub fn iter_list<'a, B: AsRef<[u8]> + ?Sized>(&'a self, list_key: &B) -> ListIterator {
         self.owned_iter_list(list_key.as_ref().to_owned())
     }
 
-    pub fn owned_iter_list<'a>(&'a self, list_key: Vec<u8>) -> LinkedListIterator {
+    /// Owned version of [Self::iter_list]
+    pub fn owned_iter_list<'a>(&'a self, list_key: Vec<u8>) -> ListIterator {
         let (list_ph, list_key) = self.make_list_key(list_key);
-        LinkedListIterator {
+        ListIterator {
             store: &self,
             list_key,
             list_ph,
@@ -613,16 +650,18 @@ impl CandyStore {
         }
     }
 
+    /// Same as [Self::iter_list] but iterates from the end (tail) to the beginning (head)
     pub fn iter_list_backwards<'a, B: AsRef<[u8]> + ?Sized>(
         &'a self,
         list_key: &B,
-    ) -> LinkedListIterator {
+    ) -> ListIterator {
         self.owned_iter_list_backwards(list_key.as_ref().to_owned())
     }
 
-    pub fn owned_iter_list_backwards<'a>(&'a self, list_key: Vec<u8>) -> LinkedListIterator {
+    /// Owned version of [Self::iter_list_backwards]
+    pub fn owned_iter_list_backwards<'a>(&'a self, list_key: Vec<u8>) -> ListIterator {
         let (list_ph, list_key) = self.make_list_key(list_key);
-        LinkedListIterator {
+        ListIterator {
             store: &self,
             list_key,
             list_ph,
@@ -632,10 +671,13 @@ impl CandyStore {
         }
     }
 
+    /// Discards the given list, removing all elements it contains and dropping the list itself.
+    /// This is more efficient than iteration + removal of each element.
     pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<()> {
         self.owned_discard_list(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::discard_list]
     pub fn owned_discard_list(&self, list_key: Vec<u8>) -> Result<()> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let _guard = self.lock_list(list_ph);
@@ -643,7 +685,7 @@ impl CandyStore {
         let Some(list_bytes) = self.get_raw(&list_key)? else {
             return Ok(());
         };
-        let list = *from_bytes::<LinkedList>(&list_bytes);
+        let list = *from_bytes::<List>(&list_bytes);
         for idx in list.head_idx..list.tail_idx {
             let Some((_, full_key, _)) = self.get_from_list_at_index(list_ph, idx, false)? else {
                 continue;
@@ -660,10 +702,12 @@ impl CandyStore {
         Ok(())
     }
 
+    /// Returns the first (head) element of the list
     pub fn peek_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_peek_list_head(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::peek_list_head]
     pub fn owned_peek_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         let Some(kv) = self.owned_iter_list(list_key).next() else {
             return Ok(None);
@@ -671,10 +715,12 @@ impl CandyStore {
         Ok(Some(kv?))
     }
 
+    /// Returns the last (tail) element of the list
     pub fn peek_list_tail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_peek_list_tail(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::peek_list_tail]
     pub fn owned_peek_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         for kv in self.owned_iter_list_backwards(list_key) {
             return Ok(Some(kv?));
@@ -682,10 +728,12 @@ impl CandyStore {
         Ok(None)
     }
 
+    /// Removes and returns the first (head) element of the list
     pub fn pop_list_head<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_pop_list_head(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::peek_list_tail]
     pub fn owned_pop_list_head(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         for kv in self.owned_iter_list(list_key.clone()) {
             let (k, v) = kv?;
@@ -696,10 +744,12 @@ impl CandyStore {
         Ok(None)
     }
 
+    /// Removes and returns the last (tail) element of the list
     pub fn pop_list_tail<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<Option<KVPair>> {
         self.owned_pop_list_tail(list_key.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::peek_list_tail]
     pub fn owned_pop_list_tail(&self, list_key: Vec<u8>) -> Result<Option<KVPair>> {
         for kv in self.owned_iter_list_backwards(list_key.clone()) {
             let (k, v) = kv?;
@@ -708,14 +758,6 @@ impl CandyStore {
             }
         }
         Ok(None)
-    }
-
-    pub fn push_to_list_head<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        list_key: &B1,
-        val: &B2,
-    ) -> Result<EncodableUuid> {
-        self.owned_push_to_list_head(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
     fn owned_push_to_list(
@@ -736,6 +778,18 @@ impl CandyStore {
         Ok(EncodableUuid::from(uuid))
     }
 
+    /// Pushed "value only" at the beginning (head) of the list. The key is actually a randomly-generated UUID,
+    /// which is returned to the caller and can be acted up like a regular list item. This is used to implement
+    /// double-ended queues, where elements are pushed/popped at the ends, thus the key is not meaningful.
+    pub fn push_to_list_head<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        list_key: &B1,
+        val: &B2,
+    ) -> Result<EncodableUuid> {
+        self.owned_push_to_list_head(list_key.as_ref().to_owned(), val.as_ref().to_owned())
+    }
+
+    /// Owned version of [Self::push_to_list_head]
     pub fn owned_push_to_list_head(
         &self,
         list_key: Vec<u8>,
@@ -744,6 +798,9 @@ impl CandyStore {
         self.owned_push_to_list(list_key, val, InsertToListPos::Head)
     }
 
+    /// Pushed "value only" at the end (tail) of the list. The key is actually a randomly-generated UUID,
+    /// which is returned to the caller and can be acted up like a regular list item. This is used to implement
+    /// double-ended queues, where elements are pushed/popped at the ends, thus the key is not meaningful.
     pub fn push_to_list_tail<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B1,
@@ -752,6 +809,7 @@ impl CandyStore {
         self.owned_push_to_list_tail(list_key.as_ref().to_owned(), val.as_ref().to_owned())
     }
 
+    /// Owned version of [Self::push_to_list_tail]
     pub fn owned_push_to_list_tail(
         &self,
         list_key: Vec<u8>,

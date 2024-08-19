@@ -13,7 +13,7 @@
 //! table of ~380KB is kept `mmap`-ed (it is also file-backed, so can be evicted if needed). A shard-file can
 //! hold around 30K entries, and more shard-files are created as needed.
 //!
-//! A unique feature of Candy is the support of *linked lists*, which allow creating cheap collections.
+//! A unique feature of Candy is the support of *lists*, which allow creating cheap collections.
 //!
 //! Notes:
 //! * the file format is not yet stable!
@@ -30,7 +30,7 @@
 //!     db.remove("hello")?;
 //!     assert_eq!(db.get("hello")?, None);
 //!
-//!     // linked lists
+//!     // lists
 //!     db.set_in_list("italian", "bye", "arrivederci")?;
 //!     db.set_in_list("italian", "thanks", "grazie")?;
 //!     assert_eq!(db.get_from_list("italian", "bye")?, Some("arrivederci".into()));
@@ -57,7 +57,7 @@ mod typed;
 
 pub use hashing::HashSeed;
 pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
-pub use lists::{LinkedListIterator, ListCompactionParams};
+pub use lists::{ListCompactionParams, ListIterator};
 use std::fmt::{Display, Formatter};
 pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
@@ -75,7 +75,6 @@ pub enum CandyError {
     CompactionFailed(String),
     SplitFailed(String),
     LoadingFailed(String),
-    CorruptedLinkedList(String),
 }
 
 impl Display for CandyError {
@@ -88,7 +87,6 @@ impl Display for CandyError {
             Self::EntryCannotFitInShard(sz, max) => {
                 write!(f, "entry too big ({sz}) for a single shard file ({max})")
             }
-            Self::CorruptedLinkedList(s) => write!(f, "corrupted linked list: {s}"),
             Self::CompactionFailed(s) => write!(f, "shard compaction failed: {s}"),
             Self::LoadingFailed(s) => write!(f, "loading store failed: {s}"),
             Self::SplitFailed(s) => write!(f, "shard split failed: {s}"),

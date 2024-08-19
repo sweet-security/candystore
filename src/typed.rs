@@ -190,7 +190,7 @@ where
     }
 }
 
-/// A wrapper around [CandyStore] that exposes the linked-list API in a typed manner. See [CandyTypedStore] for more
+/// A wrapper around [CandyStore] that exposes the list API in a typed manner. See [CandyTypedStore] for more
 /// info
 pub struct CandyTypedList<L, K, V> {
     store: Arc<CandyStore>,
