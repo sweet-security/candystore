@@ -4,7 +4,7 @@ use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 use crate::{
     insertion::{ReplaceStatus, SetStatus},
     store::TYPED_NAMESPACE,
-    CandyStore,
+    CandyStore, ListCompactionParams,
 };
 
 use crate::encodable::EncodableUuid;
@@ -438,6 +438,19 @@ where
     {
         let list_key = Self::make_list_key(list_key);
         self.store.owned_discard_list(list_key)
+    }
+
+    /// Same as [CandyStore::compact_list_if_needed], but `list_key` is typed
+    pub fn compact_if_needed<Q: ?Sized + Encode>(
+        &self,
+        list_key: &Q,
+        params: ListCompactionParams,
+    ) -> Result<bool>
+    where
+        L: Borrow<Q>,
+    {
+        let list_key = Self::make_list_key(list_key);
+        self.store.compact_list_if_needed(&list_key, params)
     }
 
     /// Same as [CandyStore::push_to_list_head], but `list_key` is typed
