@@ -3,8 +3,8 @@ mod common;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use candystore::{
-    CandyStore, CandyTypedDeque, CandyTypedList, Config, GetOrCreateStatus, ReplaceStatus, Result,
-    SetStatus,
+    CandyStore, CandyTypedDeque, CandyTypedList, Config, GetOrCreateStatus, ListCompactionParams,
+    ReplaceStatus, Result, SetStatus,
 };
 
 use crate::common::run_in_tempdir;
@@ -435,6 +435,43 @@ fn test_typed_promote() -> Result<()> {
 
         typed.set_promoting("mylist", &1, "zzz")?;
         assert_eq!(items(), &[3, 4, 2, 1]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_list_compaction() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = CandyStore::open(dir, Config::default())?;
+
+        for i in 0u32..1000 {
+            db.set_in_list("xxx", &i.to_le_bytes(), "yyy")?;
+        }
+        assert!(!db.compact_list_if_needed("xxx", ListCompactionParams::default())?);
+
+        for i in 0u32..1000 {
+            if i % 3 == 1 {
+                assert!(db.remove_from_list("xxx", &i.to_le_bytes())?.is_some());
+            }
+        }
+
+        let keys1 = db
+            .iter_list("xxx")
+            .map(|res| u32::from_le_bytes(res.unwrap().0.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for k in keys1.iter() {
+            assert!(k % 3 != 1, "{k}");
+        }
+
+        assert!(db.compact_list_if_needed("xxx", ListCompactionParams::default())?);
+
+        let keys2 = db
+            .iter_list("xxx")
+            .map(|res| u32::from_le_bytes(res.unwrap().0.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys1, keys2);
 
         Ok(())
     })

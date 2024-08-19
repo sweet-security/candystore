@@ -524,7 +524,14 @@ impl CandyStore {
         Ok(None)
     }
 
-    /// Not crash-safe
+    /// Compacts (rewrites) the list such that there will be no holes. Holes are created when removing an
+    /// element from the middle of the list (not the head or tail), which makes iteration less efficient.
+    /// You should call this function every so often if you're removing elements from lists at random locations.
+    /// The function takes parameters that control when to compact: the list has to be of a minimal length and
+    /// have a minimal holes-to-length ratio. The default values are expected to be okay for most use cases.
+    /// Returns true if the list was compacted, false otherwise.
+    ///
+    /// Note: **Not crash-safe**
     pub fn compact_list_if_needed<B: AsRef<[u8]> + ?Sized>(
         &self,
         list_key: &B,
