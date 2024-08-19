@@ -571,7 +571,7 @@ impl CandyStore {
         for (_, shard) in guard.iter() {
             stats.num_inserted += shard.header.num_inserted.load(Ordering::Relaxed) as usize;
             stats.num_removed += shard.header.num_removed.load(Ordering::Relaxed) as usize;
-            stats.used_bytes = shard.header.write_offset.load(Ordering::Relaxed) as usize;
+            stats.used_bytes += shard.header.write_offset.load(Ordering::Relaxed) as usize;
             stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
         }
         stats
