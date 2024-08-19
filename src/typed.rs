@@ -395,7 +395,7 @@ where
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
-    ) -> impl Iterator<Item = Result<Option<(K, V)>>> + 'a
+    ) -> impl Iterator<Item = Result<(K, V)>> + 'a
     where
         L: Borrow<Q>,
     {
@@ -405,7 +405,7 @@ where
             Ok((k, v)) => {
                 let key = from_bytes::<K>(&k)?;
                 let val = from_bytes::<V>(&v)?;
-                Ok(Some((key, val)))
+                Ok((key, val))
             }
         })
     }
@@ -414,7 +414,7 @@ where
     pub fn iter_backwards<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
-    ) -> impl Iterator<Item = Result<Option<(K, V)>>> + 'a
+    ) -> impl Iterator<Item = Result<(K, V)>> + 'a
     where
         L: Borrow<Q>,
     {
@@ -426,7 +426,7 @@ where
                 Ok((k, v)) => {
                     let key = from_bytes::<K>(&k)?;
                     let val = from_bytes::<V>(&v)?;
-                    Ok(Some((key, val)))
+                    Ok((key, val))
                 }
             })
     }
@@ -611,14 +611,13 @@ where
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
-    ) -> impl Iterator<Item = Result<Option<V>>> + 'a
+    ) -> impl Iterator<Item = Result<V>> + 'a
     where
         L: Borrow<Q>,
     {
         self.list.iter(list_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok(None) => Ok(None),
-            Ok(Some((_, v))) => Ok(Some(v)),
+            Ok((_, v)) => Ok(v),
         })
     }
 
@@ -626,14 +625,13 @@ where
     pub fn iter_backwards<'a, Q: ?Sized + Encode>(
         &'a self,
         list_key: &Q,
-    ) -> impl Iterator<Item = Result<Option<V>>> + 'a
+    ) -> impl Iterator<Item = Result<V>> + 'a
     where
         L: Borrow<Q>,
     {
         self.list.iter_backwards(list_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok(None) => Ok(None),
-            Ok(Some((_, v))) => Ok(Some(v)),
+            Ok((_, v)) => Ok(v),
         })
     }
 }

@@ -107,7 +107,7 @@ fn test_typed_lists() -> Result<()> {
 
         let items = typed
             .iter("texas")
-            .map(|res| res.unwrap().unwrap().1)
+            .map(|res| res.unwrap().1)
             .collect::<Vec<_>>();
         assert_eq!(items, vec![2005, 2009, 2008]);
 
@@ -313,14 +313,14 @@ fn test_typed_queue() -> Result<()> {
 
         let items = queue
             .iter("orders")
-            .map(|res| res.unwrap().unwrap())
+            .map(|res| res.unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(items, vec![105, 104, 103, 100, 101, 102]);
 
         let items = queue
             .iter_backwards("orders")
-            .map(|res| res.unwrap().unwrap())
+            .map(|res| res.unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(items, vec![102, 101, 100, 103, 104, 105]);
@@ -414,7 +414,7 @@ fn test_typed_promote() -> Result<()> {
         let items = || {
             typed
                 .iter("mylist")
-                .map(|res| res.unwrap().unwrap().0)
+                .map(|res| res.unwrap().0)
                 .collect::<Vec<_>>()
         };
 
