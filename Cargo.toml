@@ -22,8 +22,5 @@ fslock = "0.2.1"
 [features]
 whitebox_testing = []
 
-[dev-dependencies]
-rand = "0.8.5"
-
 [workspace]
 members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf", "mini-candy", "test-list-collisions"]

@@ -69,9 +69,7 @@ impl CandyStore {
         if guard
             .get(&shard_end)
             .with_context(|| format!("missing shard {shard_end}"))?
-            .header
-            .write_offset
-            .load(Ordering::Relaxed)
+            .get_write_offset()
             < write_offset
         {
             return Ok(false);
@@ -88,7 +86,7 @@ impl CandyStore {
             "compact_{:04x}-{:04x}",
             removed_shard.span.start, removed_shard.span.end
         ));
-        let compacted_shard = Shard::open(
+        let mut compacted_shard = Shard::open(
             tmpfile.clone(),
             removed_shard.span.clone(),
             true,
@@ -97,17 +95,7 @@ impl CandyStore {
 
         self.num_compactions.fetch_add(1, Ordering::SeqCst);
 
-        for res in removed_shard.unlocked_iter() {
-            let (k, v) = res?;
-            let ph = PartedHash::new(&self.config.hash_seed, &k);
-            let status = compacted_shard.insert(ph, &k, &v, InsertMode::Set)?;
-            if !matches!(status, InsertStatus::Added) {
-                return Err(anyhow!(CandyError::CompactionFailed(format!(
-                    "{ph:?} [{}..{}] shard {status:?} k={k:?} v={v:?}",
-                    removed_shard.span.start, removed_shard.span.end
-                ))));
-            }
-        }
+        removed_shard.compact_into(&mut compacted_shard)?;
 
         std::fs::rename(tmpfile, &orig_filename)?;
         guard.insert(shard_end, compacted_shard);
@@ -146,21 +134,7 @@ impl CandyStore {
             self.config.clone(),
         )?;
 
-        for res in removed_shard.unlocked_iter() {
-            let (k, v) = res?;
-
-            let ph = PartedHash::new(&self.config.hash_seed, &k);
-            let status = if (ph.shard_selector() as u32) < midpoint {
-                bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
-            } else {
-                top_shard.insert(ph, &k, &v, InsertMode::Set)?
-            };
-            if !matches!(status, InsertStatus::Added) {
-                return Err(anyhow!(CandyError::SplitFailed(format!(
-                    "{ph:?} {status:?} [{shard_start} {midpoint} {shard_end}] k={k:?} v={v:?}",
-                ))));
-            }
-        }
+        removed_shard.split_into(&bottom_shard, &top_shard)?;
 
         self.num_splits.fetch_add(1, Ordering::SeqCst);
 

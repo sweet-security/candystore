@@ -125,6 +125,18 @@ impl SizeHistogram {
         coarse
     }
 
+    fn accum(&mut self, hist: SizeHistogram) {
+        for (i, c) in hist.counts_64b.into_iter().enumerate() {
+            self.counts_64b[i] += c;
+        }
+        for (i, c) in hist.counts_1kb.into_iter().enumerate() {
+            self.counts_1kb[i] += c;
+        }
+        for (i, c) in hist.counts_16kb.into_iter().enumerate() {
+            self.counts_16kb[i] += c;
+        }
+    }
+
     /// iterate over all non-empty buckets, and return their spans and counts
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         self.counts_64b
@@ -485,17 +497,15 @@ impl CandyStore {
         key
     }
 
-    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<Result<KVPair>>> {
+    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
         debug_assert!(ph.is_valid());
-        Ok(self
-            .shards
+        self.shards
             .read()
             .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
             .peek_next()
             .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
             .1
-            .iter_by_hash(ph)
-            .collect::<Vec<_>>())
+            .get_by_hash(ph)
     }
 
     pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -579,10 +589,11 @@ impl CandyStore {
             ..Default::default()
         };
         for (_, shard) in guard.iter() {
-            stats.num_inserted += shard.header.num_inserted.load(Ordering::Relaxed) as usize;
-            stats.num_removed += shard.header.num_removed.load(Ordering::Relaxed) as usize;
-            stats.used_bytes += shard.header.write_offset.load(Ordering::Relaxed) as usize;
-            stats.wasted_bytes += shard.header.wasted_bytes.load(Ordering::Relaxed) as usize;
+            let (num_inserted, num_removed, used_bytes, wasted_bytes) = shard.get_stats();
+            stats.num_inserted += num_inserted;
+            stats.num_removed += num_removed;
+            stats.used_bytes += used_bytes;
+            stats.wasted_bytes += wasted_bytes;
         }
         stats
     }
@@ -591,15 +602,7 @@ impl CandyStore {
         let guard = self.shards.read();
         let mut hist = SizeHistogram::default();
         for (_, shard) in guard.iter() {
-            for (i, h) in shard.header.size_histogram.counts_64b.iter().enumerate() {
-                hist.counts_64b[i] += h.load(Ordering::Relaxed) as usize;
-            }
-            for (i, h) in shard.header.size_histogram.counts_1kb.iter().enumerate() {
-                hist.counts_1kb[i] += h.load(Ordering::Relaxed) as usize;
-            }
-            for (i, h) in shard.header.size_histogram.counts_16kb.iter().enumerate() {
-                hist.counts_16kb[i] += h.load(Ordering::Relaxed) as usize;
-            }
+            hist.accum(shard.get_size_histogram())
         }
         hist
     }

@@ -1,3 +1,5 @@
+use anyhow::ensure;
+use bytemuck::{bytes_of, Pod, Zeroable};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use simd_itertools::PositionSimd;
 use std::{
@@ -13,7 +15,10 @@ use std::{
 
 use memmap::{MmapMut, MmapOptions};
 
-use crate::hashing::{PartedHash, INVALID_SIG};
+use crate::{
+    hashing::{PartedHash, INVALID_SIG},
+    SizeHistogram,
+};
 use crate::{Config, Result};
 
 //
@@ -28,9 +33,9 @@ pub(crate) const NUM_ROWS: usize = 64;
 pub(crate) const ROW_WIDTH: usize = 512;
 
 #[repr(C)]
-pub(crate) struct ShardRow {
-    pub signatures: [u32; ROW_WIDTH],
-    pub offsets_and_sizes: [u64; ROW_WIDTH], // | key_size: 16 | val_size: 16 | file_offset: 32 |
+struct ShardRow {
+    signatures: [u32; ROW_WIDTH],
+    offsets_and_sizes: [u64; ROW_WIDTH], // | key_size: 16 | val_size: 16 | file_offset: 32 |
 }
 
 impl ShardRow {
@@ -86,13 +91,13 @@ fn test_row_lookup() -> Result<()> {
 }
 
 #[repr(C, align(4096))]
-pub(crate) struct PageAligned<T>(pub T);
+struct PageAligned<T>(T);
 
 #[repr(C)]
-pub(crate) struct ShardSizeHistogram {
-    pub counts_64b: [AtomicU32; 16],
-    pub counts_1kb: [AtomicU32; 15],
-    pub counts_16kb: [AtomicU32; 4],
+struct ShardSizeHistogram {
+    counts_64b: [AtomicU32; 16],
+    counts_1kb: [AtomicU32; 15],
+    counts_16kb: [AtomicU32; 4],
 }
 
 impl ShardSizeHistogram {
@@ -141,13 +146,13 @@ fn test_shard_size_histogram() {
 }
 
 #[repr(C)]
-pub(crate) struct ShardHeader {
-    pub num_inserted: AtomicU64,
-    pub num_removed: AtomicU64,
-    pub wasted_bytes: AtomicU64,
-    pub write_offset: AtomicU32,
-    pub size_histogram: ShardSizeHistogram,
-    pub rows: PageAligned<[ShardRow; NUM_ROWS]>,
+struct ShardHeader {
+    num_inserted: AtomicU64,
+    num_removed: AtomicU64,
+    wasted_bytes: AtomicU64,
+    write_offset: AtomicU32,
+    size_histogram: ShardSizeHistogram,
+    rows: PageAligned<[ShardRow; NUM_ROWS]>,
 }
 
 pub(crate) const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
@@ -170,28 +175,10 @@ pub(crate) enum InsertMode<'a> {
     GetOrCreate,
 }
 
-pub(crate) struct ByHashIterator<'a> {
-    shard: &'a Shard,
-    _guard: RwLockReadGuard<'a, ()>,
-    row: &'a ShardRow,
-    signature: u32,
-    start_idx: usize,
-}
-
 pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 
-impl<'a> Iterator for ByHashIterator<'a> {
-    type Item = Result<KVPair>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(idx) = self.row.lookup(self.signature, &mut self.start_idx) {
-            Some(self.shard.read_kv(self.row.offsets_and_sizes[idx]))
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
 struct Backpointer(u32);
 
 impl Backpointer {
@@ -201,6 +188,8 @@ impl Backpointer {
     // | idx | idx |  size    |
     // | (6) | (9) |   (17)   |
     // +-----+-----+----------+
+    const SZ: u64 = size_of::<Self>() as u64;
+
     fn new(row_idx: u16, sig_idx: u16, entry_size: usize) -> Self {
         debug_assert!((row_idx as usize % NUM_ROWS) < (1 << 6), "{row_idx}");
         debug_assert!(sig_idx < (1 << 9), "{sig_idx}");
@@ -238,8 +227,8 @@ pub(crate) struct Shard {
     config: Arc<Config>,
     #[allow(dead_code)]
     mmap: MmapMut, // needed to prevent it from dropping
-    pub(crate) header: &'static mut ShardHeader,
-    pub(crate) row_locks: Vec<RwLock<()>>,
+    header: &'static mut ShardHeader,
+    row_locks: Vec<RwLock<()>>,
 }
 
 enum TryReplaceStatus {
@@ -296,13 +285,8 @@ impl Shard {
         Ok(())
     }
 
-    // #[inline]
-    // fn is_special_offset(offset_and_size: u64) -> bool {
-    //     (offset_and_size >> 62) != 0
-    // }
-
     #[inline]
-    pub(crate) fn extract_offset_and_size(offset_and_size: u64) -> (usize, usize, u64) {
+    fn extract_offset_and_size(offset_and_size: u64) -> (usize, usize, u64) {
         let klen = (offset_and_size >> 48) as usize;
         debug_assert_eq!(klen >> 14, 0, "attempting to read a special key");
         let vlen = ((offset_and_size >> 32) & 0xffff) as usize;
@@ -312,12 +296,10 @@ impl Shard {
 
     // reading doesn't require holding any locks - we only ever extend the file, never overwrite data
     fn read_kv(&self, offset_and_size: u64) -> Result<KVPair> {
-        const BP: u64 = size_of::<Backpointer>() as u64;
-
         let (klen, vlen, offset) = Self::extract_offset_and_size(offset_and_size);
         let mut buf = vec![0u8; klen + vlen];
         self.file
-            .read_exact_at(&mut buf, HEADER_SIZE + BP + offset)?;
+            .read_exact_at(&mut buf, HEADER_SIZE + Backpointer::SZ + offset)?;
 
         let val = buf[klen..klen + vlen].to_owned();
         buf.truncate(klen);
@@ -327,12 +309,11 @@ impl Shard {
 
     // writing doesn't require holding any locks since we write with an offset
     fn write_kv(&self, row_idx: u16, sig_idx: u16, key: &[u8], val: &[u8]) -> Result<u64> {
-        const BP: usize = size_of::<Backpointer>();
-
+        const BP: usize = Backpointer::SZ as usize;
         let entry_size = key.len() + val.len();
         let mut buf = vec![0u8; BP + entry_size];
         let bp = Backpointer::new(row_idx, sig_idx, entry_size);
-        buf[..BP].copy_from_slice(&bp.0.to_le_bytes());
+        buf[..BP].copy_from_slice(bytes_of(&bp));
         buf[BP..BP + key.len()].copy_from_slice(key);
         buf[BP + key.len()..].copy_from_slice(val);
 
@@ -360,7 +341,35 @@ impl Shard {
         }
     }
 
-    pub(crate) fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
+    pub(crate) fn compact_into(&self, new_shard: &mut Shard) -> Result<()> {
+        for res in self.unlocked_iter() {
+            let (k, v) = res?;
+            let ph = PartedHash::new(&self.config.hash_seed, &k);
+            let status = new_shard.insert(ph, &k, &v, InsertMode::Set)?;
+            ensure!(matches!(status, InsertStatus::Added));
+        }
+
+        Ok(())
+    }
+    pub(crate) fn split_into(&self, bottom_shard: &Shard, top_shard: &Shard) -> Result<()> {
+        for res in self.unlocked_iter() {
+            let (k, v) = res?;
+
+            let ph = PartedHash::new(&self.config.hash_seed, &k);
+            let status = if (ph.shard_selector() as u32) < bottom_shard.span.end {
+                bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
+            } else {
+                top_shard.insert(ph, &k, &v, InsertMode::Set)?
+            };
+            ensure!(
+                matches!(status, InsertStatus::Added),
+                "{ph} key={k:?} already exists in new_shard"
+            );
+        }
+        Ok(())
+    }
+
+    fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
         self.header.rows.0.iter().flat_map(|row| {
             row.signatures.iter().enumerate().filter_map(|(idx, &sig)| {
                 if sig == INVALID_SIG {
@@ -372,22 +381,28 @@ impl Shard {
         })
     }
 
-    pub(crate) fn iter_by_hash<'a>(&'a self, ph: PartedHash) -> ByHashIterator<'a> {
+    fn get_row(&self, ph: PartedHash) -> (RwLockReadGuard<()>, &ShardRow) {
         let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
         let guard = self.row_locks[row_idx].read();
         let row = &self.header.rows.0[row_idx];
-        ByHashIterator {
-            shard: &self,
-            _guard: guard,
-            row,
-            signature: ph.signature(),
-            start_idx: 0,
+        (guard, row)
+    }
+
+    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
+        let (_guard, row) = self.get_row(ph);
+        let mut kvs = Vec::with_capacity(1);
+        let mut start = 0;
+        while let Some(idx) = row.lookup(ph.signature(), &mut start) {
+            kvs.push(self.read_kv(row.offsets_and_sizes[idx])?);
         }
+        Ok(kvs)
     }
 
     pub(crate) fn get(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        for res in self.iter_by_hash(ph) {
-            let (k, v) = res?;
+        let (_guard, row) = self.get_row(ph);
+        let mut start = 0;
+        while let Some(idx) = row.lookup(ph.signature(), &mut start) {
+            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key == k {
                 return Ok(Some(v));
             }
@@ -429,7 +444,7 @@ impl Shard {
                 row.offsets_and_sizes[idx] =
                     self.write_kv(ph.row_selector(), idx as u16, key, val)?;
                 self.header.wasted_bytes.fetch_add(
-                    (size_of::<Backpointer>() + k.len() + existing_val.len()) as u64,
+                    Backpointer::SZ + (k.len() + existing_val.len()) as u64,
                     Ordering::SeqCst,
                 );
             }
@@ -522,5 +537,30 @@ impl Shard {
         }
 
         Ok(None)
+    }
+
+    pub(crate) fn get_write_offset(&self) -> u32 {
+        self.header.write_offset.load(Ordering::Relaxed)
+    }
+    pub(crate) fn get_stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.header.num_inserted.load(Ordering::Relaxed) as usize,
+            self.header.num_removed.load(Ordering::Relaxed) as usize,
+            self.header.write_offset.load(Ordering::Relaxed) as usize,
+            self.header.wasted_bytes.load(Ordering::Relaxed) as usize,
+        )
+    }
+    pub(crate) fn get_size_histogram(&self) -> SizeHistogram {
+        let mut hist = SizeHistogram::default();
+        for (i, h) in self.header.size_histogram.counts_64b.iter().enumerate() {
+            hist.counts_64b[i] = h.load(Ordering::Relaxed) as usize;
+        }
+        for (i, h) in self.header.size_histogram.counts_1kb.iter().enumerate() {
+            hist.counts_1kb[i] = h.load(Ordering::Relaxed) as usize;
+        }
+        for (i, h) in self.header.size_histogram.counts_16kb.iter().enumerate() {
+            hist.counts_16kb[i] = h.load(Ordering::Relaxed) as usize;
+        }
+        hist
     }
 }

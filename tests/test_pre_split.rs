@@ -77,7 +77,7 @@ fn test_compaction() -> Result<()> {
             },
         )?;
 
-        // fill the shard to the rim, creating waste
+        // fill the shard to the brim, creating waste
         for i in 0..10 {
             db.set("aaa", &format!("1111222233334444555566667777888899990000111122223333444455556666777788889999000011112222333{:x}", i))?;
 

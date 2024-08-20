@@ -534,10 +534,7 @@ impl CandyStore {
         let item_ph = *from_bytes::<PartedHash>(&item_ph_bytes);
 
         // handle unlikely (but possible) collisions on item_ph
-        for kv in self.get_by_hash(item_ph)? {
-            let Ok((mut k, mut v)) = kv else {
-                continue;
-            };
+        for (mut k, mut v) in self.get_by_hash(item_ph)? {
             if v.ends_with(&idx.to_le_bytes()) {
                 if truncate {
                     v.truncate(v.len() - size_of::<u64>());
