@@ -1,9 +1,8 @@
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail};
 use fslock::LockFile;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::{
-    collections::BTreeMap,
-    ops::{Bound, Range},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -11,15 +10,15 @@ use std::{
     },
 };
 
+use crate::shard::{NUM_ROWS, ROW_WIDTH};
 use crate::{
     hashing::PartedHash,
-    shard::{KVPair, HEADER_SIZE},
+    router::ShardRouter,
+    shard::{InsertMode, InsertStatus, KVPair, HEADER_SIZE},
+    HashSeed,
 };
-use crate::{
-    shard::{Shard, NUM_ROWS, ROW_WIDTH},
-    CandyError,
-};
-use crate::{Config, Result};
+
+use crate::{CandyError, Config, Result, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
 
 pub(crate) const USER_NAMESPACE: &[u8] = &[1];
 pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
@@ -125,18 +124,6 @@ impl SizeHistogram {
         coarse
     }
 
-    fn accum(&mut self, hist: SizeHistogram) {
-        for (i, c) in hist.counts_64b.into_iter().enumerate() {
-            self.counts_64b[i] += c;
-        }
-        for (i, c) in hist.counts_1kb.into_iter().enumerate() {
-            self.counts_1kb[i] += c;
-        }
-        for (i, c) in hist.counts_16kb.into_iter().enumerate() {
-            self.counts_16kb[i] += c;
-        }
-    }
-
     /// iterate over all non-empty buckets, and return their spans and counts
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
         self.counts_64b
@@ -176,15 +163,80 @@ impl std::fmt::Display for SizeHistogram {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InternalConfig {
+    pub dir_path: PathBuf,
+    pub max_shard_size: u32,
+    pub min_compaction_threashold: u32,
+    pub hash_seed: HashSeed,
+    pub expected_number_of_keys: usize,
+    pub max_concurrent_list_ops: u32,
+    pub truncate_up: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceStatus {
+    PrevValue(Vec<u8>),
+    WrongValue(Vec<u8>),
+    DoesNotExist,
+}
+impl ReplaceStatus {
+    pub fn was_replaced(&self) -> bool {
+        matches!(*self, Self::PrevValue(_))
+    }
+    pub fn failed(&self) -> bool {
+        !matches!(*self, Self::PrevValue(_))
+    }
+    pub fn is_key_missing(&self) -> bool {
+        matches!(*self, Self::DoesNotExist)
+    }
+    pub fn is_wrong_value(&self) -> bool {
+        matches!(*self, Self::WrongValue(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetStatus {
+    PrevValue(Vec<u8>),
+    CreatedNew,
+}
+impl SetStatus {
+    pub fn was_created(&self) -> bool {
+        matches!(*self, Self::CreatedNew)
+    }
+    pub fn was_replaced(&self) -> bool {
+        matches!(*self, Self::PrevValue(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetOrCreateStatus {
+    ExistingValue(Vec<u8>),
+    CreatedNew(Vec<u8>),
+}
+impl GetOrCreateStatus {
+    pub fn was_created(&self) -> bool {
+        matches!(*self, Self::CreatedNew(_))
+    }
+    pub fn already_exists(&self) -> bool {
+        matches!(*self, Self::ExistingValue(_))
+    }
+    pub fn value(self) -> Vec<u8> {
+        match self {
+            Self::CreatedNew(val) => val,
+            Self::ExistingValue(val) => val,
+        }
+    }
+}
+
 /// The CandyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
 pub struct CandyStore {
-    pub(crate) shards: RwLock<BTreeMap<u32, Shard>>,
-    pub(crate) config: Arc<Config>,
-    pub(crate) dir_path: PathBuf,
+    pub(crate) root: ShardRouter,
+    pub(crate) config: Arc<InternalConfig>,
     // stats
     pub(crate) num_entries: AtomicUsize,
-    pub(crate) num_compactions: AtomicUsize,
-    pub(crate) num_splits: AtomicUsize,
+    pub(crate) num_compactions: Arc<AtomicUsize>,
+    pub(crate) num_splits: Arc<AtomicUsize>,
     // locks for complicated operations
     pub(crate) keyed_locks_mask: u32,
     pub(crate) keyed_locks: Vec<Mutex<()>>,
@@ -195,18 +247,18 @@ pub struct CandyStore {
 /// but the results of the iteration may or may not include these changes. This is considered a
 /// well-defined behavior of the store.
 pub struct CandyStoreIterator<'a> {
-    db: &'a CandyStore,
-    shard_idx: u32,
+    store: &'a CandyStore,
+    shard_selector: u32,
     row_idx: usize,
     entry_idx: usize,
     raw: bool,
 }
 
 impl<'a> CandyStoreIterator<'a> {
-    fn new(db: &'a CandyStore, raw: bool) -> Self {
+    fn new(store: &'a CandyStore, raw: bool) -> Self {
         Self {
-            db,
-            shard_idx: 0,
+            store,
+            shard_selector: 0,
             row_idx: 0,
             entry_idx: 0,
             raw,
@@ -216,16 +268,16 @@ impl<'a> CandyStoreIterator<'a> {
     /// Returns the cookie of the next item in the store. This can be used later to construct an iterator
     /// that starts at the given point.
     pub fn cookie(&self) -> u64 {
-        ((self.shard_idx as u64 & 0xffff) << 32)
+        ((self.shard_selector as u64 & 0xffff) << 32)
             | ((self.row_idx as u64 & 0xffff) << 16)
             | (self.entry_idx as u64 & 0xffff)
     }
 
     // Constructs an iterator starting at the given cookie
-    pub fn from_cookie(db: &'a CandyStore, cookie: u64, raw: bool) -> Self {
+    pub fn from_cookie(store: &'a CandyStore, cookie: u64, raw: bool) -> Self {
         Self {
-            db,
-            shard_idx: ((cookie >> 32) & 0xffff) as u32,
+            store,
+            shard_selector: ((cookie >> 32) & 0xffff) as u32,
             row_idx: ((cookie >> 16) & 0xffff) as usize,
             entry_idx: (cookie & 0xffff) as usize,
             raw,
@@ -237,72 +289,70 @@ impl<'a> Iterator for CandyStoreIterator<'a> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let guard = self.db.shards.read();
-        for (curr_shard_idx, shard) in guard.range(self.shard_idx..) {
-            self.shard_idx = *curr_shard_idx;
-            loop {
-                let kvres = shard.read_at(self.row_idx, self.entry_idx);
+        while self.shard_selector < ShardRouter::END_OF_SHARDS {
+            let res = self.store.root.shared_op(self.shard_selector, |sh| {
+                while self.row_idx < NUM_ROWS {
+                    let row_idx = self.row_idx;
+                    let entry_idx = self.entry_idx;
 
-                // advance
-                let mut should_break = false;
-                self.entry_idx += 1;
-                if self.entry_idx >= ROW_WIDTH {
-                    self.entry_idx = 0;
-                    self.row_idx += 1;
-                    if self.row_idx >= NUM_ROWS {
-                        self.row_idx = 0;
-                        self.shard_idx += 1;
-                        should_break = true;
+                    self.entry_idx += 1;
+                    if self.entry_idx >= ROW_WIDTH {
+                        self.entry_idx = 0;
+                        self.row_idx += 1;
+                    }
+
+                    let Some((mut k, v)) = sh.read_at(row_idx, entry_idx)? else {
+                        continue;
+                    };
+                    if self.raw {
+                        return Ok((sh.span.start, Some((k, v))));
+                    } else if k.ends_with(USER_NAMESPACE) {
+                        k.truncate(k.len() - USER_NAMESPACE.len());
+                        return Ok((sh.span.start, Some((k, v))));
                     }
                 }
 
-                if let Some(res) = kvres {
-                    match res {
-                        Ok((mut k, v)) => {
-                            if self.raw {
-                                return Some(Ok((k, v)));
-                            }
-                            // filter anything other than USER_NAMESPACE
-                            if k.ends_with(USER_NAMESPACE) {
-                                k.truncate(k.len() - USER_NAMESPACE.len());
-                                return Some(Ok((k, v)));
-                            }
-                        }
-                        Err(e) => {
-                            return Some(Err(e));
-                        }
+                self.entry_idx = 0;
+                self.row_idx = 0;
+                Ok((sh.span.end, None))
+            });
+
+            match res {
+                Ok((shard_selector, kv)) => {
+                    self.shard_selector = shard_selector;
+                    if let Some(kv) = kv {
+                        return Some(Ok(kv));
                     }
+                    // continue
                 }
-                if should_break {
-                    break;
-                }
+                Err(e) => return Some(Err(e)),
             }
         }
+
         None
     }
 }
 
 impl CandyStore {
-    const END_OF_SHARDS: u32 = 1u32 << 16;
-
     /// Opens or creates a new CandyStore.
     /// * dir_path - the directory where shards will be kept
     /// * config - the configuration options for the store
     pub fn open(dir_path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let mut shards: BTreeMap<u32, Shard> = BTreeMap::new();
-        let config = Arc::new(config);
-        let dir_path: PathBuf = dir_path.as_ref().into();
+        let config = Arc::new(InternalConfig {
+            dir_path: dir_path.as_ref().to_path_buf(),
+            expected_number_of_keys: config.expected_number_of_keys,
+            hash_seed: config.hash_seed,
+            max_concurrent_list_ops: config.max_concurrent_list_ops,
+            max_shard_size: config.max_shard_size,
+            min_compaction_threashold: config.min_compaction_threashold,
+            truncate_up: config.truncate_up,
+        });
 
-        std::fs::create_dir_all(&dir_path)?;
-        let lockfilename = dir_path.join(".lock");
+        std::fs::create_dir_all(dir_path)?;
+        let lockfilename = config.dir_path.join(".lock");
         let mut lockfile = fslock::LockFile::open(&lockfilename)?;
         if !lockfile.try_lock_with_pid()? {
-            bail!("Failed to lock {lockfilename:?}");
-        }
-
-        Self::load_existing_dir(&dir_path, &config, &mut shards)?;
-        if shards.is_empty() {
-            Self::create_first_shards(&dir_path, &config, &mut shards)?;
+            bail!("Lock file {lockfilename:?} is used by another process");
         }
 
         let mut num_keyed_locks = config.max_concurrent_list_ops.max(4);
@@ -315,179 +365,37 @@ impl CandyStore {
             keyed_locks.push(Mutex::new(()));
         }
 
+        let num_compactions = Arc::new(AtomicUsize::new(0));
+        let num_splits = Arc::new(AtomicUsize::new(0));
+
+        let root = ShardRouter::new(config.clone(), num_compactions.clone(), num_splits.clone())?;
+
         Ok(Self {
             config,
-            dir_path,
-            shards: RwLock::new(shards),
+            root,
             num_entries: Default::default(),
-            num_compactions: Default::default(),
-            num_splits: Default::default(),
+            num_compactions,
+            num_splits,
             keyed_locks_mask: num_keyed_locks - 1,
             keyed_locks,
             _lockfile: lockfile,
         })
     }
 
-    fn load_existing_dir(
-        dir_path: &PathBuf,
-        config: &Arc<Config>,
-        shards: &mut BTreeMap<u32, Shard>,
-    ) -> Result<()> {
-        for res in std::fs::read_dir(&dir_path)? {
-            let entry = res?;
-            let filename = entry.file_name();
-            let Some(filename) = filename.to_str() else {
-                continue;
-            };
-            let Ok(filetype) = entry.file_type() else {
-                continue;
-            };
-            if !filetype.is_file() {
-                continue;
-            }
-            if filename.starts_with("compact_")
-                || filename.starts_with("bottom_")
-                || filename.starts_with("top_")
-            {
-                std::fs::remove_file(entry.path())?;
-                continue;
-            } else if !filename.starts_with("shard_") {
-                continue;
-            }
-            let Some((_, span)) = filename.split_once("_") else {
-                continue;
-            };
-            let Some((start, end)) = span.split_once("-") else {
-                continue;
-            };
-            let start = u32::from_str_radix(start, 16).expect(filename);
-            let end = u32::from_str_radix(end, 16).expect(filename);
-
-            if start > end || end > Self::END_OF_SHARDS {
-                return Err(anyhow!(CandyError::LoadingFailed(format!(
-                    "Bad span for {filename}"
-                ))));
-            }
-
-            if let Some(existing) = shards.get(&end) {
-                // this means we hit an uncompleted split - we need to take the wider of the two shards
-                // and delete the narrower one
-                if existing.span.start < start {
-                    // keep existing, remove this one
-                    std::fs::remove_file(entry.path())?;
-                    continue;
-                } else {
-                    // remove existing one
-                    std::fs::remove_file(dir_path.join(format!(
-                        "shard_{:04x}-{:04x}",
-                        existing.span.start, existing.span.end
-                    )))?;
-                }
-            }
-            shards.insert(
-                end,
-                Shard::open(entry.path(), start..end, false, config.clone())?,
-            );
-        }
-
-        // remove any split midpoints. we may come across one of [start..mid), [mid..end), [start..end)
-        // the case of [mid..end) and [start..end) (same end) is already handled above. so we need to
-        // detect two shards where first.start == second.start and remove the shorter one
-        let mut spans = vec![];
-        for (end, shard) in shards.range(0..) {
-            spans.push((shard.span.start, *end));
-        }
-        let mut to_remove = vec![];
-        for (i, (start, end)) in spans.iter().enumerate() {
-            if i < spans.len() - 1 {
-                let (next_start, next_end) = spans[i + 1];
-                if *start == next_start {
-                    if next_end <= *end {
-                        return Err(anyhow!(CandyError::LoadingFailed(format!(
-                            "Removing in-progress split with start={} end={} next_start={} next_end={}",
-                            *start, *end, next_start, next_end
-                        ))));
-                    }
-
-                    to_remove.push((*start, *end))
-                }
-            }
-        }
-        for (start, end) in to_remove {
-            let bottomfile = dir_path.join(format!("shard_{start:04x}-{end:04x}"));
-            std::fs::remove_file(bottomfile)?;
-            shards.remove(&end);
-        }
-
-        Ok(())
-    }
-
-    fn create_first_shards(
-        dir_path: &PathBuf,
-        config: &Arc<Config>,
-        shards: &mut BTreeMap<u32, Shard>,
-    ) -> Result<()> {
-        let step = (Self::END_OF_SHARDS as f64)
-            / (config.expected_number_of_keys as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
-        let step = 1 << (step as u32).ilog2();
-
-        let mut start = 0;
-        while start < Self::END_OF_SHARDS {
-            let end = start + step;
-            let shard = Shard::open(
-                dir_path.join(format!("shard_{:04x}-{:04x}", start, end)),
-                0..Self::END_OF_SHARDS,
-                false,
-                config.clone(),
-            )?;
-            shards.insert(end, shard);
-            start = end;
-        }
-
-        Ok(())
-    }
-
     /// Syncs all in-memory changes of all shards to disk. Concurrent changes are allowed while
     /// flushing, and may result in partially-sync'ed store. Use sparingly, as this is a costly operaton.
     pub fn flush(&self) -> Result<()> {
-        let guard = self.shards.read();
-        for (_, shard) in guard.iter() {
-            shard.flush()?;
-        }
+        self.root.call_on_all_shards(|sh| sh.flush())?;
         Ok(())
     }
 
     /// Clears the store (erasing all keys), and removing all shard files
     pub fn clear(&self) -> Result<()> {
-        let mut guard = self.shards.write();
-
-        for res in std::fs::read_dir(&self.dir_path)? {
-            let entry = res?;
-            let filename = entry.file_name();
-            let Some(filename) = filename.to_str() else {
-                continue;
-            };
-            let Ok(filetype) = entry.file_type() else {
-                continue;
-            };
-            if !filetype.is_file() {
-                continue;
-            }
-            if filename.starts_with("shard_")
-                || filename.starts_with("compact_")
-                || filename.starts_with("bottom_")
-                || filename.starts_with("top_")
-            {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
+        self.root.clear()?;
 
         self.num_entries.store(0, Ordering::Relaxed);
         self.num_compactions.store(0, Ordering::Relaxed);
         self.num_splits.store(0, Ordering::Relaxed);
-
-        guard.clear();
-        Self::create_first_shards(&self.dir_path, &self.config, &mut guard)?;
 
         Ok(())
     }
@@ -499,24 +407,14 @@ impl CandyStore {
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
         debug_assert!(ph.is_valid());
-        self.shards
-            .read()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
-            .peek_next()
-            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
-            .1
-            .get_by_hash(ph)
+        self.root
+            .shared_op(ph.shard_selector() as u32, |sh| sh.get_by_hash(ph))
     }
 
     pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
-        self.shards
-            .read()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
-            .peek_next()
-            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
-            .1
-            .get(ph, &full_key)
+        self.root
+            .shared_op(ph.shard_selector() as u32, |sh| sh.get(ph, &full_key))
     }
 
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
@@ -544,13 +442,8 @@ impl CandyStore {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
         let val = self
-            .shards
-            .read()
-            .lower_bound(Bound::Excluded(&(ph.shard_selector() as u32)))
-            .peek_next()
-            .with_context(|| format!("missing shard for 0x{:04x}", ph.shard_selector()))?
-            .1
-            .remove(ph, &full_key)?;
+            .root
+            .shared_op(ph.shard_selector() as u32, |sh| sh.remove(ph, &full_key))?;
         if val.is_some() {
             self.num_entries.fetch_sub(1, Ordering::SeqCst);
         }
@@ -568,6 +461,161 @@ impl CandyStore {
         self.remove_raw(&self.make_user_key(key))
     }
 
+    pub(crate) fn insert_internal(
+        &self,
+        full_key: &[u8],
+        val: &[u8],
+        mode: InsertMode,
+    ) -> Result<InsertStatus> {
+        let ph = PartedHash::new(&self.config.hash_seed, full_key);
+
+        if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
+            return Err(anyhow!(CandyError::KeyTooLong(full_key.len())));
+        }
+        if val.len() > MAX_VALUE_SIZE as usize {
+            return Err(anyhow!(CandyError::ValueTooLong(val.len())));
+        }
+        if full_key.len() + val.len() > self.config.max_shard_size as usize {
+            return Err(anyhow!(CandyError::EntryCannotFitInShard(
+                full_key.len() + val.len(),
+                self.config.max_shard_size as usize
+            )));
+        }
+
+        loop {
+            let status = self.root.insert(ph, full_key, val, mode)?;
+
+            match status {
+                InsertStatus::Added => {
+                    self.num_entries.fetch_add(1, Ordering::SeqCst);
+                    return Ok(status);
+                }
+                InsertStatus::KeyDoesNotExist
+                | InsertStatus::Replaced(_)
+                | InsertStatus::AlreadyExists(_) => {
+                    return Ok(status);
+                }
+                InsertStatus::CompactionNeeded(_) | InsertStatus::SplitNeeded => {
+                    unreachable!();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
+        match self.insert_internal(full_key, val, InsertMode::Set)? {
+            InsertStatus::Added => Ok(SetStatus::CreatedNew),
+            InsertStatus::Replaced(v) => Ok(SetStatus::PrevValue(v)),
+            InsertStatus::AlreadyExists(v) => Ok(SetStatus::PrevValue(v)),
+            InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
+        }
+    }
+
+    /// Inserts a key-value pair, creating it or replacing an existing pair. Note that if the program crashed
+    /// while or "right after" this operation, or if the operating system is unable to flush the page cache,
+    /// you may lose some data. However, you will still be in a consistent state, where you will get a previous
+    /// version of the state.
+    ///
+    /// While this method is O(1) amortized, every so often it will trigger either a shard compaction or a
+    /// shard split, which requires rewriting the whole shard. However, unlike LSM trees, this operation is
+    /// constant in size
+    pub fn set<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        val: &B2,
+    ) -> Result<SetStatus> {
+        self.owned_set(key.as_ref().to_owned(), val.as_ref())
+    }
+
+    /// Same as [Self::set], but the key passed owned to this function
+    pub fn owned_set(&self, key: Vec<u8>, val: &[u8]) -> Result<SetStatus> {
+        self.set_raw(&self.make_user_key(key), val)
+    }
+
+    pub(crate) fn replace_raw(
+        &self,
+        full_key: &[u8],
+        val: &[u8],
+        expected_val: Option<&[u8]>,
+    ) -> Result<ReplaceStatus> {
+        match self.insert_internal(full_key, val, InsertMode::Replace(expected_val))? {
+            InsertStatus::Added => unreachable!(),
+            InsertStatus::Replaced(v) => Ok(ReplaceStatus::PrevValue(v)),
+            InsertStatus::AlreadyExists(v) => Ok(ReplaceStatus::WrongValue(v)),
+            InsertStatus::KeyDoesNotExist => Ok(ReplaceStatus::DoesNotExist),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
+        }
+    }
+
+    /// Replaces the value of an existing key with a new value. If the key existed, returns
+    /// `PrevValue(value)` with its old value, and if it did not, returns `DoesNotExist` but
+    /// does not create the key.
+    ///
+    /// See [Self::set] for more details
+    pub fn replace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        val: &B2,
+        expected_val: Option<&B2>,
+    ) -> Result<ReplaceStatus> {
+        self.owned_replace(
+            key.as_ref().to_owned(),
+            val.as_ref(),
+            expected_val.map(|ev| ev.as_ref()),
+        )
+    }
+
+    /// Same as [Self::replace], but the key passed owned to this function
+    pub fn owned_replace(
+        &self,
+        key: Vec<u8>,
+        val: &[u8],
+        expected_val: Option<&[u8]>,
+    ) -> Result<ReplaceStatus> {
+        self.replace_raw(&self.make_user_key(key), val.as_ref(), expected_val)
+    }
+
+    pub(crate) fn get_or_create_raw(
+        &self,
+        full_key: &[u8],
+        default_val: Vec<u8>,
+    ) -> Result<GetOrCreateStatus> {
+        match self.insert_internal(full_key, &default_val, InsertMode::GetOrCreate)? {
+            InsertStatus::Added => Ok(GetOrCreateStatus::CreatedNew(default_val)),
+            InsertStatus::AlreadyExists(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
+            InsertStatus::Replaced(_) => unreachable!(),
+            InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
+            InsertStatus::SplitNeeded => unreachable!(),
+        }
+    }
+
+    /// Gets the value of the given key or creates it with the given default value. If the key did not exist,
+    /// returns `CreatedNew(default_val)`, and if it did, returns `ExistingValue(value)`.
+    /// This is done atomically, so it can be used to create a key only if it did not exist before,
+    /// like `open` with `O_EXCL`.
+    ///
+    /// See [Self::set] for more details
+    pub fn get_or_create<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        default_val: &B2,
+    ) -> Result<GetOrCreateStatus> {
+        self.owned_get_or_create(key.as_ref().to_owned(), default_val.as_ref().to_owned())
+    }
+
+    /// Same as [Self::get_or_create], but the `key` and `default_val` are passed owned to this function
+    pub fn owned_get_or_create(
+        &self,
+        key: Vec<u8>,
+        default_val: Vec<u8>,
+    ) -> Result<GetOrCreateStatus> {
+        self.get_or_create_raw(&self.make_user_key(key), default_val)
+    }
+
     /// Ephemeral stats: number of inserts
     pub fn _num_entries(&self) -> usize {
         self.num_entries.load(Ordering::Acquire)
@@ -583,13 +631,13 @@ impl CandyStore {
 
     /// Returns useful stats about the store
     pub fn stats(&self) -> Stats {
-        let guard = self.shards.read();
-        let mut stats = Stats {
-            num_shards: guard.len(),
-            ..Default::default()
-        };
-        for (_, shard) in guard.iter() {
-            let (num_inserted, num_removed, used_bytes, wasted_bytes) = shard.get_stats();
+        let stats_vec = self
+            .root
+            .call_on_all_shards(|sh| Ok(sh.get_stats()))
+            .unwrap();
+        let mut stats = Stats::default();
+        for (num_inserted, num_removed, used_bytes, wasted_bytes) in stats_vec {
+            stats.num_shards += 1;
             stats.num_inserted += num_inserted;
             stats.num_removed += num_removed;
             stats.used_bytes += used_bytes;
@@ -599,10 +647,22 @@ impl CandyStore {
     }
 
     pub fn size_histogram(&self) -> SizeHistogram {
-        let guard = self.shards.read();
         let mut hist = SizeHistogram::default();
-        for (_, shard) in guard.iter() {
-            hist.accum(shard.get_size_histogram())
+        let hist_vec = self
+            .root
+            .call_on_all_shards(|sh| Ok(sh.get_size_histogram()))
+            .unwrap();
+
+        for v in hist_vec {
+            for (i, c) in v.counts_64b.into_iter().enumerate() {
+                hist.counts_64b[i] += c;
+            }
+            for (i, c) in v.counts_1kb.into_iter().enumerate() {
+                hist.counts_1kb[i] += c;
+            }
+            for (i, c) in v.counts_16kb.into_iter().enumerate() {
+                hist.counts_16kb[i] += c;
+            }
         }
         hist
     }

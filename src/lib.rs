@@ -45,21 +45,20 @@
 //! }
 //! ```
 
-#![feature(btree_cursors)]
-
 mod encodable;
 mod hashing;
-mod insertion;
 mod lists;
+mod router;
 mod shard;
 mod store;
 mod typed;
 
 pub use hashing::HashSeed;
-pub use insertion::{GetOrCreateStatus, ReplaceStatus, SetStatus};
 pub use lists::{ListCompactionParams, ListIterator};
 use std::fmt::{Display, Formatter};
-pub use store::{CandyStore, CoarseHistogram, SizeHistogram, Stats};
+pub use store::{
+    CandyStore, CoarseHistogram, GetOrCreateStatus, ReplaceStatus, SetStatus, SizeHistogram, Stats,
+};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
 
 #[cfg(feature = "whitebox_testing")]
@@ -115,7 +114,7 @@ impl Default for Config {
         Self {
             max_shard_size: 64 * 1024 * 1024,
             min_compaction_threashold: 8 * 1024 * 1024,
-            hash_seed: HashSeed::new(b"kOYLu0xvq2WtzcKJ").unwrap(),
+            hash_seed: HashSeed::from_buf(b"kOYLu0xvq2WtzcKJ").unwrap(),
             expected_number_of_keys: 0,
             merge_small_shards: false,
             max_concurrent_list_ops: 64,

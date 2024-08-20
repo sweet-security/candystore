@@ -15,11 +15,12 @@ use std::{
 
 use memmap::{MmapMut, MmapOptions};
 
+use crate::Result;
 use crate::{
     hashing::{PartedHash, INVALID_SIG},
+    store::InternalConfig,
     SizeHistogram,
 };
-use crate::{Config, Result};
 
 //
 // these numbers were chosen according to the simulation, as they allow for 90% utilization of the shard with
@@ -224,7 +225,7 @@ impl Backpointer {
 pub(crate) struct Shard {
     pub(crate) span: Range<u32>,
     file: File,
-    config: Arc<Config>,
+    pub(crate) config: Arc<InternalConfig>,
     #[allow(dead_code)]
     mmap: MmapMut, // needed to prevent it from dropping
     header: &'static mut ShardHeader,
@@ -244,7 +245,7 @@ impl Shard {
         filename: PathBuf,
         span: Range<u32>,
         truncate: bool,
-        config: Arc<Config>,
+        config: Arc<InternalConfig>,
     ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -331,13 +332,13 @@ impl Shard {
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
     }
 
-    pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Option<Result<KVPair>> {
+    pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Result<Option<KVPair>> {
         let _guard = self.row_locks[row_idx].read();
         let row = &self.header.rows.0[row_idx];
         if row.signatures[entry_idx] != INVALID_SIG {
-            Some(self.read_kv(row.offsets_and_sizes[entry_idx]))
+            Ok(Some(self.read_kv(row.offsets_and_sizes[entry_idx])?))
         } else {
-            None
+            Ok(None)
         }
     }
 

@@ -140,7 +140,7 @@ for res in db.iter_list("mylist") {
 
 ## Notes
 * The file format is not yet stable
-* Requires nightly (for `simd_itertools` and BTree cursors), uses very little `unsafe` (required due to `mmap`)
+* Requires nightly (for `simd_itertools`), uses very little `unsafe` (required due to `mmap`)
 
 ## Roadmap
 * Distributed protocol based on file locks (meant to run on a shared network folder)

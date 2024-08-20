@@ -2,8 +2,7 @@ use anyhow::anyhow;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
-    insertion::{ReplaceStatus, SetStatus},
-    store::TYPED_NAMESPACE,
+    store::{ReplaceStatus, SetStatus, TYPED_NAMESPACE},
     CandyStore, ListCompactionParams,
 };
 

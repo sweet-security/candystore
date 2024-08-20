@@ -1,7 +1,6 @@
-use anyhow::anyhow;
 use siphasher::sip128::{Hash128, SipHasher24};
 
-use crate::{CandyError, Result};
+use crate::Result;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HashSeed([u8; 16]);
@@ -11,15 +10,13 @@ pub struct HashSeed([u8; 16]);
 impl HashSeed {
     pub const LEN: usize = size_of::<Self>();
 
+    pub fn new(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes)
+    }
+
     /// Construct a HashSeed from the given byte buffer (must be 16 bytes in length)
-    pub fn new<B: AsRef<[u8]> + ?Sized>(key: &B) -> Result<Self> {
-        let key = key.as_ref();
-        if key.len() != Self::LEN {
-            return Err(anyhow!(CandyError::WrongHashSeedLength));
-        }
-        let mut bytes = [0u8; Self::LEN];
-        bytes.copy_from_slice(&key);
-        Ok(Self(bytes))
+    pub fn from_buf<B: AsRef<[u8]> + ?Sized>(key: &B) -> Result<Self> {
+        Ok(Self(key.as_ref().try_into()?))
     }
 }
 
@@ -97,9 +94,9 @@ impl PartedHash {
 fn test_parted_hash() -> Result<()> {
     use bytemuck::{bytes_of, from_bytes};
 
-    HashSeed::new("12341234123412341").expect_err("shouldn't work");
+    HashSeed::from_buf("12341234123412341").expect_err("shouldn't work");
 
-    let seed = HashSeed::new("aaaabbbbccccdddd")?;
+    let seed = HashSeed::from_buf("aaaabbbbccccdddd")?;
 
     let h1 = PartedHash::new(&seed, b"hello world");
     assert_eq!(h1.0, 13445180190757400308,);
