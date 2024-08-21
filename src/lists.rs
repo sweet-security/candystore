@@ -63,8 +63,6 @@ impl Default for ListCompactionParams {
     }
 }
 
-const ITEM_SUFFIX_LEN: usize = size_of::<PartedHash>() + ITEM_NAMESPACE.len();
-
 pub struct ListIterator<'a> {
     store: &'a CandyStore,
     list_key: Vec<u8>,
@@ -218,8 +216,6 @@ impl CandyStore {
 
         match res {
             crate::GetOrCreateStatus::CreatedNew(_) => {
-                //println!("Created list");
-
                 // list was just created. create chain
                 self.set_raw(
                     bytes_of(&ChainKey {
@@ -533,12 +529,15 @@ impl CandyStore {
         };
         let item_ph = *from_bytes::<PartedHash>(&item_ph_bytes);
 
-        // handle unlikely (but possible) collisions on item_ph
+        let mut suffix = [0u8; size_of::<PartedHash>() + ITEM_NAMESPACE.len()];
+        suffix[0..size_of::<PartedHash>()].copy_from_slice(bytes_of(&list_ph));
+        suffix[size_of::<PartedHash>()..].copy_from_slice(ITEM_NAMESPACE);
+
         for (mut k, mut v) in self.get_by_hash(item_ph)? {
-            if v.ends_with(&idx.to_le_bytes()) {
+            if k.ends_with(&suffix) && v.ends_with(&idx.to_le_bytes()) {
                 if truncate {
                     v.truncate(v.len() - size_of::<u64>());
-                    k.truncate(k.len() - ITEM_SUFFIX_LEN);
+                    k.truncate(k.len() - suffix.len());
                 }
                 return Ok(Some((item_ph, k, v)));
             }
