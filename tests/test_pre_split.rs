@@ -46,7 +46,7 @@ fn test_pre_split() -> Result<()> {
         // namespace byte as well
         assert_eq!(
             stats.wasted_bytes,
-            "????aaa?".len() + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
+            "aaa?".len() + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
         );
 
         db.remove("aaa")?;
@@ -55,9 +55,9 @@ fn test_pre_split() -> Result<()> {
         assert_eq!(stats.num_removed, 1);
         assert_eq!(
             stats.wasted_bytes,
-            "????aaa?".len()
+            "aaa?".len()
                 + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".len()
-                + "????aaa?".len()
+                + "aaa?".len()
                 + "xxx".len()
         );
 
@@ -79,7 +79,7 @@ fn test_compaction() -> Result<()> {
 
         // fill the shard to the brim, creating waste
         for i in 0..10 {
-            db.set("aaa", &format!("1111222233334444555566667777888899990000111122223333444455556666777788889999000011112222333{:x}", i))?;
+            db.set("aaa", &format!("11112222333344445555666677778888999900001111222233334444555566667777888899990000111122223333444{:x}", i))?;
 
             let stats = db.stats();
             assert_eq!(stats.num_inserted, 1, "i={i}");
@@ -94,7 +94,7 @@ fn test_compaction() -> Result<()> {
         assert_eq!(db._num_compactions(), 1);
 
         let stats = db.stats();
-        assert_eq!(stats.used_bytes, 100 + "????bbb?".len() + "x".len());
+        assert_eq!(stats.used_bytes, 100 + "bbb?".len() + "x".len());
         assert_eq!(stats.wasted_bytes, 0);
 
         Ok(())

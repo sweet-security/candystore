@@ -107,6 +107,7 @@ pub struct Config {
     pub merge_small_shards: bool, // whether or not to merge small shards when items are removed
     pub max_concurrent_list_ops: u32, // number of keyed locks for concurrent list ops
     pub truncate_up: bool, // whether or not to truncate up shard files to their max size (spare files)
+    pub clear_on_unsupported_version: bool, // whether or not to clear the DB if the version is unsupported
 }
 
 impl Default for Config {
@@ -119,6 +120,7 @@ impl Default for Config {
             merge_small_shards: false,
             max_concurrent_list_ops: 64,
             truncate_up: true,
+            clear_on_unsupported_version: false,
         }
     }
 }

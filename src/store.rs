@@ -172,6 +172,7 @@ pub(crate) struct InternalConfig {
     pub expected_number_of_keys: usize,
     pub max_concurrent_list_ops: u32,
     pub truncate_up: bool,
+    pub clear_on_unsupported_version: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +347,7 @@ impl CandyStore {
             max_shard_size: config.max_shard_size,
             min_compaction_threashold: config.min_compaction_threashold,
             truncate_up: config.truncate_up,
+            clear_on_unsupported_version: config.clear_on_unsupported_version,
         });
 
         std::fs::create_dir_all(dir_path)?;
