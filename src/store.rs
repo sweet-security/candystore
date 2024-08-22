@@ -57,7 +57,7 @@ impl Stats {
 
     /// compute the average entry size
     pub fn average_entry_size(&self) -> usize {
-        self.data_bytes() / self.len()
+        self.data_bytes().checked_div(self.len()).unwrap_or(0)
     }
 
     /// total bytes consumed by the store (including headers and wasted bytes)
