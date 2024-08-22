@@ -108,6 +108,7 @@ pub struct Config {
     pub max_concurrent_list_ops: u32, // number of keyed locks for concurrent list ops
     pub truncate_up: bool, // whether or not to truncate up shard files to their max size (spare files)
     pub clear_on_unsupported_version: bool, // whether or not to clear the DB if the version is unsupported
+    pub mlock_headers: bool, // whether or not to mlock the shard headers to RAM (POSIX only)
 }
 
 impl Default for Config {
@@ -121,6 +122,7 @@ impl Default for Config {
             max_concurrent_list_ops: 64,
             truncate_up: true,
             clear_on_unsupported_version: false,
+            mlock_headers: false,
         }
     }
 }

@@ -272,6 +272,10 @@ impl Shard {
 
         let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
 
+        if cfg!(target_family = "unix") {
+            unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
+        }
+
         let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
         header.metadata.magic = SHARD_FILE_MAGIC;
         header.metadata.version = SHARD_FILE_VERSION;
