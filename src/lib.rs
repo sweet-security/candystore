@@ -100,15 +100,26 @@ pub type Result<T> = anyhow::Result<T>;
 /// The configuration options for CandyStore. Comes with sane defaults, feel free to use them
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub max_shard_size: u32, // we don't want huge shards, because splitting would be expensive
-    pub min_compaction_threashold: u32, // should be ~10% of max_shard_size
-    pub hash_seed: HashSeed, // just some entropy, not so important unless you fear DoS
-    pub expected_number_of_keys: usize, // hint for creating number of shards accordingly)
-    pub merge_small_shards: bool, // whether or not to merge small shards when items are removed
-    pub max_concurrent_list_ops: u32, // number of keyed locks for concurrent list ops
-    pub truncate_up: bool, // whether or not to truncate up shard files to their max size (spare files)
-    pub clear_on_unsupported_version: bool, // whether or not to clear the DB if the version is unsupported
-    pub mlock_headers: bool, // whether or not to mlock the shard headers to RAM (POSIX only)
+    /// we don't want huge shards, because splitting would be expensive
+    pub max_shard_size: u32,
+    /// should be ~10% of max_shard_size
+    pub min_compaction_threashold: u32,
+    /// just some entropy, not so important unless you fear DoS
+    pub hash_seed: HashSeed,
+    /// hint for creating number of shards accordingly)
+    pub expected_number_of_keys: usize,
+    /// number of keyed locks for concurrent list ops
+    pub max_concurrent_list_ops: u32,
+    /// whether or not to truncate up shard files to their max size (spare files)
+    pub truncate_up: bool,
+    /// whether or not to clear the DB if the version is unsupported
+    pub clear_on_unsupported_version: bool,
+    /// whether or not to mlock the shard headers to RAM (POSIX only)
+    pub mlock_headers: bool,
+    /// optionally delay modifying operations before for the given duration before flushing data to disk,
+    /// to ensure reboot consistency
+    #[cfg(feature = "flush_aggregation")]
+    pub flush_aggregation_delay: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -118,11 +129,12 @@ impl Default for Config {
             min_compaction_threashold: 8 * 1024 * 1024,
             hash_seed: HashSeed::from_buf(b"kOYLu0xvq2WtzcKJ").unwrap(),
             expected_number_of_keys: 0,
-            merge_small_shards: false,
             max_concurrent_list_ops: 64,
             truncate_up: true,
             clear_on_unsupported_version: false,
             mlock_headers: false,
+            #[cfg(feature = "flush_aggregation")]
+            flush_aggregation_delay: None,
         }
     }
 }

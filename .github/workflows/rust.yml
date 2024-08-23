@@ -37,4 +37,6 @@ jobs:
     - name: Run mini-candy
       run: cargo -Z unstable-options -C mini-candy run
     - name: Run test-list-collisions
-      run: cargo -Z unstable-options -C test-list-collisions run --release
+      run: cargo test -F whitebox_testing --test test_list_collisions -- --nocapture
+    - name: Run test-flush-agg
+      run: cargo test --test -F flush_aggregation test_flush_agg -- --nocapture

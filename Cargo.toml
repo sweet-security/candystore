@@ -22,6 +22,7 @@ libc = "0.2.158"
 
 [features]
 whitebox_testing = []
+flush_aggregation = []
 
 [workspace]
-members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf", "mini-candy", "test-list-collisions"]
+members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf", "mini-candy"]

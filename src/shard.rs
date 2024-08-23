@@ -205,10 +205,14 @@ pub(crate) struct Shard {
     mmap: MmapMut, // needed to prevent it from dropping
     header: &'static mut ShardHeader,
     row_locks: Vec<RwLock<()>>,
+    #[cfg(feature = "flush_aggregation")]
+    sync_agg_mutex: parking_lot::Mutex<()>,
+    #[cfg(feature = "flush_aggregation")]
+    in_sync_agg_delay: std::sync::atomic::AtomicBool,
 }
 
-enum TryReplaceStatus {
-    KeyDoesNotExist,
+enum TryReplaceStatus<'a> {
+    KeyDoesNotExist(RwLockWriteGuard<'a, ()>),
     KeyExistsNotReplaced(Vec<u8>),
     KeyExistsReplaced(Vec<u8>),
 }
@@ -273,7 +277,9 @@ impl Shard {
         let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
 
         if cfg!(target_family = "unix") {
-            unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
+            if config.mlock_headers {
+                unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
+            }
         }
 
         let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
@@ -291,11 +297,15 @@ impl Shard {
             mmap,
             header,
             row_locks,
+            #[cfg(feature = "flush_aggregation")]
+            sync_agg_mutex: Mutex::new(()),
+            #[cfg(feature = "flush_aggregation")]
+            in_sync_agg_delay: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn flush(&self) -> Result<()> {
-        //self.mmap.flush()?;
+        //self.mmap.flush()? -- fdatasync should take care of that as well
         self.file.sync_data()?;
         Ok(())
     }
@@ -421,8 +431,52 @@ impl Shard {
         Ok(None)
     }
 
-    fn try_replace(
-        &self,
+    #[cfg(feature = "flush_aggregation")]
+    fn flush_aggregation(&self) -> Result<()> {
+        let Some(delay) = self.config.flush_aggregation_delay else {
+            return Ok(());
+        };
+
+        let do_sync = || {
+            self.in_sync_agg_delay.store(true, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            self.in_sync_agg_delay.store(false, Ordering::SeqCst);
+            self.file.sync_data()
+            /*self.mmap.flush()?;
+            let rc = unsafe {
+                libc::sync_file_range(
+                    self.file.as_raw_fd(),
+                    HEADER_SIZE as i64,
+                    HEADER_SIZE as i64 + self.header.write_offset.load(Ordering::Relaxed) as i64,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            ensure!(rc == 0);
+            Ok(())
+            */
+        };
+
+        if let Some(_guard) = self.sync_agg_mutex.try_lock() {
+            // we're the first ones here. wait for the aggregation duration and sync the file
+            do_sync()?;
+        } else {
+            // another thread is currently sync'ing, we're waiting in line. if the holder of the lock is in the
+            // sleep (aggregation) phase, we can just wait for it to finish and return -- the other thread will
+            // have sync'ed us by the time we got the lock. otherwise, we'll need to sync as well
+            let was_in_delay = self.in_sync_agg_delay.load(Ordering::Relaxed);
+            let _guard = self.sync_agg_mutex.lock();
+            if !was_in_delay {
+                do_sync()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_replace<'a>(
+        &'a self,
+        guard: RwLockWriteGuard<'a, ()>,
         row: &mut ShardRow,
         ph: PartedHash,
         key: &[u8],
@@ -456,11 +510,16 @@ impl Shard {
                 self.header
                     .wasted_bytes
                     .fetch_add((k.len() + existing_val.len()) as u64, Ordering::SeqCst);
+                #[cfg(feature = "flush_aggregation")]
+                {
+                    drop(guard);
+                    self.flush_aggregation()?;
+                }
             }
             return Ok(TryReplaceStatus::KeyExistsReplaced(existing_val));
         }
 
-        Ok(TryReplaceStatus::KeyDoesNotExist)
+        Ok(TryReplaceStatus::KeyDoesNotExist(guard))
     }
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
@@ -481,7 +540,7 @@ impl Shard {
         val: &[u8],
         mode: InsertMode,
     ) -> Result<InsertStatus> {
-        let (_guard, row) = self.get_row_mut(ph);
+        let (guard, row) = self.get_row_mut(ph);
 
         if self.header.write_offset.load(Ordering::Relaxed) as u64
             + (full_key.len() + val.len()) as u64
@@ -498,8 +557,8 @@ impl Shard {
             }
         }
 
-        match self.try_replace(row, ph, &full_key, val, mode)? {
-            TryReplaceStatus::KeyDoesNotExist => {
+        match self.try_replace(guard, row, ph, &full_key, val, mode)? {
+            TryReplaceStatus::KeyDoesNotExist(_guard) => {
                 if matches!(mode, InsertMode::Replace(_)) {
                     return Ok(InsertStatus::KeyDoesNotExist);
                 }
@@ -514,6 +573,11 @@ impl Shard {
                     std::sync::atomic::fence(Ordering::SeqCst);
                     row.signatures[idx] = ph.signature();
                     self.header.num_inserted.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "flush_aggregation")]
+                    {
+                        drop(_guard);
+                        self.flush_aggregation()?;
+                    }
                     Ok(InsertStatus::Added)
                 } else {
                     // no room in this row, must split
@@ -540,6 +604,11 @@ impl Shard {
                 self.header
                     .wasted_bytes
                     .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
+                #[cfg(feature = "flush_aggregation")]
+                {
+                    drop(_guard);
+                    self.flush_aggregation()?;
+                }
                 return Ok(Some(v));
             }
         }

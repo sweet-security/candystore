@@ -173,6 +173,9 @@ pub(crate) struct InternalConfig {
     pub max_concurrent_list_ops: u32,
     pub truncate_up: bool,
     pub clear_on_unsupported_version: bool,
+    pub mlock_headers: bool,
+    #[cfg(feature = "flush_aggregation")]
+    pub flush_aggregation_delay: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +351,9 @@ impl CandyStore {
             min_compaction_threashold: config.min_compaction_threashold,
             truncate_up: config.truncate_up,
             clear_on_unsupported_version: config.clear_on_unsupported_version,
+            mlock_headers: config.mlock_headers,
+            #[cfg(feature = "flush_aggregation")]
+            flush_aggregation_delay: config.flush_aggregation_delay,
         });
 
         std::fs::create_dir_all(dir_path)?;
