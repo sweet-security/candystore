@@ -162,7 +162,7 @@ fn test_compaction_stats() -> Result<()> {
             .iter()
             .any(|s| matches!(s.0, CompactionKind::Split(_, _))));
 
-        for i in 500..1000 {
+        for i in 500..10000 {
             db.set("key", &format!("val{i:0200}"))?;
         }
 
