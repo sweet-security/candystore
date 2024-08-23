@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use crate::shard::{NUM_ROWS, ROW_WIDTH};
@@ -176,6 +177,7 @@ pub(crate) struct InternalConfig {
     pub mlock_headers: bool,
     #[cfg(feature = "flush_aggregation")]
     pub flush_aggregation_delay: Option<std::time::Duration>,
+    pub num_of_compaction_stats: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +235,57 @@ impl GetOrCreateStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CompactionKind {
+    // reclaimed size (bytes)
+    Compaction(u32),
+    // sizes of bottom and top shards in bytes
+    Split(u32, u32),
+}
+
+pub(crate) struct CompactionStats {
+    last_fetch: AtomicUsize,
+    counter: AtomicUsize,
+    enabled: bool,
+    stats: Mutex<Vec<(CompactionKind, Duration)>>,
+}
+
+impl CompactionStats {
+    fn new(size: usize) -> Self {
+        Self {
+            last_fetch: Default::default(),
+            counter: Default::default(),
+            enabled: size > 0,
+            stats: Mutex::new(vec![(CompactionKind::Compaction(0), Duration::ZERO); size]),
+        }
+    }
+
+    pub(crate) fn push_stat(&self, t0: Instant, kind: CompactionKind) {
+        if !self.enabled {
+            return;
+        }
+        let dur = Instant::now().duration_since(t0);
+        let mut stats = self.stats.lock();
+        let cnt = self.counter.fetch_add(1, Ordering::SeqCst);
+        let len = stats.len();
+        stats[cnt % len] = (kind, dur);
+    }
+
+    pub fn fetch(&self) -> (usize, Vec<(CompactionKind, Duration)>) {
+        let stats = self.stats.lock();
+        let cnt = self.counter.load(Ordering::Relaxed);
+        let last_fetch = self.last_fetch.load(Ordering::Relaxed);
+        self.last_fetch.store(cnt, Ordering::Relaxed);
+        let mut durs = Vec::with_capacity(stats.len());
+        if self.enabled {
+            for i in last_fetch.max(cnt.checked_sub(stats.len()).unwrap_or(last_fetch))..cnt {
+                durs.push(stats[i % stats.len()]);
+            }
+        }
+        (cnt, durs)
+    }
+}
+
 /// The CandyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
 pub struct CandyStore {
     pub(crate) root: ShardRouter,
@@ -245,6 +298,7 @@ pub struct CandyStore {
     pub(crate) keyed_locks_mask: u32,
     pub(crate) keyed_locks: Vec<Mutex<()>>,
     _lockfile: LockFile,
+    compaction_stats: Arc<CompactionStats>,
 }
 
 /// An iterator over a CandyStore. Note that it's safe to modify (insert/delete) keys while iterating,
@@ -354,6 +408,7 @@ impl CandyStore {
             mlock_headers: config.mlock_headers,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: config.flush_aggregation_delay,
+            num_of_compaction_stats: config.num_of_compaction_stats,
         });
 
         std::fs::create_dir_all(dir_path)?;
@@ -377,6 +432,7 @@ impl CandyStore {
         let num_splits = Arc::new(AtomicUsize::new(0));
 
         let root = ShardRouter::new(config.clone(), num_compactions.clone(), num_splits.clone())?;
+        let compaction_stats = Arc::new(CompactionStats::new(config.num_of_compaction_stats));
 
         Ok(Self {
             config,
@@ -387,6 +443,7 @@ impl CandyStore {
             keyed_locks_mask: num_keyed_locks - 1,
             keyed_locks,
             _lockfile: lockfile,
+            compaction_stats,
         })
     }
 
@@ -491,7 +548,9 @@ impl CandyStore {
         }
 
         loop {
-            let status = self.root.insert(ph, full_key, val, mode)?;
+            let status =
+                self.root
+                    .insert(ph, full_key, val, mode, self.compaction_stats.clone())?;
 
             match status {
                 InsertStatus::Added => {
@@ -635,6 +694,11 @@ impl CandyStore {
     /// Ephemeral stats: number of splits performed
     pub fn _num_splits(&self) -> usize {
         self.num_splits.load(Ordering::Acquire)
+    }
+
+    /// Fetch compaction and split stats, returns the number of compactions/splits and the recent
+    pub fn fetch_compaction_stats(&self) -> (usize, Vec<(CompactionKind, Duration)>) {
+        self.compaction_stats.fetch()
     }
 
     /// Returns useful stats about the store

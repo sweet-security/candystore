@@ -1,9 +1,11 @@
 use anyhow::ensure;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use std::{ops::Range, sync::Arc};
 
 use crate::shard::{InsertMode, InsertStatus, Shard};
+use crate::store::{CompactionKind, CompactionStats};
 use crate::Result;
 use crate::{hashing::PartedHash, store::InternalConfig};
 
@@ -343,13 +345,15 @@ impl ShardRouter {
         }
     }
 
-    fn split_shard(&self) -> Result<()> {
+    fn split_shard(&self, compaction_stats: Arc<CompactionStats>) -> Result<()> {
         let mut guard = self.node.write();
         let ShardNode::Leaf(sh) = &*guard else {
             // already split
             return Ok(());
         };
         let mid = (sh.span.start + sh.span.end) / 2;
+
+        let t0 = Instant::now();
 
         let bottomfile = self
             .config
@@ -391,6 +395,13 @@ impl ShardRouter {
         )?;
 
         self.num_splits.fetch_add(1, Ordering::SeqCst);
+        compaction_stats.push_stat(
+            t0,
+            CompactionKind::Split(
+                bottom_shard.get_write_offset(),
+                top_shard.get_write_offset(),
+            ),
+        );
 
         *guard = ShardNode::Vertex(
             Arc::new(ShardRouter {
@@ -412,7 +423,11 @@ impl ShardRouter {
         Ok(())
     }
 
-    fn compact_shard(&self, write_offset: u32) -> Result<()> {
+    fn compact_shard(
+        &self,
+        write_offset: u32,
+        compaction_stats: Arc<CompactionStats>,
+    ) -> Result<()> {
         let mut guard = self.node.write();
         let ShardNode::Leaf(sh) = &*guard else {
             // was split
@@ -422,6 +437,8 @@ impl ShardRouter {
             // already compacted
             return Ok(());
         };
+
+        let t0 = Instant::now();
         let orig_filename = self
             .config
             .dir_path
@@ -441,6 +458,15 @@ impl ShardRouter {
         self.num_compactions.fetch_add(1, Ordering::SeqCst);
 
         std::fs::rename(tmpfile, orig_filename)?;
+        compaction_stats.push_stat(
+            t0,
+            CompactionKind::Compaction(
+                sh.get_write_offset()
+                    .checked_sub(compacted_shard.get_write_offset())
+                    .unwrap_or(0),
+            ),
+        );
+
         *guard = ShardNode::Leaf(compacted_shard);
 
         Ok(())
@@ -452,26 +478,27 @@ impl ShardRouter {
         full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
+        compaction_stats: Arc<CompactionStats>,
     ) -> Result<InsertStatus> {
         loop {
             let res = match &*self.node.read() {
                 ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode)?,
                 ShardNode::Vertex(bottom, top) => {
                     if (ph.shard_selector() as u32) < bottom.span.end {
-                        bottom.insert(ph, full_key, val, mode)?
+                        bottom.insert(ph, full_key, val, mode, compaction_stats.clone())?
                     } else {
-                        top.insert(ph, full_key, val, mode)?
+                        top.insert(ph, full_key, val, mode, compaction_stats.clone())?
                     }
                 }
             };
 
             match res {
                 InsertStatus::SplitNeeded => {
-                    self.split_shard()?;
+                    self.split_shard(compaction_stats.clone())?;
                     // retry
                 }
                 InsertStatus::CompactionNeeded(write_offset) => {
-                    self.compact_shard(write_offset)?;
+                    self.compact_shard(write_offset, compaction_stats.clone())?;
                     // retry
                 }
                 _ => {

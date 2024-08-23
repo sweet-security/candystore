@@ -298,9 +298,9 @@ impl Shard {
             header,
             row_locks,
             #[cfg(feature = "flush_aggregation")]
-            sync_agg_mutex: Mutex::new(()),
+            sync_agg_mutex: parking_lot::Mutex::new(()),
             #[cfg(feature = "flush_aggregation")]
-            in_sync_agg_delay: AtomicBool::new(false),
+            in_sync_agg_delay: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

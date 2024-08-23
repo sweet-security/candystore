@@ -57,7 +57,8 @@ pub use hashing::HashSeed;
 pub use lists::{ListCompactionParams, ListIterator};
 use std::fmt::{Display, Formatter};
 pub use store::{
-    CandyStore, CoarseHistogram, GetOrCreateStatus, ReplaceStatus, SetStatus, SizeHistogram, Stats,
+    CandyStore, CoarseHistogram, CompactionKind, GetOrCreateStatus, ReplaceStatus, SetStatus,
+    SizeHistogram, Stats,
 };
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
 
@@ -120,6 +121,8 @@ pub struct Config {
     /// to ensure reboot consistency
     #[cfg(feature = "flush_aggregation")]
     pub flush_aggregation_delay: Option<std::time::Duration>,
+    /// number of compaction stats to keep (0 means disabled)
+    pub num_of_compaction_stats: usize,
 }
 
 impl Default for Config {
@@ -135,6 +138,7 @@ impl Default for Config {
             mlock_headers: false,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: None,
+            num_of_compaction_stats: 0,
         }
     }
 }

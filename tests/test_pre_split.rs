@@ -1,6 +1,6 @@
 mod common;
 
-use candystore::{CandyError, CandyStore, Config, Result};
+use candystore::{CandyError, CandyStore, CompactionKind, Config, Result};
 
 use crate::common::run_in_tempdir;
 
@@ -128,6 +128,55 @@ fn test_too_large() -> Result<()> {
         db.set("zzz", &vec![7u8; 700])?;
         assert_eq!(db._num_compactions(), 0);
         assert_eq!(db._num_splits(), 1);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn test_compaction_stats() -> Result<()> {
+    run_in_tempdir(|dir| {
+        let db = CandyStore::open(
+            dir,
+            Config {
+                max_shard_size: 20_000,
+                min_compaction_threashold: 10_000,
+                num_of_compaction_stats: 10,
+                ..Default::default()
+            },
+        )?;
+
+        let (generation1, stats1) = db.fetch_compaction_stats();
+        assert_eq!(generation1, 0);
+        assert!(stats1.is_empty());
+
+        for i in 1..500 {
+            db.set(&format!("key{i}"), &format!("val{i:0200}"))?;
+        }
+
+        let (generation2, stats2) = db.fetch_compaction_stats();
+        println!("{stats2:?}");
+
+        assert!(generation2 > generation1);
+        assert!(stats2
+            .iter()
+            .any(|s| matches!(s.0, CompactionKind::Split(_, _))));
+
+        for i in 500..1000 {
+            db.set("key", &format!("val{i:0200}"))?;
+        }
+
+        let (generation3, stats3) = db.fetch_compaction_stats();
+        println!("{stats3:?}");
+
+        assert!(generation3 > generation2);
+        assert!(stats3
+            .iter()
+            .any(|s| matches!(s.0, CompactionKind::Compaction(_))));
+
+        let (generation4, stats4) = db.fetch_compaction_stats();
+        assert_eq!(generation4, generation3);
+        assert!(stats4.is_empty());
 
         Ok(())
     })
