@@ -353,7 +353,11 @@ impl ShardRouter {
         };
         let mid = (sh.span.start + sh.span.end) / 2;
 
-        let t0 = Instant::now();
+        let t0 = if compaction_stats.is_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let bottomfile = self
             .config
@@ -395,13 +399,16 @@ impl ShardRouter {
         )?;
 
         self.num_splits.fetch_add(1, Ordering::SeqCst);
-        compaction_stats.push_stat(
-            t0,
-            CompactionKind::Split(
-                bottom_shard.get_write_offset(),
-                top_shard.get_write_offset(),
-            ),
-        );
+
+        if let Some(t0) = t0 {
+            compaction_stats.push_stat(
+                t0,
+                CompactionKind::Split(
+                    bottom_shard.get_write_offset(),
+                    top_shard.get_write_offset(),
+                ),
+            );
+        }
 
         *guard = ShardNode::Vertex(
             Arc::new(ShardRouter {
@@ -438,7 +445,11 @@ impl ShardRouter {
             return Ok(());
         };
 
-        let t0 = Instant::now();
+        let t0 = if compaction_stats.is_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let orig_filename = self
             .config
             .dir_path
@@ -458,14 +469,17 @@ impl ShardRouter {
         self.num_compactions.fetch_add(1, Ordering::SeqCst);
 
         std::fs::rename(tmpfile, orig_filename)?;
-        compaction_stats.push_stat(
-            t0,
-            CompactionKind::Compaction(
-                sh.get_write_offset()
-                    .checked_sub(compacted_shard.get_write_offset())
-                    .unwrap_or(0),
-            ),
-        );
+
+        if let Some(t0) = t0 {
+            compaction_stats.push_stat(
+                t0,
+                CompactionKind::Compaction(
+                    sh.get_write_offset()
+                        .checked_sub(compacted_shard.get_write_offset())
+                        .unwrap_or(0),
+                ),
+            );
+        }
 
         *guard = ShardNode::Leaf(compacted_shard);
 

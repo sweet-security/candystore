@@ -246,29 +246,40 @@ pub enum CompactionKind {
 pub(crate) struct CompactionStats {
     last_fetch: AtomicUsize,
     counter: AtomicUsize,
-    enabled: bool,
+    mask: usize,
     stats: Mutex<Vec<(CompactionKind, Duration)>>,
 }
 
 impl CompactionStats {
     fn new(size: usize) -> Self {
+        let mask = if size == 0 {
+            0
+        } else if size.is_power_of_two() {
+            size - 1
+        } else {
+            (1 << (size.ilog2() + 1)) - 1
+        };
         Self {
             last_fetch: Default::default(),
             counter: Default::default(),
-            enabled: size > 0,
-            stats: Mutex::new(vec![(CompactionKind::Compaction(0), Duration::ZERO); size]),
+            mask,
+            stats: Mutex::new(vec![
+                (CompactionKind::Compaction(0), Duration::ZERO);
+                mask + 1
+            ]),
         }
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.mask != 0
+    }
+
     pub(crate) fn push_stat(&self, t0: Instant, kind: CompactionKind) {
-        if !self.enabled {
-            return;
-        }
+        debug_assert!(self.is_enabled());
         let dur = Instant::now().duration_since(t0);
         let mut stats = self.stats.lock();
         let cnt = self.counter.fetch_add(1, Ordering::SeqCst);
-        let len = stats.len();
-        stats[cnt % len] = (kind, dur);
+        stats[cnt & self.mask] = (kind, dur);
     }
 
     pub fn fetch(&self) -> (usize, Vec<(CompactionKind, Duration)>) {
@@ -277,9 +288,10 @@ impl CompactionStats {
         let last_fetch = self.last_fetch.load(Ordering::Relaxed);
         self.last_fetch.store(cnt, Ordering::Relaxed);
         let mut durs = Vec::with_capacity(stats.len());
-        if self.enabled {
+
+        if self.is_enabled() {
             for i in last_fetch.max(cnt.checked_sub(stats.len()).unwrap_or(last_fetch))..cnt {
-                durs.push(stats[i % stats.len()]);
+                durs.push(stats[i & self.mask]);
             }
         }
         (cnt, durs)
