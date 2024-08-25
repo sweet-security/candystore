@@ -72,6 +72,7 @@ pub enum CandyError {
     ValueTooLong(usize),
     EntryCannotFitInShard(usize, usize),
     KeyNotFound,
+    KeyAlreadyExists(Vec<u8>, u64),
     CompactionFailed(String),
     SplitFailed(String),
     LoadingFailed(String),
@@ -84,6 +85,9 @@ impl Display for CandyError {
             Self::KeyTooLong(sz) => write!(f, "key too long {sz}"),
             Self::KeyNotFound => write!(f, "key not found"),
             Self::ValueTooLong(sz) => write!(f, "value too long {sz}"),
+            Self::KeyAlreadyExists(key, ph) => {
+                write!(f, "key {key:?} already exists (0x{ph:016x})")
+            }
             Self::EntryCannotFitInShard(sz, max) => {
                 write!(f, "entry too big ({sz}) for a single shard file ({max})")
             }

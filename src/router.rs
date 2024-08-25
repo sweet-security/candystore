@@ -402,7 +402,7 @@ impl ShardRouter {
         Ok(())
     }
 
-    fn compact_shard(&self, write_offset: u32) -> Result<()> {
+    fn compact_shard(&self, write_offset: u64) -> Result<()> {
         let mut guard = self.node.write();
         let ShardNode::Leaf(sh) = &*guard else {
             // was split

@@ -68,6 +68,10 @@ impl PartedHash {
         self.0 as u32
     }
 
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
     fn from_hash(h: Hash128) -> Self {
         let mut sig = h.h1 as u32;
         if sig == INVALID_SIG {

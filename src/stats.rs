@@ -13,15 +13,16 @@ pub struct Stats {
     pub num_shards: usize,
     pub num_splits: usize,
     pub num_compactions: usize,
-    pub last_split_stats: Vec<(Duration, u32, u32)>,
-    pub last_compaction_stats: Vec<(Duration, u32, u32)>,
+    pub last_split_stats: Vec<(Duration, u64, u64)>,
+    pub last_compaction_stats: Vec<(Duration, u64, u64)>,
 
     pub occupied_bytes: usize,
     pub wasted_bytes: usize,
 
     pub num_inserts: usize,
     pub num_updates: usize,
-    pub num_lookups: usize,
+    pub num_positive_lookups: usize,
+    pub num_negative_lookups: usize,
     pub num_removals: usize,
 
     pub num_read_ops: usize,
@@ -58,10 +59,10 @@ impl Stats {
 impl Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, 
-            "shards={} [splits={} compacts={}] [occupied={} wasted={}] [ins={} updt={} lkup={} rem={}] reads=[{}, {}b] writes=[{}, {}b]",
+            "shards={} [splits={} compacts={}] [occupied={} wasted={}] [ins={} updt={} +lkup={} -lkup={} rem={}] reads=[{}, {}b] writes=[{}, {}b]",
             self.num_shards, self.num_splits, self.num_compactions, self.occupied_bytes, self.wasted_bytes, 
-            self.num_inserts, self.num_updates, self.num_lookups,self.num_removals, self.num_read_ops,
-            self.num_read_bytes, self.num_write_ops, self.num_write_bytes)
+            self.num_inserts, self.num_updates, self.num_positive_lookups, self.num_negative_lookups, 
+            self.num_removals, self.num_read_ops, self.num_read_bytes, self.num_write_ops, self.num_write_bytes)
     }
 }
 
@@ -127,12 +128,13 @@ fn test_cyclic_arr() {
 pub struct InternalStats {
     pub(crate) num_splits: AtomicUsize,
     pub(crate) num_compactions: AtomicUsize,
-    pub(crate) last_compaction_stats: Mutex<CyclicArr<(Duration, u32, u32), 8>>,
-    pub(crate) last_split_stats: Mutex<CyclicArr<(Duration, u32, u32), 8>>,
+    pub(crate) last_compaction_stats: Mutex<CyclicArr<(Duration, u64, u64), 8>>,
+    pub(crate) last_split_stats: Mutex<CyclicArr<(Duration, u64, u64), 8>>,
 
     pub(crate) num_inserts: AtomicUsize,
     pub(crate) num_updates: AtomicUsize,
-    pub(crate) num_lookups: AtomicUsize,
+    pub(crate) num_positive_lookups: AtomicUsize,
+    pub(crate) num_negative_lookups: AtomicUsize,
     pub(crate) num_removals: AtomicUsize,
 
     pub(crate) num_read_ops: AtomicUsize,
@@ -149,28 +151,28 @@ pub struct InternalStats {
 
 impl InternalStats {
     pub(crate) fn add_entry(&self, sz: usize) {
-        self.num_write_bytes.fetch_add(sz, Ordering::SeqCst);
-        self.num_write_ops.fetch_add(1, Ordering::SeqCst);
+        self.num_write_bytes.fetch_add(sz, Ordering::Relaxed);
+        self.num_write_ops.fetch_add(1, Ordering::Relaxed);
         match sz {
-            0..128 => self.entries_under_128.fetch_add(1, Ordering::SeqCst),
-            128..1024 => self.entries_under_1k.fetch_add(1, Ordering::SeqCst),
-            1024..8192 => self.entries_under_8k.fetch_add(1, Ordering::SeqCst),
-            8192..32768 => self.entries_under_32k.fetch_add(1, Ordering::SeqCst),
-            _ => self.entries_over_32k.fetch_add(1, Ordering::SeqCst),
+            0..128 => self.entries_under_128.fetch_add(1, Ordering::Relaxed),
+            128..1024 => self.entries_under_1k.fetch_add(1, Ordering::Relaxed),
+            1024..8192 => self.entries_under_8k.fetch_add(1, Ordering::Relaxed),
+            8192..32768 => self.entries_under_32k.fetch_add(1, Ordering::Relaxed),
+            _ => self.entries_over_32k.fetch_add(1, Ordering::Relaxed),
         };
     }
 
-    pub(crate) fn report_split(&self, t0: Instant, bottom_size: u32, top_size: u32) {
+    pub(crate) fn report_split(&self, t0: Instant, bottom_size: u64, top_size: u64) {
         let dur = Instant::now().duration_since(t0);
-        self.num_splits.fetch_add(1, Ordering::SeqCst);
+        self.num_splits.fetch_add(1, Ordering::Relaxed);
         self.last_split_stats
             .lock()
             .push((dur, bottom_size, top_size));
     }
 
-    pub(crate) fn report_compaction(&self, t0: Instant, prev_size: u32, new_size: u32) {
+    pub(crate) fn report_compaction(&self, t0: Instant, prev_size: u64, new_size: u64) {
         let dur = Instant::now().duration_since(t0);
-        self.num_compactions.fetch_add(1, Ordering::SeqCst);
+        self.num_compactions.fetch_add(1, Ordering::Relaxed);
         self.last_compaction_stats
             .lock()
             .push((dur, prev_size, new_size));
@@ -186,7 +188,8 @@ impl InternalStats {
 
         self.num_inserts.store(0, Ordering::SeqCst);
         self.num_updates.store(0, Ordering::SeqCst);
-        self.num_lookups.store(0, Ordering::SeqCst);
+        self.num_positive_lookups.store(0, Ordering::SeqCst);
+        self.num_negative_lookups.store(0, Ordering::SeqCst);
         self.num_removals.store(0, Ordering::SeqCst);
 
         self.num_read_ops.store(0, Ordering::SeqCst);
@@ -218,7 +221,8 @@ impl InternalStats {
 
         stats.num_inserts = self.num_inserts.load(Ordering::Relaxed);
         stats.num_updates = self.num_updates.load(Ordering::Relaxed);
-        stats.num_lookups = self.num_lookups.load(Ordering::Relaxed);
+        stats.num_positive_lookups = self.num_positive_lookups.load(Ordering::Relaxed);
+        stats.num_negative_lookups = self.num_negative_lookups.load(Ordering::Relaxed);
         stats.num_removals = self.num_removals.load(Ordering::Relaxed);
 
         stats.num_read_ops = self.num_read_ops.load(Ordering::Relaxed);

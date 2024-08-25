@@ -174,6 +174,7 @@ impl CandyStore {
         // if the item already exists, it's already part of the list. just update it and preserve the index
         if let Some(mut existing_val) = self.get_raw(&item_key)? {
             match mode {
+                InsertMode::MustCreate => unreachable!(),
                 InsertMode::GetOrCreate => {
                     existing_val.truncate(existing_val.len() - size_of::<u64>());
                     return Ok(InsertToListStatus::ExistingValue(existing_val));
