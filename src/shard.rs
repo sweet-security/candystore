@@ -19,8 +19,8 @@ use memmap::{MmapMut, MmapOptions};
 use crate::Result;
 use crate::{
     hashing::{PartedHash, INVALID_SIG},
+    stats::InternalStats,
     store::InternalConfig,
-    SizeHistogram,
 };
 
 //
@@ -95,60 +95,8 @@ fn test_row_lookup() -> Result<()> {
 #[repr(C, align(4096))]
 struct PageAligned<T>(T);
 
-#[repr(C)]
-struct ShardSizeHistogram {
-    counts_64b: [AtomicU32; 16],
-    counts_1kb: [AtomicU32; 15],
-    counts_16kb: [AtomicU32; 4],
-}
-
-impl ShardSizeHistogram {
-    fn insert(&self, sz: usize) {
-        if sz < 1024 {
-            self.counts_64b[sz / 64].fetch_add(1, Ordering::Relaxed);
-        } else if sz < 16 * 1024 {
-            self.counts_1kb[(sz - 1024) / 1024].fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.counts_16kb[(sz - 16 * 1024) / (16 * 1024)].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-#[test]
-fn test_shard_size_histogram() {
-    let hist = ShardSizeHistogram {
-        counts_64b: Default::default(),
-        counts_1kb: Default::default(),
-        counts_16kb: Default::default(),
-    };
-    hist.insert(0);
-    hist.insert(63);
-    hist.insert(1022);
-    hist.insert(1023);
-    assert_eq!(hist.counts_64b[0].load(Ordering::Relaxed), 2);
-    assert_eq!(hist.counts_64b[15].load(Ordering::Relaxed), 2);
-
-    hist.insert(1024);
-    hist.insert(1025);
-    hist.insert(16382);
-    hist.insert(16383);
-    assert_eq!(hist.counts_1kb[0].load(Ordering::Relaxed), 2);
-    assert_eq!(hist.counts_1kb[14].load(Ordering::Relaxed), 2);
-
-    hist.insert(16384);
-    hist.insert(16385);
-    hist.insert(65534);
-    hist.insert(65535);
-    assert_eq!(hist.counts_16kb[0].load(Ordering::Relaxed), 2);
-    assert_eq!(hist.counts_16kb[2].load(Ordering::Relaxed), 2);
-
-    hist.insert(65536);
-    hist.insert(65537);
-    assert_eq!(hist.counts_16kb[3].load(Ordering::Relaxed), 2);
-}
-
 pub(crate) const SHARD_FILE_MAGIC: u64 = 0x72745379646e6143; // "CandyStr"
-pub(crate) const SHARD_FILE_VERSION: u64 = 0x06;
+pub(crate) const SHARD_FILE_VERSION: u64 = 0x07;
 
 #[derive(Clone, Copy, Default, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -160,11 +108,8 @@ struct MetaHeader {
 #[repr(C)]
 struct ShardHeader {
     metadata: MetaHeader,
-    num_inserted: AtomicU64,
-    num_removed: AtomicU64,
     wasted_bytes: AtomicU64,
     write_offset: AtomicU32,
-    size_histogram: ShardSizeHistogram,
     rows: PageAligned<[ShardRow; NUM_ROWS]>,
 }
 
@@ -209,6 +154,7 @@ pub(crate) struct Shard {
     sync_agg_mutex: parking_lot::Mutex<()>,
     #[cfg(feature = "flush_aggregation")]
     in_sync_agg_delay: std::sync::atomic::AtomicBool,
+    stats: Arc<InternalStats>,
 }
 
 enum TryReplaceStatus<'a> {
@@ -225,6 +171,7 @@ impl Shard {
         span: Range<u32>,
         truncate: bool,
         config: Arc<InternalConfig>,
+        stats: Arc<InternalStats>,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -301,6 +248,7 @@ impl Shard {
             sync_agg_mutex: parking_lot::Mutex::new(()),
             #[cfg(feature = "flush_aggregation")]
             in_sync_agg_delay: std::sync::atomic::AtomicBool::new(false),
+            stats,
         })
     }
 
@@ -325,6 +273,11 @@ impl Shard {
         let mut buf = vec![0u8; klen + vlen];
         self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
 
+        self.stats
+            .num_read_bytes
+            .fetch_add(buf.len(), Ordering::SeqCst);
+        self.stats.num_read_ops.fetch_add(1, Ordering::SeqCst);
+
         let val = buf[klen..klen + vlen].to_owned();
         buf.truncate(klen);
 
@@ -347,7 +300,7 @@ impl Shard {
 
         // now writing can be non-atomic (pwrite)
         self.file.write_all_at(&buf, HEADER_SIZE + write_offset)?;
-        self.header.size_histogram.insert(entry_size);
+        self.stats.add_entry(entry_size);
 
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
     }
@@ -366,7 +319,7 @@ impl Shard {
         for res in self.unlocked_iter() {
             let (k, v) = res?;
             let ph = PartedHash::new(&self.config.hash_seed, &k);
-            let status = new_shard.insert(ph, &k, &v, InsertMode::Set)?;
+            let status = new_shard.insert(ph, &k, &v, InsertMode::Set, false)?;
             ensure!(matches!(status, InsertStatus::Added));
         }
 
@@ -378,9 +331,9 @@ impl Shard {
 
             let ph = PartedHash::new(&self.config.hash_seed, &k);
             let status = if (ph.shard_selector() as u32) < bottom_shard.span.end {
-                bottom_shard.insert(ph, &k, &v, InsertMode::Set)?
+                bottom_shard.insert(ph, &k, &v, InsertMode::Set, false)?
             } else {
-                top_shard.insert(ph, &k, &v, InsertMode::Set)?
+                top_shard.insert(ph, &k, &v, InsertMode::Set, false)?
             };
             ensure!(
                 matches!(status, InsertStatus::Added),
@@ -410,6 +363,7 @@ impl Shard {
     }
 
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
+        self.stats.num_lookups.fetch_add(1, Ordering::SeqCst);
         let (_guard, row) = self.get_row(ph);
         let mut kvs = Vec::with_capacity(1);
         let mut start = 0;
@@ -420,6 +374,7 @@ impl Shard {
     }
 
     pub(crate) fn get(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.stats.num_lookups.fetch_add(1, Ordering::SeqCst);
         let (_guard, row) = self.get_row(ph);
         let mut start = 0;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
@@ -482,6 +437,7 @@ impl Shard {
         key: &[u8],
         val: &[u8],
         mode: InsertMode,
+        inc_stats: bool,
     ) -> Result<TryReplaceStatus> {
         let mut start = 0;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
@@ -492,6 +448,9 @@ impl Shard {
             match mode {
                 InsertMode::GetOrCreate => {
                     // no-op, key already exists
+                    if inc_stats {
+                        self.stats.num_lookups.fetch_add(1, Ordering::SeqCst);
+                    }
                     return Ok(TryReplaceStatus::KeyExistsNotReplaced(existing_val));
                 }
                 InsertMode::Set => {
@@ -510,6 +469,9 @@ impl Shard {
                 self.header
                     .wasted_bytes
                     .fetch_add((k.len() + existing_val.len()) as u64, Ordering::SeqCst);
+                if inc_stats {
+                    self.stats.num_updates.fetch_add(1, Ordering::SeqCst);
+                }
                 #[cfg(feature = "flush_aggregation")]
                 {
                     drop(guard);
@@ -539,6 +501,7 @@ impl Shard {
         full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
+        inc_stats: bool,
     ) -> Result<InsertStatus> {
         let (guard, row) = self.get_row_mut(ph);
 
@@ -557,7 +520,7 @@ impl Shard {
             }
         }
 
-        match self.try_replace(guard, row, ph, &full_key, val, mode)? {
+        match self.try_replace(guard, row, ph, &full_key, val, mode, inc_stats)? {
             TryReplaceStatus::KeyDoesNotExist(_guard) => {
                 if matches!(mode, InsertMode::Replace(_)) {
                     return Ok(InsertStatus::KeyDoesNotExist);
@@ -572,7 +535,9 @@ impl Shard {
                     row.offsets_and_sizes[idx] = new_off;
                     std::sync::atomic::fence(Ordering::SeqCst);
                     row.signatures[idx] = ph.signature();
-                    self.header.num_inserted.fetch_add(1, Ordering::Relaxed);
+                    if inc_stats {
+                        self.stats.num_inserts.fetch_add(1, Ordering::SeqCst);
+                    }
                     #[cfg(feature = "flush_aggregation")]
                     {
                         drop(_guard);
@@ -600,7 +565,7 @@ impl Shard {
             if key == k {
                 row.signatures[idx] = INVALID_SIG;
                 // we managed to remove this key
-                self.header.num_removed.fetch_add(1, Ordering::Relaxed);
+                self.stats.num_removals.fetch_add(1, Ordering::SeqCst);
                 self.header
                     .wasted_bytes
                     .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
@@ -619,25 +584,7 @@ impl Shard {
     pub(crate) fn get_write_offset(&self) -> u32 {
         self.header.write_offset.load(Ordering::Relaxed)
     }
-    pub(crate) fn get_stats(&self) -> (usize, usize, usize, usize) {
-        (
-            self.header.num_inserted.load(Ordering::Relaxed) as usize,
-            self.header.num_removed.load(Ordering::Relaxed) as usize,
-            self.header.write_offset.load(Ordering::Relaxed) as usize,
-            self.header.wasted_bytes.load(Ordering::Relaxed) as usize,
-        )
-    }
-    pub(crate) fn get_size_histogram(&self) -> SizeHistogram {
-        let mut hist = SizeHistogram::default();
-        for (i, h) in self.header.size_histogram.counts_64b.iter().enumerate() {
-            hist.counts_64b[i] = h.load(Ordering::Relaxed) as usize;
-        }
-        for (i, h) in self.header.size_histogram.counts_1kb.iter().enumerate() {
-            hist.counts_1kb[i] = h.load(Ordering::Relaxed) as usize;
-        }
-        for (i, h) in self.header.size_histogram.counts_16kb.iter().enumerate() {
-            hist.counts_16kb[i] = h.load(Ordering::Relaxed) as usize;
-        }
-        hist
+    pub(crate) fn get_wasted_bytes(&self) -> u64 {
+        self.header.wasted_bytes.load(Ordering::Relaxed)
     }
 }

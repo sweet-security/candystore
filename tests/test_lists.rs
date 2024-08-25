@@ -72,7 +72,7 @@ fn test_lists() -> Result<()> {
         }
 
         // make sure we survive splits
-        assert!(db._num_splits() > 1);
+        assert!(db.stats().num_splits > 1);
 
         for (i, res) in db.iter_list("xxx").enumerate() {
             let (k, _) = res?;

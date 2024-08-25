@@ -33,9 +33,11 @@ fn test_logic() -> Result<()> {
         assert!(db.remove("my_name")?.is_none());
         assert!(db.get("my name")?.is_none());
 
-        assert_eq!(db._num_entries(), 1);
-        assert_eq!(db._num_compactions(), 0);
-        assert_eq!(db._num_splits(), 0);
+        let stats = db.stats();
+        assert_eq!(stats.num_entries(), 1);
+        assert_eq!(stats.num_compactions, 0);
+        assert_eq!(stats.num_splits, 0);
+        println!("{stats}");
 
         for _ in 0..1000 {
             db.set(
@@ -47,25 +49,28 @@ fn test_logic() -> Result<()> {
                 .is_some());
         }
 
-        let splits1 = db._num_splits();
-        assert_eq!(db._num_entries(), 1);
-        assert!(db._num_compactions() >= 2);
-        assert_eq!(splits1, 0);
+        let stats1 = db.stats();
+        println!("{stats1}");
+        assert_eq!(stats1.num_entries(), 1);
+        assert!(stats1.num_compactions >= 2);
+        assert_eq!(stats1.num_splits, 0);
 
         for i in 0..1000 {
             db.set(&format!("unique key {i}"), LONG_VAL)?;
         }
 
-        assert_eq!(db._num_entries(), 1001);
-        assert!(db._num_splits() > splits1);
+        let stats2 = db.stats();
+        assert_eq!(stats2.num_entries(), 1001);
+        assert!(stats2.num_splits > stats1.num_splits);
 
         assert_eq!(db.get("your_name")?, Some("vizzini".into()));
         db.clear()?;
         assert_eq!(db.get("your_name")?, None);
 
-        assert_eq!(db._num_entries(), 0);
-        assert_eq!(db._num_compactions(), 0);
-        assert_eq!(db._num_splits(), 0);
+        let stats3 = db.stats();
+        assert_eq!(stats3.num_entries(), 0);
+        assert_eq!(stats3.num_compactions, 0);
+        assert_eq!(stats3.num_splits, 0);
 
         for i in 0..1000 {
             db.set(&format!("unique key {i}"), LONG_VAL)?;
@@ -124,25 +129,11 @@ fn test_histogram() -> Result<()> {
         db.set("k5", &vec![b'b'; 50000])?;
         db.set("kkkkkkkkkkkkkkk", &vec![b'b'; 0xffff])?;
 
-        let hist = db.size_histogram();
-        assert_eq!(
-            hist.iter().collect::<Vec<_>>(),
-            vec![
-                (0..64, 1),
-                (64..128, 1),
-                (448..512, 1),
-                (4096..5120, 2),
-                (49152..65536, 1),
-                (65536..81920, 1)
-            ]
-        );
-
-        assert!(hist.to_string().contains("[64..128): 1"));
-
-        let coarse = hist.to_coarse();
-        assert_eq!(coarse.under512, 3);
-        assert_eq!(coarse.under16k, 2);
-        assert_eq!(coarse.over32k, 2);
+        let stats = db.stats();
+        assert_eq!(stats.entries_under_128, 2);
+        assert_eq!(stats.entries_under_1k, 1);
+        assert_eq!(stats.entries_under_8k, 2);
+        assert_eq!(stats.entries_over_32k, 2);
 
         Ok(())
     })

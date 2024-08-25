@@ -1,11 +1,10 @@
 use anyhow::ensure;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use std::{ops::Range, sync::Arc};
 
 use crate::shard::{InsertMode, InsertStatus, Shard};
-use crate::store::{CompactionKind, CompactionStats};
+use crate::stats::InternalStats;
 use crate::Result;
 use crate::{hashing::PartedHash, store::InternalConfig};
 
@@ -83,33 +82,27 @@ pub(crate) struct ShardRouter {
     span: Range<u32>,
     config: Arc<InternalConfig>,
     node: RwLock<ShardNode>,
-    num_compactions: Arc<AtomicUsize>,
-    num_splits: Arc<AtomicUsize>,
+    stats: Arc<InternalStats>,
 }
 
 impl ShardRouter {
     pub(crate) const END_OF_SHARDS: u32 = 1u32 << 16;
 
-    pub(crate) fn new(
-        config: Arc<InternalConfig>,
-        num_compactions: Arc<AtomicUsize>,
-        num_splits: Arc<AtomicUsize>,
-    ) -> Result<Self> {
-        let mut shards = Self::load(&config)?;
+    pub(crate) fn new(config: Arc<InternalConfig>, stats: Arc<InternalStats>) -> Result<Self> {
+        let mut shards = Self::load(&config, &stats)?;
         if shards.is_empty() {
-            shards = Self::create_initial_shards(&config)?;
+            shards = Self::create_initial_shards(&config, &stats)?;
         }
-        let root = Self::treeify(shards, num_compactions.clone(), num_splits.clone());
+        let root = Self::treeify(shards, stats.clone());
         Ok(Self {
             span: root.span(),
             config,
             node: RwLock::new(root),
-            num_compactions,
-            num_splits,
+            stats,
         })
     }
 
-    fn load(config: &Arc<InternalConfig>) -> Result<Vec<Shard>> {
+    fn load(config: &Arc<InternalConfig>, stats: &Arc<InternalStats>) -> Result<Vec<Shard>> {
         let mut found_shards = vec![];
         for res in std::fs::read_dir(&config.dir_path)? {
             let entry = res?;
@@ -167,13 +160,17 @@ impl ShardRouter {
                 span,
                 false,
                 config.clone(),
+                stats.clone(),
             )?);
         }
 
         Ok(shards)
     }
 
-    fn create_initial_shards(config: &Arc<InternalConfig>) -> Result<Vec<Shard>> {
+    fn create_initial_shards(
+        config: &Arc<InternalConfig>,
+        stats: &Arc<InternalStats>,
+    ) -> Result<Vec<Shard>> {
         let step = (Self::END_OF_SHARDS as f64)
             / (config.expected_number_of_keys as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
         let step = 1 << (step as u32).ilog2();
@@ -189,6 +186,7 @@ impl ShardRouter {
                 start..end,
                 true,
                 config.clone(),
+                stats.clone(),
             )?);
             start = end;
         }
@@ -196,11 +194,7 @@ impl ShardRouter {
         Ok(shards)
     }
 
-    fn from_shardnode(
-        n: ShardNode,
-        num_compactions: Arc<AtomicUsize>,
-        num_splits: Arc<AtomicUsize>,
-    ) -> Self {
+    fn from_shardnode(n: ShardNode, stats: Arc<InternalStats>) -> Self {
         let config = match n {
             ShardNode::Leaf(ref sh) => sh.config.clone(),
             ShardNode::Vertex(ref bottom, _) => bottom.config.clone(),
@@ -209,16 +203,11 @@ impl ShardRouter {
             config,
             span: n.span(),
             node: RwLock::new(n),
-            num_compactions,
-            num_splits,
+            stats,
         }
     }
 
-    fn treeify(
-        shards: Vec<Shard>,
-        num_compactions: Arc<AtomicUsize>,
-        num_splits: Arc<AtomicUsize>,
-    ) -> ShardNode {
+    fn treeify(shards: Vec<Shard>, stats: Arc<InternalStats>) -> ShardNode {
         let mut nodes = vec![];
         let mut spans_debug: Vec<Range<u32>> = vec![];
         for sh in shards {
@@ -249,16 +238,8 @@ impl ShardRouter {
                     nodes.insert(
                         i,
                         ShardNode::Vertex(
-                            Arc::new(Self::from_shardnode(
-                                n0,
-                                num_compactions.clone(),
-                                num_splits.clone(),
-                            )),
-                            Arc::new(Self::from_shardnode(
-                                n1,
-                                num_compactions.clone(),
-                                num_splits.clone(),
-                            )),
+                            Arc::new(Self::from_shardnode(n0, stats.clone())),
+                            Arc::new(Self::from_shardnode(n1, stats.clone())),
                         ),
                     );
                     break;
@@ -321,12 +302,8 @@ impl ShardRouter {
             }
         }
 
-        let shards = Self::create_initial_shards(&self.config)?;
-        *guard = Self::treeify(
-            shards,
-            self.num_compactions.clone(),
-            self.num_splits.clone(),
-        );
+        let shards = Self::create_initial_shards(&self.config, &self.stats)?;
+        *guard = Self::treeify(shards, self.stats.clone());
 
         Ok(())
     }
@@ -345,7 +322,7 @@ impl ShardRouter {
         }
     }
 
-    fn split_shard(&self, compaction_stats: Arc<CompactionStats>) -> Result<()> {
+    fn split_shard(&self) -> Result<()> {
         let mut guard = self.node.write();
         let ShardNode::Leaf(sh) = &*guard else {
             // already split
@@ -353,11 +330,7 @@ impl ShardRouter {
         };
         let mid = (sh.span.start + sh.span.end) / 2;
 
-        let t0 = if compaction_stats.is_enabled() {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let t0 = Instant::now();
 
         let bottomfile = self
             .config
@@ -373,8 +346,15 @@ impl ShardRouter {
             sh.span.start..mid,
             true,
             self.config.clone(),
+            self.stats.clone(),
         )?;
-        let top_shard = Shard::open(topfile.clone(), mid..sh.span.end, true, self.config.clone())?;
+        let top_shard = Shard::open(
+            topfile.clone(),
+            mid..sh.span.end,
+            true,
+            self.config.clone(),
+            self.stats.clone(),
+        )?;
 
         sh.split_into(&bottom_shard, &top_shard)?;
 
@@ -398,43 +378,31 @@ impl ShardRouter {
                 .join(format!("shard_{:04x}-{:04x}", sh.span.start, sh.span.end)),
         )?;
 
-        self.num_splits.fetch_add(1, Ordering::SeqCst);
-
-        if let Some(t0) = t0 {
-            compaction_stats.push_stat(
-                t0,
-                CompactionKind::Split(
-                    bottom_shard.get_write_offset(),
-                    top_shard.get_write_offset(),
-                ),
-            );
-        }
+        self.stats.report_split(
+            t0,
+            bottom_shard.get_write_offset(),
+            top_shard.get_write_offset(),
+        );
 
         *guard = ShardNode::Vertex(
             Arc::new(ShardRouter {
                 span: bottom_shard.span.clone(),
                 config: self.config.clone(),
                 node: RwLock::new(ShardNode::Leaf(bottom_shard)),
-                num_compactions: self.num_compactions.clone(),
-                num_splits: self.num_splits.clone(),
+                stats: self.stats.clone(),
             }),
             Arc::new(ShardRouter {
                 span: top_shard.span.clone(),
                 config: self.config.clone(),
                 node: RwLock::new(ShardNode::Leaf(top_shard)),
-                num_compactions: self.num_compactions.clone(),
-                num_splits: self.num_splits.clone(),
+                stats: self.stats.clone(),
             }),
         );
 
         Ok(())
     }
 
-    fn compact_shard(
-        &self,
-        write_offset: u32,
-        compaction_stats: Arc<CompactionStats>,
-    ) -> Result<()> {
+    fn compact_shard(&self, write_offset: u32) -> Result<()> {
         let mut guard = self.node.write();
         let ShardNode::Leaf(sh) = &*guard else {
             // was split
@@ -445,11 +413,7 @@ impl ShardRouter {
             return Ok(());
         };
 
-        let t0 = if compaction_stats.is_enabled() {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        let t0 = Instant::now();
         let orig_filename = self
             .config
             .dir_path
@@ -459,27 +423,25 @@ impl ShardRouter {
             .dir_path
             .join(format!("compact_{:04x}-{:04x}", sh.span.start, sh.span.end));
 
-        let mut compacted_shard =
-            Shard::open(tmpfile.clone(), sh.span.clone(), true, self.config.clone())?;
+        let mut compacted_shard = Shard::open(
+            tmpfile.clone(),
+            sh.span.clone(),
+            true,
+            self.config.clone(),
+            self.stats.clone(),
+        )?;
 
         // XXX: this can be done in a background thread, holding a read lock until we're done, and then wrap it
         // all up under a write lock
         sh.compact_into(&mut compacted_shard)?;
 
-        self.num_compactions.fetch_add(1, Ordering::SeqCst);
-
         std::fs::rename(tmpfile, orig_filename)?;
 
-        if let Some(t0) = t0 {
-            compaction_stats.push_stat(
-                t0,
-                CompactionKind::Compaction(
-                    sh.get_write_offset()
-                        .checked_sub(compacted_shard.get_write_offset())
-                        .unwrap_or(0),
-                ),
-            );
-        }
+        self.stats.report_compaction(
+            t0,
+            sh.get_write_offset(),
+            compacted_shard.get_write_offset(),
+        );
 
         *guard = ShardNode::Leaf(compacted_shard);
 
@@ -492,27 +454,26 @@ impl ShardRouter {
         full_key: &[u8],
         val: &[u8],
         mode: InsertMode,
-        compaction_stats: Arc<CompactionStats>,
     ) -> Result<InsertStatus> {
         loop {
             let res = match &*self.node.read() {
-                ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode)?,
+                ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode, true)?,
                 ShardNode::Vertex(bottom, top) => {
                     if (ph.shard_selector() as u32) < bottom.span.end {
-                        bottom.insert(ph, full_key, val, mode, compaction_stats.clone())?
+                        bottom.insert(ph, full_key, val, mode)?
                     } else {
-                        top.insert(ph, full_key, val, mode, compaction_stats.clone())?
+                        top.insert(ph, full_key, val, mode)?
                     }
                 }
             };
 
             match res {
                 InsertStatus::SplitNeeded => {
-                    self.split_shard(compaction_stats.clone())?;
+                    self.split_shard()?;
                     // retry
                 }
                 InsertStatus::CompactionNeeded(write_offset) => {
-                    self.compact_shard(write_offset, compaction_stats.clone())?;
+                    self.compact_shard(write_offset)?;
                     // retry
                 }
                 _ => {

@@ -1,6 +1,6 @@
 mod common;
 
-use candystore::{CandyError, CandyStore, CompactionKind, Config, Result};
+use candystore::{CandyError, CandyStore, Config, Result};
 
 use crate::common::run_in_tempdir;
 
@@ -28,19 +28,19 @@ fn test_pre_split() -> Result<()> {
 
         let stats = db.stats();
         assert_eq!(stats.num_shards, 64);
-        assert_eq!(stats.num_inserted, 1);
+        assert_eq!(stats.num_inserts, 1);
         assert_eq!(stats.wasted_bytes, 0);
 
         db.set("bbb", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
 
         let stats = db.stats();
-        assert_eq!(stats.num_inserted, 2);
+        assert_eq!(stats.num_inserts, 2);
         assert_eq!(stats.wasted_bytes, 0);
 
         db.set("aaa", "xxx")?;
 
         let stats = db.stats();
-        assert_eq!(stats.num_inserted, 2);
+        assert_eq!(stats.num_inserts, 2);
 
         // test accounting, it's a bit of an implementation detail, but we have to account for the
         // namespace byte as well
@@ -51,8 +51,8 @@ fn test_pre_split() -> Result<()> {
 
         db.remove("aaa")?;
         let stats = db.stats();
-        assert_eq!(stats.num_inserted, 2);
-        assert_eq!(stats.num_removed, 1);
+        assert_eq!(stats.num_inserts, 2);
+        assert_eq!(stats.num_removals, 1);
         assert_eq!(
             stats.wasted_bytes,
             "aaa?".len()
@@ -82,19 +82,19 @@ fn test_compaction() -> Result<()> {
             db.set("aaa", &format!("11112222333344445555666677778888999900001111222233334444555566667777888899990000111122223333444{:x}", i))?;
 
             let stats = db.stats();
-            assert_eq!(stats.num_inserted, 1, "i={i}");
-            assert_eq!(stats.used_bytes, 100 * (i + 1), "i={i}");
+            assert_eq!(stats.num_inserts, 1, "i={i}");
+            assert_eq!(stats.occupied_bytes, 100 * (i + 1), "i={i}");
             assert_eq!(stats.wasted_bytes, 100 * i, "i={i}");
         }
 
-        assert_eq!(db._num_compactions(), 0);
+        assert_eq!(db.stats().num_compactions, 0);
 
         // insert a new entry, which will cause a compaction
         db.set("bbb", "x")?;
-        assert_eq!(db._num_compactions(), 1);
+        assert_eq!(db.stats().num_compactions, 1);
 
         let stats = db.stats();
-        assert_eq!(stats.used_bytes, 100 + "bbb?".len() + "x".len());
+        assert_eq!(stats.occupied_bytes, 100 + "bbb?".len() + "x".len());
         assert_eq!(stats.wasted_bytes, 0);
 
         Ok(())
@@ -122,12 +122,14 @@ fn test_too_large() -> Result<()> {
         ));
 
         db.set("yyy", &vec![7u8; 700])?;
-        assert_eq!(db._num_splits(), 0);
-        assert_eq!(db._num_compactions(), 0);
+        let stats = db.stats();
+        assert_eq!(stats.num_splits, 0);
+        assert_eq!(stats.num_compactions, 0);
 
         db.set("zzz", &vec![7u8; 700])?;
-        assert_eq!(db._num_compactions(), 0);
-        assert_eq!(db._num_splits(), 1);
+        let stats = db.stats();
+        assert_eq!(stats.num_compactions, 0);
+        assert_eq!(stats.num_splits, 1);
 
         Ok(())
     })
@@ -141,42 +143,38 @@ fn test_compaction_stats() -> Result<()> {
             Config {
                 max_shard_size: 20_000,
                 min_compaction_threashold: 10_000,
-                num_of_compaction_stats: 10,
                 ..Default::default()
             },
         )?;
 
-        let (generation1, stats1) = db.fetch_compaction_stats();
-        assert_eq!(generation1, 0);
-        assert!(stats1.is_empty());
+        let stats1 = db.stats();
+        assert!(stats1.last_compaction_stats.is_empty());
+        assert!(stats1.last_split_stats.is_empty());
 
         for i in 1..500 {
             db.set(&format!("key{i}"), &format!("val{i:0200}"))?;
         }
 
-        let (generation2, stats2) = db.fetch_compaction_stats();
-        println!("{stats2:?}");
-
-        assert!(generation2 > generation1);
-        assert!(stats2
-            .iter()
-            .any(|s| matches!(s.0, CompactionKind::Split(_, _))));
+        let stats2 = db.stats();
+        println!("stats2={stats2:?}");
+        assert!(stats2.last_compaction_stats.is_empty());
+        assert!(stats2.last_split_stats.len() > 0);
 
         for i in 500..10000 {
             db.set("key", &format!("val{i:0200}"))?;
         }
 
-        let (generation3, stats3) = db.fetch_compaction_stats();
+        let stats3 = db.stats();
         println!("{stats3:?}");
+        assert!(stats3.last_compaction_stats.len() > 1);
 
-        assert!(generation3 > generation2);
-        assert!(stats3
-            .iter()
-            .any(|s| matches!(s.0, CompactionKind::Compaction(_))));
+        for _ in 0..1000 {
+            assert!(db.get("key")?.is_some());
+        }
 
-        let (generation4, stats4) = db.fetch_compaction_stats();
-        assert_eq!(generation4, generation3);
-        assert!(stats4.is_empty());
+        let stats4 = db.stats();
+        assert!(stats4.last_compaction_stats.is_empty());
+        assert!(stats4.last_split_stats.is_empty());
 
         Ok(())
     })

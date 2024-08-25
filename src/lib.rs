@@ -50,17 +50,17 @@ mod hashing;
 mod lists;
 mod router;
 mod shard;
+mod stats;
 mod store;
 mod typed;
 
 pub use hashing::HashSeed;
 pub use lists::{ListCompactionParams, ListIterator};
-use std::fmt::{Display, Formatter};
-pub use store::{
-    CandyStore, CoarseHistogram, CompactionKind, GetOrCreateStatus, ReplaceStatus, SetStatus,
-    SizeHistogram, Stats,
-};
+pub use stats::Stats;
+pub use store::{CandyStore, GetOrCreateStatus, ReplaceStatus, SetStatus};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
+
+use std::fmt::{Display, Formatter};
 
 #[cfg(feature = "whitebox_testing")]
 pub use hashing::HASH_BITS_TO_KEEP;
@@ -121,8 +121,6 @@ pub struct Config {
     /// to ensure reboot consistency
     #[cfg(feature = "flush_aggregation")]
     pub flush_aggregation_delay: Option<std::time::Duration>,
-    /// number of compaction stats to keep (0 means disabled)
-    pub num_of_compaction_stats: usize,
 }
 
 impl Default for Config {
@@ -138,7 +136,6 @@ impl Default for Config {
             mlock_headers: false,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: None,
-            num_of_compaction_stats: 0,
         }
     }
 }
