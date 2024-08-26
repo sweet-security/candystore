@@ -495,7 +495,7 @@ impl Shard {
                 row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
                 self.header
                     .wasted_bytes
-                    .fetch_add((k.len() + existing_val.len()) as u64, Ordering::SeqCst);
+                    .fetch_add((k.len() + existing_val.len()) as u64, Ordering::Relaxed);
                 if inc_stats {
                     self.stats.num_updates.fetch_add(1, Ordering::Relaxed);
                 }
