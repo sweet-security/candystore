@@ -225,10 +225,9 @@ impl Shard {
 
         let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
 
-        if cfg!(target_family = "unix") {
-            if config.mlock_headers {
-                unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
-            }
+        #[cfg(target_family = "unix")]
+        if config.mlock_headers {
+            unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
         }
 
         let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
@@ -326,6 +325,18 @@ impl Shard {
         }
     }
 
+    fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
+        self.header.rows.0.iter().flat_map(|row| {
+            row.signatures.iter().enumerate().filter_map(|(idx, &sig)| {
+                if sig == INVALID_SIG {
+                    None
+                } else {
+                    Some(self.read_kv(row.offsets_and_sizes[idx]))
+                }
+            })
+        })
+    }
+
     pub(crate) fn compact_into(&self, new_shard: &mut Shard) -> Result<()> {
         for res in self.unlocked_iter() {
             let (k, v) = res?;
@@ -335,6 +346,7 @@ impl Shard {
 
         Ok(())
     }
+
     pub(crate) fn split_into(&self, bottom_shard: &Shard, top_shard: &Shard) -> Result<()> {
         for res in self.unlocked_iter() {
             let (k, v) = res?;
@@ -347,18 +359,6 @@ impl Shard {
             }
         }
         Ok(())
-    }
-
-    fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
-        self.header.rows.0.iter().flat_map(|row| {
-            row.signatures.iter().enumerate().filter_map(|(idx, &sig)| {
-                if sig == INVALID_SIG {
-                    None
-                } else {
-                    Some(self.read_kv(row.offsets_and_sizes[idx]))
-                }
-            })
-        })
     }
 
     fn get_row(&self, ph: PartedHash) -> (RwLockReadGuard<()>, &ShardRow) {

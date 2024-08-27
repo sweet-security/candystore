@@ -228,7 +228,7 @@ impl CandyStore {
                 )?;
 
                 // create item
-                val.extend_from_slice(&Self::FIRST_IDX.to_le_bytes());
+                val.extend_from_slice(bytes_of(&Self::FIRST_IDX));
                 self.set_raw(&item_key, &val)?;
             }
             crate::GetOrCreateStatus::ExistingValue(list_bytes) => {
@@ -260,7 +260,7 @@ impl CandyStore {
                 )?;
 
                 // create item
-                val.extend_from_slice(&item_idx.to_le_bytes());
+                val.extend_from_slice(bytes_of(&item_idx));
                 self.set_raw(&item_key, &val)?;
             }
         }
@@ -535,7 +535,7 @@ impl CandyStore {
         suffix[size_of::<PartedHash>()..].copy_from_slice(ITEM_NAMESPACE);
 
         for (mut k, mut v) in self.get_by_hash(item_ph)? {
-            if k.ends_with(&suffix) && v.ends_with(&idx.to_le_bytes()) {
+            if k.ends_with(&suffix) && v.ends_with(bytes_of(&idx)) {
                 if truncate {
                     v.truncate(v.len() - size_of::<u64>());
                     k.truncate(k.len() - suffix.len());
@@ -594,7 +594,7 @@ impl CandyStore {
 
             // update item's index suffix
             let offset = full_v.len() - size_of::<u64>();
-            full_v[offset..].copy_from_slice(&new_idx.to_le_bytes());
+            full_v[offset..].copy_from_slice(bytes_of(&new_idx));
             self.set_raw(&full_k, &full_v)?;
 
             // remove old chain

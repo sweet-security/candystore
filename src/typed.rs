@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use bytemuck::bytes_of;
 use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
 
 use crate::{
@@ -88,7 +89,7 @@ where
         K: Borrow<Q>,
     {
         let mut kbytes = key.to_bytes::<LE>();
-        kbytes.extend_from_slice(&K::TYPE_ID.to_le_bytes());
+        kbytes.extend_from_slice(bytes_of(&K::TYPE_ID));
         kbytes.extend_from_slice(TYPED_NAMESPACE);
         kbytes
     }
@@ -224,7 +225,7 @@ where
         L: Borrow<Q>,
     {
         let mut kbytes = list_key.to_bytes::<LE>();
-        kbytes.extend_from_slice(&L::TYPE_ID.to_le_bytes());
+        kbytes.extend_from_slice(bytes_of(&L::TYPE_ID));
         kbytes
     }
 
