@@ -115,7 +115,7 @@ for res in db.iter_list("mylist") {
 * Add generations as an adapter on top, so that older generations are compacted into exponentially larger 
   time spans. It's an alternative to TTL, and amortizes the number of times an entry will move around as the 
   dataset grows.
-* Maybe add Arithmethid coding/Huffman coding as a cheap compression for the keys and values
+* Maybe add Arithmethic coding/Huffman coding as a cheap compression for the keys and values
 
 ## How to Interpret the Performance Results
 While the numbers above are incredible, it is obvious that any file-backed store will be limited by the
@@ -129,7 +129,7 @@ These IOs may return from the kernel's page cache, in which case it's practicall
 in which case you can expect it to take 1-2 round-trip times of your device.
 
 Inserting to/removing from a lists require 2-3 IOs, since these operations need to update the list's 
-head or tail, as well as link/unlink to their previous element. Such operations should really be done with a "large enough page cache". 
+head or tail, as well as a "chain" element. Such operations should really be done with a "large enough page cache". 
 Updating/fetching an existing element element in a list is a single IO as above.
 
 If your memory is too constrainted for keeping the lookup tables mapped-in (i.e., they get evicted to disk),
