@@ -55,16 +55,6 @@ enum ShardNode {
     Leaf(Shard),
     Vertex(Arc<ShardRouter>, Arc<ShardRouter>),
 }
-impl std::fmt::Debug for ShardNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Leaf(sh) => write!(f, "Leaf({:?})", sh.span),
-            Self::Vertex(bottom, top) => {
-                write!(f, "Vetrex({:?}, {:?})", bottom.span, top.span)
-            }
-        }
-    }
-}
 
 impl ShardNode {
     fn span(&self) -> Range<u32> {
@@ -73,8 +63,8 @@ impl ShardNode {
             Self::Vertex(bottom, top) => bottom.span.start..top.span.end,
         }
     }
-    fn len(&self) -> usize {
-        self.span().len()
+    fn len(&self) -> u32 {
+        self.span().end - self.span().start
     }
 }
 
@@ -208,33 +198,44 @@ impl ShardRouter {
     }
 
     fn treeify(shards: Vec<Shard>, stats: Arc<InternalStats>) -> ShardNode {
-        let mut nodes = vec![];
-        let mut spans_debug: Vec<Range<u32>> = vec![];
-        for sh in shards {
-            assert!(
-                spans_debug.is_empty() || spans_debug.last().unwrap().start != sh.span.start,
-                "two elements with the same start {spans_debug:?} {:?}",
-                sh.span
-            );
-            spans_debug.push(sh.span.clone());
-            nodes.push(ShardNode::Leaf(sh));
-        }
-        assert!(
-            spans_debug.is_sorted_by(|a, b| a.start < b.start),
-            "not sorted {spans_debug:?}"
-        );
+        // algorithm: first find the smallest span, and let that be our base unit, say it's 1K. then go over
+        // 0..64K in 1K increments and pair up every consecutive pairs whose size is 1K. we count on the spans to be
+        // sorted, so we'll merge 0..1K with 1K..2K, and not 1K..3K with 2K..3K.
+        // then we double our base unit and repeat, until base unit = 64K.
 
-        let mut unchanged_loops = 0;
-        let mut prev_len = nodes.len();
-        while nodes.len() > 1 {
+        let mut nodes = vec![];
+        let mut unit: u32 = Self::END_OF_SHARDS;
+        {
+            let mut spans_debug: Vec<Range<u32>> = vec![];
+            for sh in shards {
+                assert!(
+                    spans_debug.is_empty() || spans_debug.last().unwrap().start != sh.span.start,
+                    "two elements with the same start {spans_debug:?} {:?}",
+                    sh.span
+                );
+                spans_debug.push(sh.span.clone());
+                let n = ShardNode::Leaf(sh);
+                if unit > n.len() {
+                    unit = n.len();
+                }
+                nodes.push(n);
+            }
+            assert!(
+                spans_debug.is_sorted_by(|a, b| a.start < b.start),
+                "not sorted {spans_debug:?}"
+            );
+
+            assert!(unit >= 1 && unit.is_power_of_two(), "unit={unit}");
+            assert!(nodes.len() > 0, "No shards to merge");
+            assert!(nodes.len() > 1 || unit == Self::END_OF_SHARDS);
+        }
+
+        while unit < Self::END_OF_SHARDS {
             let mut i = 0;
             while i < nodes.len() - 1 {
-                if nodes[i].span().end == nodes[i + 1].span().start
-                    && nodes[i].len() == nodes[i + 1].len()
-                {
+                if nodes[i].len() == unit && nodes[i + 1].len() == unit {
                     let n0 = nodes.remove(i);
                     let n1 = nodes.remove(i);
-
                     nodes.insert(
                         i,
                         ShardNode::Vertex(
@@ -242,22 +243,15 @@ impl ShardRouter {
                             Arc::new(Self::from_shardnode(n1, stats.clone())),
                         ),
                     );
-                    break;
                 } else {
                     i += 1;
                 }
             }
-            if nodes.len() == prev_len {
-                unchanged_loops += 1;
-            } else {
-                unchanged_loops = 0;
-            }
-            if unchanged_loops > 2 {
-                panic!("store load: loop detected (len={prev_len}) {spans_debug:?} {nodes:?}");
-            }
-            prev_len = nodes.len();
+
+            unit *= 2;
         }
 
+        assert_eq!(nodes.len(), 1);
         nodes.remove(0)
     }
 
