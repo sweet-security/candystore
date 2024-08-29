@@ -267,13 +267,13 @@ impl CandyStore {
     pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
         debug_assert!(ph.is_valid());
         self.root
-            .shared_op(ph.shard_selector() as u32, |sh| sh.get_by_hash(ph))
+            .shared_op(ph.shard_selector(), |sh| sh.get_by_hash(ph))
     }
 
     pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
         self.root
-            .shared_op(ph.shard_selector() as u32, |sh| sh.get(ph, &full_key))
+            .shared_op(ph.shard_selector(), |sh| sh.get(ph, &full_key))
     }
 
     /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
@@ -300,7 +300,7 @@ impl CandyStore {
     pub(crate) fn remove_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
         self.root
-            .shared_op(ph.shard_selector() as u32, |sh| sh.remove(ph, &full_key))
+            .shared_op(ph.shard_selector(), |sh| sh.remove(ph, &full_key))
     }
 
     /// Removes a key-value pair from the store, returning `None` if the key did not exist,

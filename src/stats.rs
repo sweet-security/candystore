@@ -24,6 +24,7 @@ pub struct Stats {
     pub num_positive_lookups: usize,
     pub num_negative_lookups: usize,
     pub num_removals: usize,
+    pub num_collisions: usize,
 
     pub num_read_ops: usize,
     pub num_read_bytes: usize,
@@ -59,10 +60,11 @@ impl Stats {
 impl Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, 
-            "shards={} [splits={} compacts={}] [occupied={} wasted={}] [ins={} updt={} +lkup={} -lkup={} rem={}] reads=[{}, {}b] writes=[{}, {}b]",
+            "shards={} [splits={} compacts={}] [occupied={} wasted={}] [ins={} updt={} +lkup={} -lkup={} rem={} coll={}] reads=[{}, {}b] writes=[{}, {}b]",
             self.num_shards, self.num_splits, self.num_compactions, self.occupied_bytes, self.wasted_bytes, 
             self.num_inserts, self.num_updates, self.num_positive_lookups, self.num_negative_lookups, 
-            self.num_removals, self.num_read_ops, self.num_read_bytes, self.num_write_ops, self.num_write_bytes)
+            self.num_removals, self.num_collisions, self.num_read_ops, self.num_read_bytes, self.num_write_ops, 
+            self.num_write_bytes)
     }
 }
 
@@ -136,6 +138,7 @@ pub struct InternalStats {
     pub(crate) num_positive_lookups: AtomicUsize,
     pub(crate) num_negative_lookups: AtomicUsize,
     pub(crate) num_removals: AtomicUsize,
+    pub(crate) num_collisions: AtomicUsize,
 
     pub(crate) num_read_ops: AtomicUsize,
     pub(crate) num_read_bytes: AtomicUsize,
@@ -191,6 +194,7 @@ impl InternalStats {
         self.num_positive_lookups.store(0, Ordering::SeqCst);
         self.num_negative_lookups.store(0, Ordering::SeqCst);
         self.num_removals.store(0, Ordering::SeqCst);
+        self.num_collisions.store(0, Ordering::SeqCst);
 
         self.num_read_ops.store(0, Ordering::SeqCst);
         self.num_read_bytes.store(0, Ordering::SeqCst);
@@ -224,6 +228,7 @@ impl InternalStats {
         stats.num_positive_lookups = self.num_positive_lookups.load(Ordering::Relaxed);
         stats.num_negative_lookups = self.num_negative_lookups.load(Ordering::Relaxed);
         stats.num_removals = self.num_removals.load(Ordering::Relaxed);
+        stats.num_collisions = self.num_collisions.load(Ordering::Relaxed);
 
         stats.num_read_ops = self.num_read_ops.load(Ordering::Relaxed);
         stats.num_read_bytes = self.num_read_bytes.load(Ordering::Relaxed);

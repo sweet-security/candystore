@@ -160,7 +160,7 @@ pub(crate) struct Shard {
 }
 
 enum TryReplaceStatus<'a> {
-    KeyDoesNotExist(RwLockWriteGuard<'a, ()>),
+    KeyDoesNotExist(RwLockWriteGuard<'a, ()>, bool),
     KeyExistsNotReplaced(Vec<u8>),
     KeyExistsReplaced(Vec<u8>),
 }
@@ -352,7 +352,7 @@ impl Shard {
             let (k, v) = res?;
 
             let ph = PartedHash::new(&self.config.hash_seed, &k);
-            if (ph.shard_selector() as u32) < bottom_shard.span.end {
+            if ph.shard_selector() < bottom_shard.span.end {
                 bottom_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
             } else {
                 top_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
@@ -362,7 +362,7 @@ impl Shard {
     }
 
     fn get_row(&self, ph: PartedHash) -> (RwLockReadGuard<()>, &ShardRow) {
-        let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
+        let row_idx = ph.row_selector();
         let guard = self.row_locks[row_idx].read();
         let row = &self.header.rows.0[row_idx];
         (guard, row)
@@ -462,9 +462,11 @@ impl Shard {
         inc_stats: bool,
     ) -> Result<TryReplaceStatus> {
         let mut start = 0;
+        let mut had_collision = false;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
             let (k, existing_val) = self.read_kv(row.offsets_and_sizes[idx])?;
             if key != k {
+                had_collision = true;
                 continue;
             }
             match mode {
@@ -508,11 +510,11 @@ impl Shard {
             return Ok(TryReplaceStatus::KeyExistsReplaced(existing_val));
         }
 
-        Ok(TryReplaceStatus::KeyDoesNotExist(guard))
+        Ok(TryReplaceStatus::KeyDoesNotExist(guard, had_collision))
     }
 
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
-        let row_idx = (ph.row_selector() as usize) % NUM_ROWS;
+        let row_idx = ph.row_selector();
         let guard = self.row_locks[row_idx].write();
         // this is safe because we hold a write lock on the row. the row sits in an mmap, so it can't be
         // owned by the lock itself
@@ -548,7 +550,7 @@ impl Shard {
         }
 
         match self.try_replace(guard, row, ph, &full_key, val, mode, inc_stats)? {
-            TryReplaceStatus::KeyDoesNotExist(_guard) => {
+            TryReplaceStatus::KeyDoesNotExist(_guard, had_collision) => {
                 if matches!(mode, InsertMode::Replace(_)) {
                     return Ok(InsertStatus::KeyDoesNotExist);
                 }
@@ -563,6 +565,9 @@ impl Shard {
                     std::sync::atomic::fence(Ordering::SeqCst);
                     row.signatures[idx] = ph.signature();
                     if inc_stats {
+                        if had_collision {
+                            self.stats.num_collisions.fetch_add(1, Ordering::Relaxed);
+                        }
                         self.stats.num_inserts.fetch_add(1, Ordering::Relaxed);
                     }
                     self.header.num_entries.fetch_add(1, Ordering::Relaxed);

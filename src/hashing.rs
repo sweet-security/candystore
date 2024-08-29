@@ -1,6 +1,6 @@
 use siphasher::sip128::{Hash128, SipHasher24};
 
-use crate::Result;
+use crate::{shard::NUM_ROWS, Result};
 
 #[derive(Debug, Clone, Copy)]
 pub struct HashSeed([u8; 16]);
@@ -54,13 +54,13 @@ impl PartedHash {
     }
 
     #[inline]
-    pub fn shard_selector(&self) -> u16 {
-        (self.0 >> 48) as u16
+    pub fn shard_selector(&self) -> u32 {
+        ((self.0 >> 48) & 0xffff) as u32
     }
 
     #[inline]
-    pub fn row_selector(&self) -> u16 {
-        (self.0 >> 32) as u16
+    pub fn row_selector(&self) -> usize {
+        (((self.0 >> 32) as u16) as usize) % NUM_ROWS
     }
 
     #[inline]

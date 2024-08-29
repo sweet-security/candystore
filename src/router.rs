@@ -453,7 +453,7 @@ impl ShardRouter {
             let res = match &*self.node.read() {
                 ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode, true)?,
                 ShardNode::Vertex(bottom, top) => {
-                    if (ph.shard_selector() as u32) < bottom.span.end {
+                    if ph.shard_selector() < bottom.span.end {
                         bottom.insert(ph, full_key, val, mode)?
                     } else {
                         top.insert(ph, full_key, val, mode)?
