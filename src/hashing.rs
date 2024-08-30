@@ -1,24 +1,8 @@
 use siphasher::sip128::{Hash128, SipHasher24};
 
-use crate::{shard::NUM_ROWS, Result};
+use crate::shard::NUM_ROWS;
 
-#[derive(Debug, Clone, Copy)]
-pub struct HashSeed([u8; 16]);
-
-/// A struct that represents a "nonce" for seeding the hash function (keyed hash).
-/// Keeping it secret is only meaningful if you're concerned with DoS attacks
-impl HashSeed {
-    pub const LEN: usize = size_of::<Self>();
-
-    pub fn new(bytes: [u8; Self::LEN]) -> Self {
-        Self(bytes)
-    }
-
-    /// Construct a HashSeed from the given byte buffer (must be 16 bytes in length)
-    pub fn from_buf<B: AsRef<[u8]> + ?Sized>(key: &B) -> Result<Self> {
-        Ok(Self(key.as_ref().try_into()?))
-    }
-}
+pub type HashSeed = [u8; 16];
 
 use bytemuck::{Pod, Zeroable};
 
@@ -45,7 +29,7 @@ pub static mut HASH_BITS_TO_KEEP: u64 = u64::MAX; // which bits to keep from the
 
 impl PartedHash {
     pub fn new(seed: &HashSeed, buf: &[u8]) -> Self {
-        Self::from_hash(SipHasher24::new_with_key(&seed.0).hash(buf))
+        Self::from_hash(SipHasher24::new_with_key(seed).hash(buf))
     }
 
     #[inline]
@@ -95,12 +79,10 @@ impl PartedHash {
 }
 
 #[test]
-fn test_parted_hash() -> Result<()> {
+fn test_parted_hash() -> crate::Result<()> {
     use bytemuck::{bytes_of, from_bytes};
 
-    HashSeed::from_buf("12341234123412341").expect_err("shouldn't work");
-
-    let seed = HashSeed::from_buf("aaaabbbbccccdddd")?;
+    let seed: HashSeed = *b"aaaabbbbccccdddd";
 
     let h1 = PartedHash::new(&seed, b"hello world");
     assert_eq!(h1.0, 13445180190757400308,);

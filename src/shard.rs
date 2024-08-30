@@ -1,20 +1,20 @@
-use anyhow::bail;
+use anyhow::{bail, ensure};
 use bytemuck::{bytes_of_mut, Pod, Zeroable};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use simd_itertools::PositionSimd;
 use std::{
     fs::{File, OpenOptions},
     io::Read,
+    mem::MaybeUninit,
     ops::Range,
-    os::unix::fs::FileExt,
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
-
-use memmap::{MmapMut, MmapOptions};
 
 use crate::{
     hashing::{PartedHash, INVALID_SIG},
@@ -114,6 +114,19 @@ struct ShardHeader {
     rows: PageAligned<[ShardRow; NUM_ROWS]>,
 }
 
+impl ShardHeader {
+    fn zeroed() -> Self {
+        // we're perfectly content with zeros
+        unsafe { std::mem::zeroed() }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self as *mut Self as *mut u8, size_of::<Self>()) }
+    }
+}
+
 pub(crate) const HEADER_SIZE: u64 = size_of::<ShardHeader>() as u64;
 const _: () = assert!(HEADER_SIZE % 4096 == 0);
 
@@ -135,6 +148,12 @@ pub(crate) enum InsertMode<'a> {
     MustCreate,
 }
 
+enum TryReplaceStatus<'a> {
+    KeyDoesNotExist(RwLockWriteGuard<'a, ()>, bool),
+    KeyExistsNotReplaced(Vec<u8>),
+    KeyExistsReplaced(Vec<u8>),
+}
+
 pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 
 // Note: it's possible to reduce the number row_locks, it we make them per-store rather than per-shard.
@@ -144,25 +163,50 @@ pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 // shard+row combination that would be safe from deadlocks. however, it seems that holding 64 locks for
 // 64MB isn't that much, and you'd still need a RW lock per shard anyway.
 
+struct Ticker {
+    interval: u64,
+    next: AtomicU64,
+}
+
+impl Ticker {
+    fn get_time() -> u64 {
+        let ts = unsafe {
+            let mut ts = MaybeUninit::<libc::timespec>::uninit();
+            libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, ts.as_mut_ptr());
+            ts.assume_init()
+        };
+        (ts.tv_sec * 1000 + ts.tv_nsec / 1000) as u64
+    }
+    fn new(interval: Duration) -> Self {
+        let interval = interval.as_micros() as u64;
+        Self {
+            interval,
+            next: AtomicU64::new(Self::get_time() + interval),
+        }
+    }
+    fn has_ticked(&self) -> bool {
+        let now = Self::get_time();
+        if now > self.next.load(Ordering::Relaxed) {
+            self.next.store(now + self.interval, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub(crate) struct Shard {
     pub(crate) span: Range<u32>,
-    file: File,
     pub(crate) config: Arc<InternalConfig>,
-    #[allow(dead_code)]
-    mmap: MmapMut, // needed to prevent it from dropping
-    header: &'static mut ShardHeader,
+    file: File,
+    header: RwLock<Box<ShardHeader>>, // don't put that on the stack
     row_locks: Vec<RwLock<()>>,
     #[cfg(feature = "flush_aggregation")]
     sync_agg_mutex: parking_lot::Mutex<()>,
     #[cfg(feature = "flush_aggregation")]
     in_sync_agg_delay: std::sync::atomic::AtomicBool,
     stats: Arc<InternalStats>,
-}
-
-enum TryReplaceStatus<'a> {
-    KeyDoesNotExist(RwLockWriteGuard<'a, ()>, bool),
-    KeyExistsNotReplaced(Vec<u8>),
-    KeyExistsReplaced(Vec<u8>),
+    ticker: Ticker,
 }
 
 impl Shard {
@@ -221,16 +265,19 @@ impl Shard {
             } else {
                 file.set_len(HEADER_SIZE)?;
             }
+            if unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, HEADER_SIZE as i64) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Unsupported {
+                    // oh well
+                } else {
+                    bail!(err);
+                }
+            }
         }
 
-        let mut mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
+        let mut header = Box::new(ShardHeader::zeroed());
+        file.read_exact_at(header.as_bytes_mut(), 0)?;
 
-        #[cfg(target_family = "unix")]
-        if config.mlock_headers {
-            unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
-        }
-
-        let header = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShardHeader) };
         header.metadata.magic = SHARD_FILE_MAGIC;
         header.metadata.version = SHARD_FILE_VERSION;
 
@@ -247,24 +294,37 @@ impl Shard {
             row_locks.push(RwLock::new(()));
         }
 
+        let ticker = Ticker::new(config.flush_interval);
         Ok(Self {
             file,
             config,
             span,
-            mmap,
-            header,
+            header: RwLock::new(header),
             row_locks,
             #[cfg(feature = "flush_aggregation")]
             sync_agg_mutex: parking_lot::Mutex::new(()),
             #[cfg(feature = "flush_aggregation")]
             in_sync_agg_delay: std::sync::atomic::AtomicBool::new(false),
             stats,
+            ticker,
         })
     }
 
     pub(crate) fn flush(&self) -> Result<()> {
-        //self.mmap.flush()? -- fdatasync should take care of that as well
-        self.file.sync_data()?;
+        {
+            let header_guard = self.header.write();
+            self.file.sync_data()?;
+            self.file.write_all_at(header_guard.as_bytes(), 0)?;
+        }
+        let rc = unsafe {
+            libc::sync_file_range(
+                self.file.as_raw_fd(),
+                0,
+                HEADER_SIZE as _,
+                libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            )
+        };
+        ensure!(rc == 0, std::io::Error::last_os_error());
         Ok(())
     }
 
@@ -305,6 +365,7 @@ impl Shard {
         // offsets_and_size array, but we're okay with leaks
         let write_offset = self
             .header
+            .read()
             .write_offset
             .fetch_add(buf.len() as u64, Ordering::SeqCst) as u64;
 
@@ -317,7 +378,7 @@ impl Shard {
 
     pub(crate) fn read_at(&self, row_idx: usize, entry_idx: usize) -> Result<Option<KVPair>> {
         let _guard = self.row_locks[row_idx].read();
-        let row = &self.header.rows.0[row_idx];
+        let row = &self.header.read().rows.0[row_idx];
         if row.signatures[entry_idx] != INVALID_SIG {
             Ok(Some(self.read_kv(row.offsets_and_sizes[entry_idx])?))
         } else {
@@ -325,37 +386,35 @@ impl Shard {
         }
     }
 
-    fn unlocked_iter<'b>(&'b self) -> impl Iterator<Item = Result<KVPair>> + 'b {
-        self.header.rows.0.iter().flat_map(|row| {
-            row.signatures.iter().enumerate().filter_map(|(idx, &sig)| {
-                if sig == INVALID_SIG {
-                    None
-                } else {
-                    Some(self.read_kv(row.offsets_and_sizes[idx]))
-                }
-            })
-        })
-    }
-
     pub(crate) fn compact_into(&self, new_shard: &mut Shard) -> Result<()> {
-        for res in self.unlocked_iter() {
-            let (k, v) = res?;
-            let ph = PartedHash::new(&self.config.hash_seed, &k);
-            new_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
+        for row in self.header.read().rows.0.iter() {
+            for (col, &sig) in row.signatures.iter().enumerate() {
+                if sig == INVALID_SIG {
+                    continue;
+                }
+                let (k, v) = self.read_kv(row.offsets_and_sizes[col])?;
+                let ph = PartedHash::new(&self.config.hash_seed, &k);
+                new_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
+            }
         }
 
         Ok(())
     }
 
     pub(crate) fn split_into(&self, bottom_shard: &Shard, top_shard: &Shard) -> Result<()> {
-        for res in self.unlocked_iter() {
-            let (k, v) = res?;
+        for row in self.header.read().rows.0.iter() {
+            for (col, &sig) in row.signatures.iter().enumerate() {
+                if sig == INVALID_SIG {
+                    continue;
+                }
+                let (k, v) = self.read_kv(row.offsets_and_sizes[col])?;
 
-            let ph = PartedHash::new(&self.config.hash_seed, &k);
-            if ph.shard_selector() < bottom_shard.span.end {
-                bottom_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
-            } else {
-                top_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
+                let ph = PartedHash::new(&self.config.hash_seed, &k);
+                if ph.shard_selector() < bottom_shard.span.end {
+                    bottom_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
+                } else {
+                    top_shard.insert(ph, &k, &v, InsertMode::MustCreate, false)?;
+                }
             }
         }
         Ok(())
@@ -364,7 +423,7 @@ impl Shard {
     fn get_row(&self, ph: PartedHash) -> (RwLockReadGuard<()>, &ShardRow) {
         let row_idx = ph.row_selector();
         let guard = self.row_locks[row_idx].read();
-        let row = &self.header.rows.0[row_idx];
+        let row = unsafe { &*(&self.header.read().rows.0[row_idx] as *const ShardRow) };
         (guard, row)
     }
 
@@ -418,21 +477,7 @@ impl Shard {
             self.in_sync_agg_delay.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
             self.in_sync_agg_delay.store(false, Ordering::SeqCst);
-            self.file.sync_data()
-            /*self.mmap.flush()?;
-            let rc = unsafe {
-                libc::sync_file_range(
-                    self.file.as_raw_fd(),
-                    HEADER_SIZE as i64,
-                    HEADER_SIZE as i64 + self.header.write_offset.load(Ordering::Relaxed) as i64,
-                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                        | libc::SYNC_FILE_RANGE_WRITE
-                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-                )
-            };
-            ensure!(rc == 0);
-            Ok(())
-            */
+            self.flush()
         };
 
         if let Some(_guard) = self.sync_agg_mutex.try_lock() {
@@ -496,6 +541,7 @@ impl Shard {
             if val != existing_val {
                 row.offsets_and_sizes[idx] = self.write_kv(key, val)?;
                 self.header
+                    .read()
                     .wasted_bytes
                     .fetch_add((k.len() + existing_val.len()) as u64, Ordering::Relaxed);
                 if inc_stats {
@@ -516,11 +562,12 @@ impl Shard {
     fn get_row_mut(&self, ph: PartedHash) -> (RwLockWriteGuard<()>, &mut ShardRow) {
         let row_idx = ph.row_selector();
         let guard = self.row_locks[row_idx].write();
-        // this is safe because we hold a write lock on the row. the row sits in an mmap, so it can't be
+        // this is safe because we hold a write lock on the row. the row resides in a POD type, so it can't be
         // owned by the lock itself
         #[allow(invalid_reference_casting)]
-        let row =
-            unsafe { &mut *(&self.header.rows.0[row_idx] as *const ShardRow as *mut ShardRow) };
+        let row = unsafe {
+            &mut *(&self.header.read().rows.0[row_idx] as *const ShardRow as *mut ShardRow)
+        };
         (guard, row)
     }
 
@@ -533,23 +580,25 @@ impl Shard {
         inc_stats: bool,
     ) -> Result<InsertStatus> {
         let (guard, row) = self.get_row_mut(ph);
+        let header_guard = self.header.read();
 
-        if self.header.write_offset.load(Ordering::Relaxed) as u64
+        if header_guard.write_offset.load(Ordering::Relaxed) as u64
             + (full_key.len() + val.len()) as u64
             > self.config.max_shard_size as u64
         {
-            if self.header.wasted_bytes.load(Ordering::Relaxed)
+            if header_guard.wasted_bytes.load(Ordering::Relaxed)
                 > self.config.min_compaction_threashold as u64
             {
                 return Ok(InsertStatus::CompactionNeeded(
-                    self.header.write_offset.load(Ordering::Relaxed),
+                    header_guard.write_offset.load(Ordering::Relaxed),
                 ));
             } else {
                 return Ok(InsertStatus::SplitNeeded);
             }
         }
 
-        match self.try_replace(guard, row, ph, &full_key, val, mode, inc_stats)? {
+        let status = self.try_replace(guard, row, ph, &full_key, val, mode, inc_stats)?;
+        match status {
             TryReplaceStatus::KeyDoesNotExist(_guard, had_collision) => {
                 if matches!(mode, InsertMode::Replace(_)) {
                     return Ok(InsertStatus::KeyDoesNotExist);
@@ -570,12 +619,13 @@ impl Shard {
                         }
                         self.stats.num_inserts.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.header.num_entries.fetch_add(1, Ordering::Relaxed);
+                    header_guard.num_entries.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "flush_aggregation")]
                     {
                         drop(_guard);
                         self.flush_aggregation()?;
                     }
+                    self.maybe_flush()?;
                     Ok(InsertStatus::Added)
                 } else {
                     // no room in this row, must split
@@ -585,8 +635,18 @@ impl Shard {
             TryReplaceStatus::KeyExistsNotReplaced(existing) => {
                 Ok(InsertStatus::AlreadyExists(existing))
             }
-            TryReplaceStatus::KeyExistsReplaced(existing) => Ok(InsertStatus::Replaced(existing)),
+            TryReplaceStatus::KeyExistsReplaced(existing) => {
+                self.maybe_flush()?;
+                Ok(InsertStatus::Replaced(existing))
+            }
         }
+    }
+
+    fn maybe_flush(&self) -> Result<()> {
+        if self.ticker.has_ticked() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn remove(&self, ph: PartedHash, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -599,8 +659,12 @@ impl Shard {
                 row.signatures[idx] = INVALID_SIG;
                 // we managed to remove this key
                 self.stats.num_removals.fetch_add(1, Ordering::Relaxed);
-                self.header.num_entries.fetch_sub(1, Ordering::Relaxed);
                 self.header
+                    .read()
+                    .num_entries
+                    .fetch_sub(1, Ordering::Relaxed);
+                self.header
+                    .read()
                     .wasted_bytes
                     .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
                 #[cfg(feature = "flush_aggregation")]
@@ -608,6 +672,7 @@ impl Shard {
                     drop(_guard);
                     self.flush_aggregation()?;
                 }
+                self.maybe_flush()?;
                 return Ok(Some(v));
             }
         }
@@ -616,9 +681,15 @@ impl Shard {
     }
 
     pub(crate) fn get_write_offset(&self) -> u64 {
-        self.header.write_offset.load(Ordering::Relaxed)
+        self.header.read().write_offset.load(Ordering::Relaxed)
     }
     pub(crate) fn get_wasted_bytes(&self) -> u64 {
-        self.header.wasted_bytes.load(Ordering::Relaxed)
+        self.header.read().wasted_bytes.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Shard {
+    fn drop(&mut self) {
+        _ = self.flush();
     }
 }

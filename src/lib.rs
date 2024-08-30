@@ -10,8 +10,8 @@
 //! state. You might lose the ongoing operation, but we consider this acceptable.
 //!
 //! Candy is designed to consume very little memory: entries are written directly to the shard-file, and only a
-//! table of ~380KB is kept `mmap`-ed (it is also file-backed, so can be evicted if needed). A shard-file can
-//! hold around 30K entries, and more shard-files are created as needed.
+//! table of 388KB is required to stay in memory. A shard-file can hold around 30K entries, and more shard-files
+//! are created as needed. This means an average overhead of ~13 bytes per entry.
 //!
 //! A unique feature of Candy is the support of *lists*, which allow creating cheap collections.
 //!
@@ -60,7 +60,10 @@ pub use stats::Stats;
 pub use store::{CandyStore, GetOrCreateStatus, ReplaceStatus, SetStatus};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
 
-use std::fmt::{Display, Formatter};
+use std::{
+    fmt::{Display, Formatter},
+    time::Duration,
+};
 
 #[cfg(feature = "whitebox_testing")]
 pub use hashing::HASH_BITS_TO_KEEP;
@@ -125,6 +128,8 @@ pub struct Config {
     /// to ensure reboot consistency
     #[cfg(feature = "flush_aggregation")]
     pub flush_aggregation_delay: Option<std::time::Duration>,
+    /// how often to flush the header and data to disk
+    pub flush_interval: Duration,
 }
 
 impl Default for Config {
@@ -132,7 +137,7 @@ impl Default for Config {
         Self {
             max_shard_size: 64 * 1024 * 1024,
             min_compaction_threashold: 8 * 1024 * 1024,
-            hash_seed: HashSeed::from_buf(b"kOYLu0xvq2WtzcKJ").unwrap(),
+            hash_seed: *b"kOYLu0xvq2WtzcKJ",
             expected_number_of_keys: 0,
             max_concurrent_list_ops: 64,
             truncate_up: true,
@@ -140,6 +145,7 @@ impl Default for Config {
             mlock_headers: false,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: None,
+            flush_interval: Duration::from_millis(500),
         }
     }
 }

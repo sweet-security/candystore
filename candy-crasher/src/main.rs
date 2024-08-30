@@ -6,17 +6,22 @@ use candystore::{CandyStore, Config, Result};
 use rand::Rng;
 
 const TARGET: u32 = 1_000_000;
+const CONFIG: Config = Config {
+    max_shard_size: 64 * 1024 * 1024,
+    min_compaction_threashold: 8 * 1024 * 1024,
+    hash_seed: *b"kOYLu0xvq2WtzcKJ",
+    expected_number_of_keys: 0,
+    max_concurrent_list_ops: 64,
+    truncate_up: true,
+    clear_on_unsupported_version: true,
+    mlock_headers: false,
+    flush_interval: Duration::from_millis(10),
+};
 
 fn child_inserts() -> Result<()> {
     // our job is to create 1M entries while being killed by our evil parent
 
-    let store = CandyStore::open(
-        "dbdir",
-        Config {
-            clear_on_unsupported_version: true,
-            ..Default::default()
-        },
-    )?;
+    let store = CandyStore::open("dbdir", CONFIG)?;
     let highest_bytes = store.get("highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes([
         highest_bytes[0],
@@ -44,13 +49,7 @@ fn child_inserts() -> Result<()> {
 fn child_removals() -> Result<()> {
     // our job is to remove 1M entries while being killed by our evil parent
 
-    let store = CandyStore::open(
-        "dbdir",
-        Config {
-            clear_on_unsupported_version: true,
-            ..Default::default()
-        },
-    )?;
+    let store = CandyStore::open("dbdir", CONFIG)?;
     let lowest_bytes = store.get("lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes([
         lowest_bytes[0],
@@ -78,13 +77,7 @@ fn child_removals() -> Result<()> {
 fn child_list_inserts() -> Result<()> {
     // our job is to insert 1M entries to a list while being killed by our evil parent
 
-    let store = CandyStore::open(
-        "dbdir",
-        Config {
-            clear_on_unsupported_version: true,
-            ..Default::default()
-        },
-    )?;
+    let store = CandyStore::open("dbdir", CONFIG)?;
 
     let highest_bytes = store.get("list_highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes([
@@ -113,13 +106,7 @@ fn child_list_inserts() -> Result<()> {
 fn child_list_removals() -> Result<()> {
     // our job is to remove 1M entries to a list while being killed by our evil parent
 
-    let store = CandyStore::open(
-        "dbdir",
-        Config {
-            clear_on_unsupported_version: true,
-            ..Default::default()
-        },
-    )?;
+    let store = CandyStore::open("dbdir", CONFIG)?;
 
     let lowest_bytes = store.get("list_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes([
@@ -166,13 +153,7 @@ fn child_list_removals() -> Result<()> {
 }
 
 fn child_list_iterator_removals() -> Result<()> {
-    let store = CandyStore::open(
-        "dbdir",
-        Config {
-            clear_on_unsupported_version: true,
-            ..Default::default()
-        },
-    )?;
+    let store = CandyStore::open("dbdir", CONFIG)?;
 
     if rand::random() {
         //println!("FWD");
@@ -288,13 +269,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                clear_on_unsupported_version: true,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
         assert_eq!(
             store.remove("highest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -317,13 +292,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                clear_on_unsupported_version: true,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
         assert_eq!(
             store.remove("lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -338,13 +307,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                clear_on_unsupported_version: true,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
         assert_eq!(
             store.remove("list_highest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -364,13 +327,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                clear_on_unsupported_version: true,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
         assert_eq!(
             store.remove("list_lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
@@ -387,13 +344,7 @@ fn main() -> Result<()> {
     {
         println!("Parent creates 1M members in a list...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                expected_number_of_keys: 1_000_000,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
         let t0 = std::time::Instant::now();
         for i in 0u32..1_000_000 {
             if i % 65536 == 0 {
@@ -412,13 +363,7 @@ fn main() -> Result<()> {
     {
         println!("Parent starts validating the DB...");
 
-        let store = CandyStore::open(
-            "dbdir",
-            Config {
-                clear_on_unsupported_version: true,
-                ..Default::default()
-            },
-        )?;
+        let store = CandyStore::open("dbdir", CONFIG)?;
 
         assert_eq!(store.iter_list("xxx").count(), 0);
 
