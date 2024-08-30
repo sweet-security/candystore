@@ -100,7 +100,9 @@ for res in db.iter_list("mylist") {
 * Fast and efficient, with a very low memory footprint (~0.6% overhead)
 * No heavy/unbounded merges
 * No Write-Ahead Log (WAL) or journalling of any kind
-* Crash safe: you may lose the latest operations, but never be in an inconsistent state
+* Process crash safe: you may lose the latest operations, but never be in an inconsistent state
+  if the process crashes.  However, if the machine itself crashes, the data on disk may be in an
+  inconsistent state.
 * Splitting/compaction happens per-shard, so there's no global locking
 * Suitable for both write-heavy and read-heavy workloads
 * Concurrent by design (multiple threads getting/setting/removing keys at the same time)
