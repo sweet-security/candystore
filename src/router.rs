@@ -451,7 +451,7 @@ impl ShardRouter {
     ) -> Result<InsertStatus> {
         loop {
             let res = match &*self.node.read() {
-                ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode, true)?,
+                ShardNode::Leaf(sh) => sh.insert(ph, full_key, val, mode)?,
                 ShardNode::Vertex(bottom, top) => {
                     if ph.shard_selector() < bottom.span.end {
                         bottom.insert(ph, full_key, val, mode)?

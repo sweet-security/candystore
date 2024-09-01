@@ -7,10 +7,10 @@ use std::{
 };
 
 use crate::{
-    hashing::PartedHash,
+    hashing::{HashSeed, PartedHash},
     router::ShardRouter,
     shard::{InsertMode, InsertStatus, KVPair},
-    HashSeed, Stats,
+    Stats,
 };
 use crate::{
     shard::{NUM_ROWS, ROW_WIDTH},
@@ -335,14 +335,7 @@ impl CandyStore {
             )));
         }
 
-        loop {
-            let status = self.root.insert(ph, full_key, val, mode)?;
-
-            match status {
-                InsertStatus::CompactionNeeded(_) | InsertStatus::SplitNeeded => unreachable!(),
-                _ => return Ok(status),
-            }
-        }
+        self.root.insert(ph, full_key, val, mode)
     }
 
     pub(crate) fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
@@ -475,22 +468,20 @@ impl CandyStore {
 
     /// Returns useful stats about the store
     pub fn stats(&self) -> Stats {
-        let occupied_and_wasted_bytes = self
+        let shard_stats = self
             .root
-            .call_on_all_shards(|sh| {
-                Ok((
-                    sh.get_write_offset() as usize,
-                    sh.get_wasted_bytes() as usize,
-                ))
-            })
+            .call_on_all_shards(|sh| Ok(sh.get_stats()))
             .unwrap();
 
         let mut stats = Stats::default();
         self.stats.fill_stats(&mut stats);
-        for (occ, wasted) in occupied_and_wasted_bytes {
+
+        for (occ, wasted, inserts, removals) in shard_stats {
             stats.num_shards += 1;
-            stats.occupied_bytes += occ;
-            stats.wasted_bytes += wasted;
+            stats.occupied_bytes += occ as usize;
+            stats.wasted_bytes += wasted as usize;
+            stats.num_inserts += inserts as usize;
+            stats.num_removals += removals as usize;
         }
         stats
     }
