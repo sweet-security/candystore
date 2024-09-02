@@ -52,6 +52,7 @@ impl PartedHash {
         self.0 as u32
     }
 
+    #[allow(dead_code)]
     pub fn as_u64(&self) -> u64 {
         self.0
     }

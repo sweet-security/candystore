@@ -70,7 +70,6 @@ pub enum CandyError {
     KeyTooLong(usize),
     ValueTooLong(usize),
     EntryCannotFitInShard(usize, usize),
-    KeyAlreadyExists(Vec<u8>, u64),
 }
 
 impl Display for CandyError {
@@ -78,9 +77,6 @@ impl Display for CandyError {
         match self {
             Self::KeyTooLong(sz) => write!(f, "key too long {sz}"),
             Self::ValueTooLong(sz) => write!(f, "value too long {sz}"),
-            Self::KeyAlreadyExists(key, ph) => {
-                write!(f, "key {key:?} already exists (0x{ph:016x})")
-            }
             Self::EntryCannotFitInShard(sz, max) => {
                 write!(f, "entry too big ({sz}) for a single shard file ({max})")
             }
@@ -111,6 +107,8 @@ pub struct Config {
     pub clear_on_unsupported_version: bool,
     /// whether or not to mlock the shard headers to RAM (POSIX only)
     pub mlock_headers: bool,
+    /// number of background compaction threads
+    pub num_compaction_threads: usize,
     /// optionally delay modifying operations before for the given duration before flushing data to disk,
     /// to ensure reboot consistency
     #[cfg(feature = "flush_aggregation")]
@@ -128,6 +126,7 @@ impl Default for Config {
             truncate_up: true,
             clear_on_unsupported_version: false,
             mlock_headers: false,
+            num_compaction_threads: 4,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: None,
         }

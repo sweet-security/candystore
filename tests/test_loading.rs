@@ -44,7 +44,6 @@ fn test_loading() -> Result<()> {
 
             std::fs::write(format!("{dir}/top_1234-5678"), "xxxx")?;
             std::fs::write(format!("{dir}/bottom_1234-5678"), "xxxx")?;
-            std::fs::write(format!("{dir}/compact_1234-5678"), "xxxx")?;
 
             let (_, span) = existing[0].split_once("_").unwrap();
             let (start, end) = span.split_once("-").unwrap();
@@ -58,7 +57,6 @@ fn test_loading() -> Result<()> {
 
             assert!(!std::fs::exists(format!("{dir}/top_1234-5678"))?);
             assert!(!std::fs::exists(format!("{dir}/bottom_1234-5678"))?);
-            assert!(!std::fs::exists(format!("{dir}/compact_1234-5678"))?);
             assert!(!std::fs::exists(format!(
                 "{dir}/shard_{start:04x}-{mid:04x}"
             ))?);
