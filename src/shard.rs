@@ -142,6 +142,12 @@ enum TryReplaceStatus<'a> {
     KeyExistsReplaced(Vec<u8>),
 }
 
+pub(crate) enum ModifyInplaceStatus {
+    Success,
+    MissingKey,
+    WrongLength(usize, usize),
+}
+
 pub(crate) type KVPair = (Vec<u8>, Vec<u8>);
 
 // Note: it's possible to reduce the number row_locks, it we make them per-store rather than per-shard.
@@ -591,5 +597,30 @@ impl Shard {
             self.header().num_inserts.load(Ordering::Relaxed),
             self.header().num_removals.load(Ordering::Relaxed),
         )
+    }
+
+    // not crash-safe!
+    pub(crate) fn modify_inplace(
+        &self,
+        ph: PartedHash,
+        key: &[u8],
+        new_val: &[u8],
+    ) -> Result<ModifyInplaceStatus> {
+        let (_guard, row) = self.get_row_mut(ph);
+
+        let mut start = 0;
+        while let Some(idx) = row.lookup(ph.signature(), &mut start) {
+            let (k, v) = self.read_kv(row.offsets_and_sizes[idx])?;
+            if key == k {
+                if new_val.len() != v.len() {
+                    return Ok(ModifyInplaceStatus::WrongLength(new_val.len(), v.len()));
+                }
+                let offset = (row.offsets_and_sizes[idx] as u32) as u64;
+                self.file.write_all_at(new_val, offset)?;
+                return Ok(ModifyInplaceStatus::Success);
+            }
+        }
+
+        Ok(ModifyInplaceStatus::MissingKey)
     }
 }

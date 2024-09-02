@@ -9,7 +9,7 @@ use std::{
 use crate::{
     hashing::{HashSeed, PartedHash},
     router::ShardRouter,
-    shard::{InsertMode, InsertStatus, KVPair},
+    shard::{InsertMode, InsertStatus, KVPair, ModifyInplaceStatus},
     Stats,
 };
 use crate::{
@@ -450,6 +450,18 @@ impl CandyStore {
         default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
         self.get_or_create_raw(&self.make_user_key(key), default_val)
+    }
+
+    /// not crash safe
+    pub(crate) fn modify_inplace_raw(
+        &self,
+        full_key: &[u8],
+        new_val: &[u8],
+    ) -> Result<ModifyInplaceStatus> {
+        let ph = PartedHash::new(&self.config.hash_seed, &full_key);
+        self.root.shared_op(ph.shard_selector(), |sh| {
+            sh.modify_inplace(ph, &full_key, &new_val)
+        })
     }
 
     /// Returns an iterator over the whole store (skipping lists or typed items)
