@@ -15,6 +15,7 @@ const CONFIG: Config = Config {
     truncate_up: true,
     clear_on_unsupported_version: true,
     mlock_headers: false,
+    num_compaction_threads: 4,
 };
 
 fn child_inserts() -> Result<()> {
@@ -22,12 +23,7 @@ fn child_inserts() -> Result<()> {
 
     let store = CandyStore::open("dbdir", CONFIG)?;
     let highest_bytes = store.get("highest")?.unwrap_or(vec![0, 0, 0, 0]);
-    let highest = u32::from_le_bytes([
-        highest_bytes[0],
-        highest_bytes[1],
-        highest_bytes[2],
-        highest_bytes[3],
-    ]);
+    let highest = u32::from_le_bytes(highest_bytes.try_into().unwrap());
 
     if highest == TARGET - 1 {
         println!("child finished (already at {highest})");
@@ -50,12 +46,7 @@ fn child_removals() -> Result<()> {
 
     let store = CandyStore::open("dbdir", CONFIG)?;
     let lowest_bytes = store.get("lowest")?.unwrap_or(vec![0, 0, 0, 0]);
-    let lowest = u32::from_le_bytes([
-        lowest_bytes[0],
-        lowest_bytes[1],
-        lowest_bytes[2],
-        lowest_bytes[3],
-    ]);
+    let lowest = u32::from_le_bytes(lowest_bytes.try_into().unwrap());
 
     if lowest == TARGET - 1 {
         println!("child finished (already at {lowest})");
@@ -79,12 +70,7 @@ fn child_list_inserts() -> Result<()> {
     let store = CandyStore::open("dbdir", CONFIG)?;
 
     let highest_bytes = store.get("list_highest")?.unwrap_or(vec![0, 0, 0, 0]);
-    let highest = u32::from_le_bytes([
-        highest_bytes[0],
-        highest_bytes[1],
-        highest_bytes[2],
-        highest_bytes[3],
-    ]);
+    let highest = u32::from_le_bytes(highest_bytes.try_into().unwrap());
 
     if highest == TARGET - 1 {
         println!("child finished (already at {highest})");
@@ -108,12 +94,7 @@ fn child_list_removals() -> Result<()> {
     let store = CandyStore::open("dbdir", CONFIG)?;
 
     let lowest_bytes = store.get("list_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
-    let lowest = u32::from_le_bytes([
-        lowest_bytes[0],
-        lowest_bytes[1],
-        lowest_bytes[2],
-        lowest_bytes[3],
-    ]);
+    let lowest = u32::from_le_bytes(lowest_bytes.try_into().unwrap());
 
     if lowest == TARGET - 1 {
         println!("child finished (already at {lowest})");
@@ -258,6 +239,7 @@ fn main() -> Result<()> {
     //     "dbdir",
     //     Config {
     //         expected_number_of_keys: 1_000_000,
+    //         clear_on_unsupported_version: true,
     //         ..Default::default()
     //     },
     // )?;
@@ -277,7 +259,7 @@ fn main() -> Result<()> {
         for res in store.iter() {
             let (k, v) = res?;
             assert_eq!(v, b"i am a key");
-            let k = u32::from_le_bytes([k[0], k[1], k[2], k[3]]);
+            let k = u32::from_le_bytes(k.try_into().unwrap());
             assert!(k < TARGET);
             count += 1;
         }
@@ -296,7 +278,12 @@ fn main() -> Result<()> {
             store.remove("lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
         );
-        assert_eq!(store.iter().count(), 0);
+        assert_eq!(
+            store.iter().count(),
+            0,
+            "{:?}",
+            store.iter().collect::<Vec<_>>()
+        );
 
         println!("DB validated successfully");
     }
@@ -314,14 +301,14 @@ fn main() -> Result<()> {
 
         for (i, res) in store.iter_list("xxx").enumerate() {
             let (k, v) = res?;
-            assert_eq!(k, (i as u32).to_le_bytes());
+            assert_eq!(u32::from_le_bytes(k.try_into().unwrap()), i as u32);
             assert_eq!(v, b"yyy");
         }
 
         println!("DB validated successfully");
     }
 
-    parent_run(shared_stuff, child_list_removals, 10..30)?;
+    parent_run(shared_stuff, child_list_removals, 10..80)?;
 
     {
         println!("Parent starts validating the DB...");

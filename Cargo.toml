@@ -19,6 +19,7 @@ uuid = { version = "1.10.0" }
 rand = "0.8.5"
 fslock = "0.2.1"
 libc = "0.2.158"
+crossbeam-channel = "0.5.13"
 
 [features]
 whitebox_testing = []

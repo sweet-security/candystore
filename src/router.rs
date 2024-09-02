@@ -1,9 +1,8 @@
 use anyhow::ensure;
 use parking_lot::RwLock;
-use std::time::Instant;
 use std::{ops::Range, sync::Arc};
 
-use crate::shard::{InsertMode, InsertStatus, Shard};
+use crate::shard::{CompactionThreadPool, InsertMode, InsertStatus, Shard};
 use crate::stats::InternalStats;
 use crate::Result;
 use crate::{hashing::PartedHash, store::InternalConfig};
@@ -73,26 +72,36 @@ pub(crate) struct ShardRouter {
     config: Arc<InternalConfig>,
     node: RwLock<ShardNode>,
     stats: Arc<InternalStats>,
+    threadpool: Arc<CompactionThreadPool>,
 }
 
 impl ShardRouter {
     pub(crate) const END_OF_SHARDS: u32 = 1u32 << 16;
 
-    pub(crate) fn new(config: Arc<InternalConfig>, stats: Arc<InternalStats>) -> Result<Self> {
-        let mut shards = Self::load(&config, &stats)?;
+    pub(crate) fn new(
+        config: Arc<InternalConfig>,
+        stats: Arc<InternalStats>,
+        threadpool: Arc<CompactionThreadPool>,
+    ) -> Result<Self> {
+        let mut shards = Self::load(&config, &stats, &threadpool)?;
         if shards.is_empty() {
-            shards = Self::create_initial_shards(&config, &stats)?;
+            shards = Self::create_initial_shards(&config, &stats, &threadpool)?;
         }
-        let root = Self::treeify(shards, stats.clone());
+        let root = Self::treeify(shards, stats.clone(), threadpool.clone());
         Ok(Self {
             span: root.span(),
             config,
             node: RwLock::new(root),
             stats,
+            threadpool,
         })
     }
 
-    fn load(config: &Arc<InternalConfig>, stats: &Arc<InternalStats>) -> Result<Vec<Shard>> {
+    fn load(
+        config: &Arc<InternalConfig>,
+        stats: &Arc<InternalStats>,
+        threadpool: &Arc<CompactionThreadPool>,
+    ) -> Result<Vec<Shard>> {
         let mut found_shards = vec![];
         for res in std::fs::read_dir(&config.dir_path)? {
             let entry = res?;
@@ -106,10 +115,7 @@ impl ShardRouter {
             if !filetype.is_file() {
                 continue;
             }
-            if filename.starts_with("compact_")
-                || filename.starts_with("bottom_")
-                || filename.starts_with("top_")
-            {
+            if filename.starts_with("bottom_") || filename.starts_with("top_") {
                 std::fs::remove_file(entry.path())?;
                 continue;
             } else if !filename.starts_with("shard_") {
@@ -144,13 +150,11 @@ impl ShardRouter {
         let mut shards = vec![];
         for span in shards_to_keep {
             shards.push(Shard::open(
-                config
-                    .dir_path
-                    .join(format!("shard_{:04x}-{:04x}", span.start, span.end)),
                 span,
                 false,
                 config.clone(),
                 stats.clone(),
+                threadpool.clone(),
             )?);
         }
 
@@ -160,6 +164,7 @@ impl ShardRouter {
     fn create_initial_shards(
         config: &Arc<InternalConfig>,
         stats: &Arc<InternalStats>,
+        threadpool: &Arc<CompactionThreadPool>,
     ) -> Result<Vec<Shard>> {
         let step = (Self::END_OF_SHARDS as f64)
             / (config.expected_number_of_keys as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
@@ -170,13 +175,11 @@ impl ShardRouter {
         while start < Self::END_OF_SHARDS {
             let end = start + step;
             shards.push(Shard::open(
-                config
-                    .dir_path
-                    .join(format!("shard_{:04x}-{:04x}", start, end)),
                 start..end,
                 true,
                 config.clone(),
                 stats.clone(),
+                threadpool.clone(),
             )?);
             start = end;
         }
@@ -184,7 +187,11 @@ impl ShardRouter {
         Ok(shards)
     }
 
-    fn from_shardnode(n: ShardNode, stats: Arc<InternalStats>) -> Self {
+    fn from_shardnode(
+        n: ShardNode,
+        stats: Arc<InternalStats>,
+        threadpool: Arc<CompactionThreadPool>,
+    ) -> Self {
         let config = match n {
             ShardNode::Leaf(ref sh) => sh.config.clone(),
             ShardNode::Vertex(ref bottom, _) => bottom.config.clone(),
@@ -194,10 +201,15 @@ impl ShardRouter {
             span: n.span(),
             node: RwLock::new(n),
             stats,
+            threadpool,
         }
     }
 
-    fn treeify(shards: Vec<Shard>, stats: Arc<InternalStats>) -> ShardNode {
+    fn treeify(
+        shards: Vec<Shard>,
+        stats: Arc<InternalStats>,
+        threadpool: Arc<CompactionThreadPool>,
+    ) -> ShardNode {
         // algorithm: first find the smallest span, and let that be our base unit, say it's 1K. then go over
         // 0..64K in 1K increments and pair up every consecutive pairs whose size is 1K. we count on the spans to be
         // sorted, so we'll merge 0..1K with 1K..2K, and not 1K..3K with 2K..3K.
@@ -239,8 +251,8 @@ impl ShardRouter {
                     nodes.insert(
                         i,
                         ShardNode::Vertex(
-                            Arc::new(Self::from_shardnode(n0, stats.clone())),
-                            Arc::new(Self::from_shardnode(n1, stats.clone())),
+                            Arc::new(Self::from_shardnode(n0, stats.clone(), threadpool.clone())),
+                            Arc::new(Self::from_shardnode(n1, stats.clone(), threadpool.clone())),
                         ),
                     );
                 } else {
@@ -296,8 +308,8 @@ impl ShardRouter {
             }
         }
 
-        let shards = Self::create_initial_shards(&self.config, &self.stats)?;
-        *guard = Self::treeify(shards, self.stats.clone());
+        let shards = Self::create_initial_shards(&self.config, &self.stats, &self.threadpool)?;
+        *guard = Self::treeify(shards, self.stats.clone(), self.threadpool.clone());
 
         Ok(())
     }
@@ -314,132 +326,6 @@ impl ShardRouter {
                 Ok(v)
             }
         }
-    }
-
-    fn split_shard(&self) -> Result<()> {
-        let mut guard = self.node.write();
-        let ShardNode::Leaf(sh) = &*guard else {
-            // already split
-            return Ok(());
-        };
-        let mid = (sh.span.start + sh.span.end) / 2;
-
-        let t0 = Instant::now();
-
-        let bottomfile = self
-            .config
-            .dir_path
-            .join(format!("bottom_{:04x}-{:04x}", sh.span.start, mid));
-        let topfile = self
-            .config
-            .dir_path
-            .join(format!("top_{:04x}-{:04x}", mid, sh.span.end));
-
-        let bottom_shard = Shard::open(
-            bottomfile.clone(),
-            sh.span.start..mid,
-            true,
-            self.config.clone(),
-            self.stats.clone(),
-        )?;
-        let top_shard = Shard::open(
-            topfile.clone(),
-            mid..sh.span.end,
-            true,
-            self.config.clone(),
-            self.stats.clone(),
-        )?;
-
-        sh.split_into(&bottom_shard, &top_shard)?;
-
-        std::fs::rename(
-            bottomfile,
-            self.config.dir_path.join(format!(
-                "shard_{:04x}-{:04x}",
-                bottom_shard.span.start, bottom_shard.span.end
-            )),
-        )?;
-        std::fs::rename(
-            topfile,
-            self.config.dir_path.join(format!(
-                "shard_{:04x}-{:04x}",
-                top_shard.span.start, top_shard.span.end
-            )),
-        )?;
-        std::fs::remove_file(
-            self.config
-                .dir_path
-                .join(format!("shard_{:04x}-{:04x}", sh.span.start, sh.span.end)),
-        )?;
-
-        self.stats.report_split(
-            t0,
-            bottom_shard.get_write_offset(),
-            top_shard.get_write_offset(),
-        );
-
-        *guard = ShardNode::Vertex(
-            Arc::new(ShardRouter {
-                span: bottom_shard.span.clone(),
-                config: self.config.clone(),
-                node: RwLock::new(ShardNode::Leaf(bottom_shard)),
-                stats: self.stats.clone(),
-            }),
-            Arc::new(ShardRouter {
-                span: top_shard.span.clone(),
-                config: self.config.clone(),
-                node: RwLock::new(ShardNode::Leaf(top_shard)),
-                stats: self.stats.clone(),
-            }),
-        );
-
-        Ok(())
-    }
-
-    fn compact_shard(&self, write_offset: u64) -> Result<()> {
-        let mut guard = self.node.write();
-        let ShardNode::Leaf(sh) = &*guard else {
-            // was split
-            return Ok(());
-        };
-        if sh.get_write_offset() < write_offset {
-            // already compacted
-            return Ok(());
-        };
-
-        let t0 = Instant::now();
-        let orig_filename = self
-            .config
-            .dir_path
-            .join(format!("shard_{:04x}-{:04x}", sh.span.start, sh.span.end));
-        let tmpfile = self
-            .config
-            .dir_path
-            .join(format!("compact_{:04x}-{:04x}", sh.span.start, sh.span.end));
-
-        let mut compacted_shard = Shard::open(
-            tmpfile.clone(),
-            sh.span.clone(),
-            true,
-            self.config.clone(),
-            self.stats.clone(),
-        )?;
-
-        // XXX: this can be done in a background thread, holding a read lock until we're done, and then wrap it
-        // all up under a write lock
-        sh.compact_into(&mut compacted_shard)?;
-
-        std::fs::rename(tmpfile, orig_filename)?;
-
-        self.stats.report_compaction(
-            t0,
-            sh.get_write_offset(),
-            compacted_shard.get_write_offset(),
-        );
-
-        *guard = ShardNode::Leaf(compacted_shard);
-
-        Ok(())
     }
 
     pub(crate) fn insert(
@@ -463,11 +349,31 @@ impl ShardRouter {
 
             match res {
                 InsertStatus::SplitNeeded => {
-                    self.split_shard()?;
-                    // retry
-                }
-                InsertStatus::CompactionNeeded(write_offset) => {
-                    self.compact_shard(write_offset)?;
+                    let mut guard = self.node.write();
+                    let ShardNode::Leaf(sh) = &*guard else {
+                        // already split
+                        continue;
+                    };
+
+                    let (bottom, top) = sh.split()?;
+
+                    *guard = ShardNode::Vertex(
+                        Arc::new(ShardRouter {
+                            span: bottom.span.clone(),
+                            config: self.config.clone(),
+                            node: RwLock::new(ShardNode::Leaf(bottom)),
+                            stats: self.stats.clone(),
+                            threadpool: self.threadpool.clone(),
+                        }),
+                        Arc::new(ShardRouter {
+                            span: top.span.clone(),
+                            config: self.config.clone(),
+                            node: RwLock::new(ShardNode::Leaf(top)),
+                            stats: self.stats.clone(),
+                            threadpool: self.threadpool.clone(),
+                        }),
+                    );
+
                     // retry
                 }
                 _ => {

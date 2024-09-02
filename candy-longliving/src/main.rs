@@ -16,7 +16,13 @@ fn main() -> Result<()> {
     let num_iters: usize = args[2].parse().expect("num_iters not a number");
     let tail_length: usize = args[3].parse().expect("tail_length not a number");
 
-    let db = Arc::new(CandyStore::open("dbdir", Config::default())?);
+    let db = Arc::new(CandyStore::open(
+        "dbdir",
+        Config {
+            min_compaction_threashold: 1024 * 1024,
+            ..Default::default()
+        },
+    )?);
     db.clear()?;
 
     let mut handles = vec![];
@@ -35,7 +41,7 @@ fn main() -> Result<()> {
                 if i % 10000 == 0 {
                     let t1 = Instant::now();
                     println!(
-                        "thread {thd} at {i} {:?} rate={}us",
+                        "thread {thd} at {i} {} rate={}us",
                         db.stats(),
                         t1.duration_since(t0).as_micros() / 10_000,
                     );

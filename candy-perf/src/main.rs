@@ -245,7 +245,8 @@ fn test_concurrency_without_contention(num_threads: u32, num_keys: u32) -> Resul
                 {
                     let t0 = Instant::now();
                     for i in thd * num_keys..(thd + 1) * num_keys {
-                        db.set(&i.to_le_bytes(), &thd.to_le_bytes())?;
+                        let status = db.set(&i.to_le_bytes(), &thd.to_le_bytes())?;
+                        debug_assert!(status.was_created());
                     }
                     insert_time_ns.fetch_add(
                         Instant::now().duration_since(t0).as_nanos() as u64,
@@ -257,7 +258,7 @@ fn test_concurrency_without_contention(num_threads: u32, num_keys: u32) -> Resul
                     let t0 = Instant::now();
                     for i in thd * num_keys..(thd + 1) * num_keys {
                         let val = db.get(&i.to_le_bytes())?;
-                        debug_assert_eq!(val, Some(thd.to_le_bytes().to_vec()));
+                        debug_assert_eq!(val, Some(thd.to_le_bytes().to_vec()), "thd={thd} i={i}");
                         black_box(val.unwrap());
                     }
                     get_time_ns.fetch_add(

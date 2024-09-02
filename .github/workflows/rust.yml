@@ -17,9 +17,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build
     - name: Run tests
-      run: cargo test --release --verbose -- --nocapture
+      run: cargo test --release -- --nocapture
     - name: Run simple example
       run: cargo run --example simple
     - name: Run multithreaded example
