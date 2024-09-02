@@ -15,25 +15,25 @@ use uuid::Uuid;
 struct List {
     head_idx: u64, // inclusive
     tail_idx: u64, // exclusive
-    holes: u64,
+    num_items: u64,
 }
 
 impl std::fmt::Debug for List {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "List(0x{:016x}..0x{:016x} len={} holes={})",
-            self.head_idx,
-            self.tail_idx,
-            self.tail_idx - self.head_idx,
-            self.holes
+            "List(0x{:016x}..0x{:016x} items={})",
+            self.head_idx, self.tail_idx, self.num_items
         )
     }
 }
 
 impl List {
-    fn len(&self) -> u64 {
+    fn span_len(&self) -> u64 {
         self.tail_idx - self.head_idx
+    }
+    fn holes(&self) -> u64 {
+        self.span_len() - self.num_items
     }
     fn is_empty(&self) -> bool {
         self.head_idx == self.tail_idx
@@ -210,7 +210,7 @@ impl CandyStore {
             bytes_of(&List {
                 head_idx: Self::FIRST_IDX,
                 tail_idx: Self::FIRST_IDX + 1,
-                holes: 0,
+                num_items: 1,
             })
             .to_owned(),
         )?;
@@ -247,6 +247,7 @@ impl CandyStore {
                 };
 
                 // update list
+                list.num_items += 1;
                 self.set_raw(&list_key, bytes_of(&list))?;
 
                 // create chain
@@ -482,23 +483,23 @@ impl CandyStore {
         existing_val.truncate(existing_val.len() - size_of::<u64>());
 
         // update list, if the item was the head/tail
-        let list_bytes = self.get_raw(&list_key)?.unwrap();
-        let mut list = *from_bytes::<List>(&list_bytes);
+        if let Some(list_bytes) = self.get_raw(&list_key)? {
+            let mut list = *from_bytes::<List>(&list_bytes);
 
-        if list.head_idx == item_idx || list.tail_idx == item_idx + 1 {
-            if list.head_idx == item_idx {
-                list.head_idx += 1;
-            } else if list.tail_idx == item_idx + 1 {
-                list.tail_idx -= 1;
+            list.num_items -= 1;
+
+            if list.head_idx == item_idx || list.tail_idx == item_idx + 1 {
+                if list.head_idx == item_idx {
+                    list.head_idx += 1;
+                } else if list.tail_idx == item_idx + 1 {
+                    list.tail_idx -= 1;
+                }
             }
             if list.is_empty() {
                 self.remove_raw(&list_key)?;
             } else {
                 self.set_raw(&list_key, bytes_of(&list))?;
             }
-        } else {
-            list.holes += 1;
-            self.set_raw(&list_key, bytes_of(&list))?;
         }
 
         // remove chain
@@ -567,10 +568,10 @@ impl CandyStore {
             return Ok(false);
         };
         let list = *from_bytes::<List>(&list_bytes);
-        if list.len() < params.min_length {
+        if list.span_len() < params.min_length {
             return Ok(false);
         }
-        if (list.holes as f64) < (list.len() as f64) * params.min_holes_ratio {
+        if (list.holes() as f64) < (list.span_len() as f64) * params.min_holes_ratio {
             return Ok(false);
         }
 
@@ -617,7 +618,7 @@ impl CandyStore {
                 bytes_of(&List {
                     head_idx: list.tail_idx,
                     tail_idx: new_idx,
-                    holes: 0,
+                    num_items: new_idx - list.tail_idx,
                 }),
             )?;
         }
@@ -813,5 +814,20 @@ impl CandyStore {
         val: Vec<u8>,
     ) -> Result<EncodableUuid> {
         self.owned_push_to_list(list_key, val, InsertToListPos::Tail)
+    }
+
+    /// Returns the estimated list length
+    pub fn list_len<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<usize> {
+        self.owned_list_len(list_key.as_ref().to_owned())
+    }
+    pub fn owned_list_len(&self, list_key: Vec<u8>) -> Result<usize> {
+        let (_, list_key) = self.make_list_key(list_key);
+
+        let Some(list_bytes) = self.get_raw(&list_key)? else {
+            return Ok(0);
+        };
+
+        let list = *from_bytes::<List>(&list_bytes);
+        Ok(list.num_items as usize)
     }
 }
