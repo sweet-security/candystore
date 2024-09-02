@@ -532,6 +532,14 @@ where
         };
         Ok(Some((from_bytes::<K>(&k)?, from_bytes::<V>(&v)?)))
     }
+
+    /// Same as [CandyStore::list_len], but `list_key` is typed
+    pub fn len<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<usize>
+    where
+        L: Borrow<Q>,
+    {
+        self.store.owned_list_len(Self::make_list_key(list_key))
+    }
 }
 
 /// A wrapper around [CandyTypedList] that's specialized for double-ended queues - only allows pushing
