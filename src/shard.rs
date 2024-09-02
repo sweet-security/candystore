@@ -96,7 +96,7 @@ fn test_row_lookup() -> Result<()> {
 struct PageAligned<T>(T);
 
 pub(crate) const SHARD_FILE_MAGIC: [u8; 8] = *b"CandyStr";
-pub(crate) const SHARD_FILE_VERSION: u64 = 9;
+pub(crate) const SHARD_FILE_VERSION: u64 = 10;
 
 #[derive(Clone, Copy, Default, Debug, Pod, Zeroable)]
 #[repr(C)]

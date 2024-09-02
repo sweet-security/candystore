@@ -34,7 +34,9 @@ fn test_lists() -> Result<()> {
         );
 
         assert_eq!(db.iter_list("texas").count(), 3);
+        assert_eq!(db.list_len("texas")?, 3);
         assert_eq!(db.iter_list("arkansas").count(), 0);
+        assert_eq!(db.list_len("arkansas")?, 0);
 
         let items = db
             .iter_list("texas")
@@ -56,19 +58,24 @@ fn test_lists() -> Result<()> {
         // remove from the middle
         assert_eq!(db.remove_from_list("xxx", "k3")?, Some("v3".into()));
         assert_eq!(db.iter_list("xxx").count(), 3);
+        assert_eq!(db.list_len("xxx")?, 3);
         // remove first
         assert_eq!(db.remove_from_list("xxx", "k1")?, Some("v1".into()));
         assert_eq!(db.iter_list("xxx").count(), 2);
+        assert_eq!(db.list_len("xxx")?, 2);
         // remove last
         assert_eq!(db.remove_from_list("xxx", "k4")?, Some("v4".into()));
         assert_eq!(db.iter_list("xxx").count(), 1);
+        assert_eq!(db.list_len("xxx")?, 1);
         // remove single
         assert_eq!(db.remove_from_list("xxx", "k2")?, Some("v2".into()));
         assert_eq!(db.iter_list("xxx").count(), 0);
+        assert_eq!(db.list_len("xxx")?, 0);
 
         for i in 0..10_000 {
             db.set_in_list("xxx", &format!("my key {i}"), 
                 "very long key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+            assert_eq!(db.list_len("xxx")?, i + 1);
         }
 
         // make sure we survive splits
@@ -78,6 +85,7 @@ fn test_lists() -> Result<()> {
             let (k, _) = res?;
             assert_eq!(k, format!("my key {i}").as_bytes());
             db.remove_from_list("xxx", &k)?;
+            assert_eq!(db.list_len("xxx")?, 10_000 - i - 1);
         }
 
         assert_eq!(db.iter_list("xxx").count(), 0);
