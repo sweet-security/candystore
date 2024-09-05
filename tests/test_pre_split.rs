@@ -72,7 +72,7 @@ fn test_compaction() -> Result<()> {
             dir,
             Config {
                 max_shard_size: 1000,
-                min_compaction_threashold: 900,
+                min_compaction_threashold: 0,
                 ..Default::default()
             },
         )?;
@@ -108,7 +108,7 @@ fn test_too_large() -> Result<()> {
             dir,
             Config {
                 max_shard_size: 1000,
-                min_compaction_threashold: 1000,
+                min_compaction_threashold: 0,
                 ..Default::default()
             },
         )?;

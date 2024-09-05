@@ -12,7 +12,7 @@ use candystore::{CandyStore, Config, Result};
 use crate::common::run_in_tempdir;
 
 #[test]
-fn test_flush_aggregation() -> Result<()> {
+fn test_lists() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = Arc::new(CandyStore::open(
             dir,

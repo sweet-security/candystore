@@ -9,7 +9,7 @@ use std::{
 use crate::{
     hashing::{HashSeed, PartedHash},
     router::ShardRouter,
-    shard::{CompactionThreadPool, InsertMode, InsertStatus, KVPair},
+    shard::{InsertMode, InsertStatus, KVPair},
     Stats,
 };
 use crate::{
@@ -36,7 +36,6 @@ pub(crate) struct InternalConfig {
     pub truncate_up: bool,
     pub clear_on_unsupported_version: bool,
     pub mlock_headers: bool,
-    pub num_compaction_threads: usize,
     #[cfg(feature = "flush_aggregation")]
     pub flush_aggregation_delay: Option<std::time::Duration>,
 }
@@ -104,7 +103,6 @@ pub struct CandyStore {
     pub(crate) keyed_locks: Vec<Mutex<()>>,
     _lockfile: LockFile,
     stats: Arc<InternalStats>,
-    //threadpool: Arc<CompactionThreadPool>,
 }
 
 /// An iterator over a CandyStore. Note that it's safe to modify (insert/delete) keys while iterating,
@@ -212,7 +210,6 @@ impl CandyStore {
             truncate_up: config.truncate_up,
             clear_on_unsupported_version: config.clear_on_unsupported_version,
             mlock_headers: config.mlock_headers,
-            num_compaction_threads: config.num_compaction_threads,
             #[cfg(feature = "flush_aggregation")]
             flush_aggregation_delay: config.flush_aggregation_delay,
         });
@@ -235,8 +232,7 @@ impl CandyStore {
         }
 
         let stats = Arc::new(InternalStats::default());
-        let threadpool = Arc::new(CompactionThreadPool::new(config.num_compaction_threads));
-        let root = ShardRouter::new(config.clone(), stats.clone(), threadpool.clone())?;
+        let root = ShardRouter::new(config.clone(), stats.clone())?;
 
         Ok(Self {
             config,
@@ -245,7 +241,6 @@ impl CandyStore {
             keyed_locks,
             _lockfile: lockfile,
             stats,
-            //threadpool,
         })
     }
 
@@ -349,6 +344,7 @@ impl CandyStore {
             InsertStatus::Replaced(v) => Ok(SetStatus::PrevValue(v)),
             InsertStatus::AlreadyExists(v) => Ok(SetStatus::PrevValue(v)),
             InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
             InsertStatus::SplitNeeded => unreachable!(),
         }
     }
@@ -385,6 +381,7 @@ impl CandyStore {
             InsertStatus::Replaced(v) => Ok(ReplaceStatus::PrevValue(v)),
             InsertStatus::AlreadyExists(v) => Ok(ReplaceStatus::WrongValue(v)),
             InsertStatus::KeyDoesNotExist => Ok(ReplaceStatus::DoesNotExist),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
             InsertStatus::SplitNeeded => unreachable!(),
         }
     }
@@ -427,6 +424,7 @@ impl CandyStore {
             InsertStatus::AlreadyExists(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
             InsertStatus::Replaced(_) => unreachable!(),
             InsertStatus::KeyDoesNotExist => unreachable!(),
+            InsertStatus::CompactionNeeded(_) => unreachable!(),
             InsertStatus::SplitNeeded => unreachable!(),
         }
     }
@@ -470,7 +468,10 @@ impl CandyStore {
 
     /// Returns useful stats about the store
     pub fn stats(&self) -> Stats {
-        let shard_stats = self.root.call_on_all_shards(|sh| sh.get_stats()).unwrap();
+        let shard_stats = self
+            .root
+            .call_on_all_shards(|sh| Ok(sh.get_stats()))
+            .unwrap();
 
         let mut stats = Stats::default();
         self.stats.fill_stats(&mut stats);
@@ -485,9 +486,3 @@ impl CandyStore {
         stats
     }
 }
-
-// impl Drop for CandyStore {
-//     fn drop(&mut self) {
-//         _ = self.threadpool.terminate();
-//     }
-// }
