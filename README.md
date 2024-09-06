@@ -138,3 +138,4 @@ If your memory is too constrainted for keeping the lookup tables mapped-in (i.e.
 you'll incur one more unit of "IO latency" for fetching the row from the table. Since the row spans 2KB (and 
 aligned to 4KB), it should behave nicely with 4K IOs.
 
+See also [this guide to LTO/PGO](https://github.com/sweet-security/candystore/issues/7) by Alexander Zaitsev.
