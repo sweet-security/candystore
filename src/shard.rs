@@ -754,7 +754,7 @@ impl Shard {
         key: &[u8],
         val: &[u8],
         mode: InsertMode,
-    ) -> Result<TryReplaceStatus> {
+    ) -> Result<TryReplaceStatus<'a>> {
         let mut start = 0;
         let mut had_collision = false;
         while let Some(idx) = row.lookup(ph.signature(), &mut start) {
