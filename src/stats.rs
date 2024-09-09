@@ -6,7 +6,7 @@ use std::{
 
 use parking_lot::Mutex;
 
-use crate::shard::HEADER_SIZE;
+use crate::{router::ShardRouter, shard::HEADER_SIZE};
 
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
@@ -54,6 +54,13 @@ impl Stats {
         self.data_bytes()
             .checked_div(self.num_entries())
             .unwrap_or(0)
+    }
+
+    pub fn required_num_shards(&self) -> usize {
+        ShardRouter::calc_num_shards(self.num_entries()) as usize
+    }
+    pub fn should_merge_small_shards(&self) -> bool {
+        self.num_shards > self.required_num_shards() * 2
     }
 }
 

@@ -169,6 +169,9 @@ impl ShardRouter {
             / (num_items as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
         1 << (step as u32).ilog2()
     }
+    pub(crate) fn calc_num_shards(num_items: usize) -> u32 {
+        Self::END_OF_SHARDS / Self::calc_step(num_items)
+    }
 
     fn create_initial_shards(
         config: &Arc<InternalConfig>,
@@ -464,8 +467,8 @@ impl ShardRouter {
             num_items += count;
         }
 
-        let needed_shards = Self::END_OF_SHARDS
-            / Self::calc_step(num_items.max(self.config.expected_number_of_keys));
+        let needed_shards =
+            Self::calc_num_shards(num_items.max(self.config.expected_number_of_keys));
 
         if starting_num_shards <= needed_shards {
             return Ok(false);
