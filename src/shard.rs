@@ -320,6 +320,20 @@ impl CompactionThreadPool {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ShardStats {
+    pub write_offset: usize,
+    pub wasted_bytes: usize,
+    pub num_inserts: usize,
+    pub num_removals: usize,
+}
+
+impl ShardStats {
+    pub(crate) fn num_items(&self) -> usize {
+        self.num_inserts - self.num_removals
+    }
+}
+
 pub(crate) struct Shard {
     pub(crate) span: Range<u32>,
     pub(crate) config: Arc<InternalConfig>,
@@ -615,6 +629,86 @@ impl Shard {
         )?;
 
         Ok((bottom, top))
+    }
+
+    pub(crate) fn merge(bottom: &Shard, top: &Shard) -> Result<Option<Shard>> {
+        let bottom_files = bottom.files.write();
+        let top_files = top.files.write();
+
+        let tmp_filename = bottom.config.dir_path.join(format!(
+            "merge_{:04x}-{:04x}",
+            bottom.span.start, top.span.end
+        ));
+        let mmap_file = MmapFile::create(&tmp_filename, &bottom.config)?;
+
+        let combined = Shard::new(
+            bottom.span.start..top.span.end,
+            mmap_file,
+            bottom.config.clone(),
+            bottom.stats.clone(),
+            bottom.threadpool.clone(),
+        )?;
+        let combined_files = combined.files.write();
+
+        for row_idx in 0..NUM_ROWS {
+            let mut target_col = 0;
+            for files in [&bottom_files, &top_files] {
+                let src_row = &files.0.header().rows.0[row_idx];
+                for (src_col, &sig) in src_row.signatures.iter().enumerate() {
+                    if sig == INVALID_SIG {
+                        continue;
+                    }
+                    let (k, v) = files
+                        .0
+                        .read_kv(&combined.stats, src_row.offsets_and_sizes[src_col])?;
+                    let ph = PartedHash::new(&combined.config.hash_seed, &k);
+                    assert_eq!(row_idx, ph.row_selector());
+
+                    let target_row = combined_files.0.row_mut(ph.row_selector());
+                    if target_col >= ROW_WIDTH {
+                        // too many items fall in this row, we can't merge
+                        std::fs::remove_file(tmp_filename)?;
+                        return Ok(None);
+                    }
+                    assert_eq!(
+                        target_row.signatures[target_col], INVALID_SIG,
+                        "row={} target_col={} sig={}",
+                        row_idx, target_col, target_row.signatures[target_col]
+                    );
+                    target_row.offsets_and_sizes[target_col] =
+                        combined_files.0.write_kv(&combined.stats, &k, &v)?;
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    target_row.signatures[target_col] = ph.signature();
+                    combined_files
+                        .0
+                        .header()
+                        .num_inserts
+                        .fetch_add(1, Ordering::Relaxed);
+                    target_col += 1;
+                }
+            }
+        }
+
+        let dst_filename = combined.config.dir_path.join(format!(
+            "shard_{:04x}-{:04x}",
+            combined.span.start, combined.span.end
+        ));
+        let bottom_filename = combined.config.dir_path.join(format!(
+            "shard_{:04x}-{:04x}",
+            bottom.span.start, bottom.span.end
+        ));
+        let top_filename = combined
+            .config
+            .dir_path
+            .join(format!("shard_{:04x}-{:04x}", top.span.start, top.span.end));
+
+        std::fs::rename(tmp_filename, dst_filename)?;
+        std::fs::remove_file(bottom_filename)?;
+        std::fs::remove_file(top_filename)?;
+
+        drop(combined_files);
+
+        Ok(Some(combined))
     }
 
     fn operate_on_row<T>(
@@ -979,16 +1073,16 @@ impl Shard {
         })
     }
 
-    pub(crate) fn get_stats(&self) -> Result<(u64, u64, u64, u64)> {
+    pub(crate) fn get_stats(&self) -> Result<ShardStats> {
         self.wait_for_compaction()?;
         let files_guard = self.files.read();
         let hdr = files_guard.0.header();
-        Ok((
-            hdr.write_offset.load(Ordering::Relaxed),
-            hdr.wasted_bytes.load(Ordering::Relaxed),
-            hdr.num_inserts.load(Ordering::Relaxed),
-            hdr.num_removals.load(Ordering::Relaxed),
-        ))
+        Ok(ShardStats {
+            write_offset: hdr.write_offset.load(Ordering::Relaxed) as usize,
+            wasted_bytes: hdr.wasted_bytes.load(Ordering::Relaxed) as usize,
+            num_inserts: hdr.num_inserts.load(Ordering::Relaxed) as usize,
+            num_removals: hdr.num_removals.load(Ordering::Relaxed) as usize,
+        })
     }
 }
 

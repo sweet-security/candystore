@@ -475,14 +475,29 @@ impl CandyStore {
         let mut stats = Stats::default();
         self.stats.fill_stats(&mut stats);
 
-        for (occ, wasted, inserts, removals) in shard_stats {
+        for stats2 in shard_stats {
             stats.num_shards += 1;
-            stats.occupied_bytes += occ as usize;
-            stats.wasted_bytes += wasted as usize;
-            stats.num_inserts += inserts as usize;
-            stats.num_removals += removals as usize;
+            stats.occupied_bytes += stats2.write_offset;
+            stats.wasted_bytes += stats2.wasted_bytes;
+            stats.num_inserts += stats2.num_inserts;
+            stats.num_removals += stats2.num_removals;
         }
         stats
+    }
+
+    /// Merges small shards (shards with a used capacity of less than `max_fill_level`), `max_fill_level` should
+    /// be a number between 0 and 0.5, the reasonable choice is 0.25.
+    ///
+    /// Note 1: this is an expensive operation that takes a global lock on the store (no other operations can
+    /// take place while merging is in progress). Only use it if you expect the number of items to be at half or
+    /// less than what it was (i.e., after a peak period)
+    ///
+    /// Note 2: merging will stop once we reach the number of shards required for [Config::expected_number_of_keys],
+    /// if configured
+    ///
+    /// Returns true if any shards were merged, false otherwise
+    pub fn merge_small_shards(&self, max_fill_level: f32) -> Result<bool> {
+        self.root.merge_small_shards(max_fill_level)
     }
 }
 

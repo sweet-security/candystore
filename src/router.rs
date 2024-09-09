@@ -87,7 +87,7 @@ impl ShardRouter {
         if shards.is_empty() {
             shards = Self::create_initial_shards(&config, &stats, &threadpool)?;
         }
-        let root = Self::treeify(shards, stats.clone(), threadpool.clone());
+        let root = Self::treeify(shards, &stats, &threadpool);
         Ok(Self {
             span: root.span(),
             config,
@@ -115,7 +115,10 @@ impl ShardRouter {
             if !filetype.is_file() {
                 continue;
             }
-            if filename.starts_with("bottom_") || filename.starts_with("top_") {
+            if filename.starts_with("bottom_")
+                || filename.starts_with("top_")
+                || filename.starts_with("merge_")
+            {
                 std::fs::remove_file(entry.path())?;
                 continue;
             } else if !filename.starts_with("shard_") {
@@ -161,14 +164,18 @@ impl ShardRouter {
         Ok(shards)
     }
 
+    fn calc_step(num_items: usize) -> u32 {
+        let step = (Self::END_OF_SHARDS as f64)
+            / (num_items as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
+        1 << (step as u32).ilog2()
+    }
+
     fn create_initial_shards(
         config: &Arc<InternalConfig>,
         stats: &Arc<InternalStats>,
         threadpool: &Arc<CompactionThreadPool>,
     ) -> Result<Vec<Shard>> {
-        let step = (Self::END_OF_SHARDS as f64)
-            / (config.expected_number_of_keys as f64 / Shard::EXPECTED_CAPACITY as f64).max(1.0);
-        let step = 1 << (step as u32).ilog2();
+        let step = Self::calc_step(config.expected_number_of_keys);
 
         let mut shards = vec![];
         let mut start = 0;
@@ -207,8 +214,8 @@ impl ShardRouter {
 
     fn treeify(
         shards: Vec<Shard>,
-        stats: Arc<InternalStats>,
-        threadpool: Arc<CompactionThreadPool>,
+        stats: &Arc<InternalStats>,
+        threadpool: &Arc<CompactionThreadPool>,
     ) -> ShardNode {
         // algorithm: first find the smallest span, and let that be our base unit, say it's 1K. then go over
         // 0..64K in 1K increments and pair up every consecutive pairs whose size is 1K. we count on the spans to be
@@ -309,7 +316,7 @@ impl ShardRouter {
         }
 
         let shards = Self::create_initial_shards(&self.config, &self.stats, &self.threadpool)?;
-        *guard = Self::treeify(shards, self.stats.clone(), self.threadpool.clone());
+        *guard = Self::treeify(shards, &self.stats, &self.threadpool);
 
         Ok(())
     }
@@ -381,5 +388,109 @@ impl ShardRouter {
                 }
             }
         }
+    }
+
+    fn _merge(
+        &self,
+        bottom: &ShardRouter,
+        top: &ShardRouter,
+        max_fill: usize,
+        shards_to_remove: &mut u32,
+    ) -> Result<Option<ShardRouter>> {
+        if *shards_to_remove == 0 {
+            return Ok(None);
+        }
+
+        let bottom_guard = bottom.node.write();
+        let top_guard = top.node.write();
+
+        match (&*bottom_guard, &*top_guard) {
+            (ShardNode::Leaf(b), ShardNode::Leaf(t)) => {
+                if b.get_stats()?.num_items() > max_fill {
+                    return Ok(None);
+                }
+                if t.get_stats()?.num_items() > max_fill {
+                    return Ok(None);
+                }
+                if let Some(sh) = Shard::merge(b, t)? {
+                    *shards_to_remove = *shards_to_remove - 1;
+                    let span = sh.span.clone();
+                    Ok(Some(ShardRouter {
+                        config: self.config.clone(),
+                        node: RwLock::new(ShardNode::Leaf(sh)),
+                        span,
+                        stats: self.stats.clone(),
+                        threadpool: self.threadpool.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            (ShardNode::Leaf(_), ShardNode::Vertex(b, t)) => {
+                if let Some(merged_top) = self._merge(&b, &t, max_fill, shards_to_remove)? {
+                    self._merge(bottom, &merged_top, max_fill, shards_to_remove)
+                } else {
+                    Ok(None)
+                }
+            }
+            (ShardNode::Vertex(b, t), ShardNode::Leaf(_)) => {
+                if let Some(merged_bottom) = self._merge(&b, &t, max_fill, shards_to_remove)? {
+                    self._merge(&merged_bottom, top, max_fill, shards_to_remove)
+                } else {
+                    Ok(None)
+                }
+            }
+            (ShardNode::Vertex(b1, t1), ShardNode::Vertex(b2, t2)) => {
+                let m1 = self._merge(b1, t1, max_fill, shards_to_remove)?;
+                let m2 = self._merge(b2, t2, max_fill, shards_to_remove)?;
+                match (m1, m2) {
+                    (Some(m1), Some(m2)) => self._merge(&m1, &m2, max_fill, shards_to_remove),
+                    (Some(m1), None) => self._merge(&m1, top, max_fill, shards_to_remove),
+                    (None, Some(m2)) => self._merge(bottom, &m2, max_fill, shards_to_remove),
+                    (None, None) => Ok(None),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn merge_small_shards(&self, max_fill_level: f32) -> Result<bool> {
+        ensure!(max_fill_level > 0.0 && max_fill_level < 0.5);
+        let max_fill = (Shard::EXPECTED_CAPACITY as f32 * max_fill_level) as usize;
+
+        let mut num_items = 0usize;
+        let mut starting_num_shards = 0u32;
+        for count in self.call_on_all_shards(|sh| Ok(sh.get_stats()?.num_items()))? {
+            starting_num_shards += 1;
+            num_items += count;
+        }
+
+        let needed_shards = Self::END_OF_SHARDS
+            / Self::calc_step(num_items.max(self.config.expected_number_of_keys));
+
+        if starting_num_shards <= needed_shards {
+            return Ok(false);
+        }
+        let mut shards_to_remove = starting_num_shards - needed_shards;
+
+        {
+            let mut guard = self.node.write();
+
+            match &*guard {
+                ShardNode::Leaf(_) => None,
+                ShardNode::Vertex(bottom, top) => {
+                    self._merge(&bottom, &top, max_fill, &mut shards_to_remove)?
+                }
+            };
+
+            *guard = Self::treeify(
+                Self::load(&self.config, &self.stats, &self.threadpool)?,
+                &self.stats,
+                &self.threadpool,
+            );
+        }
+
+        let new_num_shards: u32 = self.call_on_all_shards(|_| Ok(1))?.iter().sum();
+
+        Ok(new_num_shards != starting_num_shards)
     }
 }
