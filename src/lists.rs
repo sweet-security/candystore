@@ -667,17 +667,17 @@ impl CandyStore {
 
     /// Discards the given list, removing all elements it contains and dropping the list itself.
     /// This is more efficient than iteration + removal of each element.
-    pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<()> {
+    pub fn discard_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> Result<bool> {
         self.owned_discard_list(list_key.as_ref().to_owned())
     }
 
     /// Owned version of [Self::discard_list]
-    pub fn owned_discard_list(&self, list_key: Vec<u8>) -> Result<()> {
+    pub fn owned_discard_list(&self, list_key: Vec<u8>) -> Result<bool> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let _guard = self.lock_list(list_ph);
 
         let Some(list_bytes) = self.get_raw(&list_key)? else {
-            return Ok(());
+            return Ok(false);
         };
         let list = *from_bytes::<List>(&list_bytes);
         for idx in list.head_idx..list.tail_idx {
@@ -693,7 +693,7 @@ impl CandyStore {
         }
         self.remove_raw(&list_key)?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the first (head) element of the list

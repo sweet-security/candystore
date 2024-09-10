@@ -10,7 +10,7 @@ use crate::{
     hashing::{HashSeed, PartedHash},
     router::ShardRouter,
     shard::{CompactionThreadPool, InsertMode, InsertStatus, KVPair},
-    Stats,
+    Stats, MAX_TOTAL_VALUE_SIZE,
 };
 use crate::{
     shard::{NUM_ROWS, ROW_WIDTH},
@@ -330,7 +330,7 @@ impl CandyStore {
         if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
             return Err(anyhow!(CandyError::KeyTooLong(full_key.len())));
         }
-        if val.len() > MAX_VALUE_SIZE as usize {
+        if val.len() > MAX_TOTAL_VALUE_SIZE as usize {
             return Err(anyhow!(CandyError::ValueTooLong(val.len())));
         }
         if full_key.len() + val.len() > self.config.max_shard_size as usize {
@@ -498,6 +498,43 @@ impl CandyStore {
     /// Returns true if any shards were merged, false otherwise
     pub fn merge_small_shards(&self, max_fill_level: f32) -> Result<bool> {
         self.root.merge_small_shards(max_fill_level)
+    }
+
+    /// Sets a big item, whose value is unlimited in size. Behind the scenes the value is split into chunks
+    /// and stored as a list. This makes this API non-atomic, i.e., crashing while writing a big value may later
+    /// allow you to retrieve a partial result. It is up to the caller to add a length field or a checksum to make
+    /// sure the value is correct.
+    ///
+    /// Returns true if the value had existed before (thus it was replaced), false otherwise
+    pub fn set_big(&self, key: &[u8], val: &[u8]) -> Result<bool> {
+        let existed = self.discard_list(key)?;
+        for (i, chunk) in val.chunks(MAX_VALUE_SIZE).enumerate() {
+            self.set_in_list(key, &i.to_le_bytes(), chunk)?;
+        }
+        Ok(existed)
+    }
+
+    /// Returns a big item, collecting all the underlying chunks into a single value that's returned to the
+    /// caller.
+    pub fn get_big(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut val = vec![];
+        let mut exists = false;
+        for res in self.iter_list(key) {
+            let (_, chunk) = res?;
+            exists = true;
+            val.extend_from_slice(&chunk);
+        }
+        if exists {
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Removes a big item by key. Returns true if the key had existed, false otherwise.
+    /// See also [Self::set_big]
+    pub fn remove_big(&self, key: &[u8]) -> Result<bool> {
+        self.discard_list(key)
     }
 }
 

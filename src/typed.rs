@@ -188,6 +188,43 @@ where
             Ok(None)
         }
     }
+
+    /// Same as [CandyStore::get_big] but serializes the key and deserializes the value
+    pub fn get_big<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
+    where
+        K: Borrow<Q>,
+    {
+        let kbytes = Self::make_key(key);
+        if let Some(vbytes) = self.store.get_big(&kbytes)? {
+            Ok(Some(from_bytes::<V>(&vbytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Same as [CandyStore::set_big] but serializes the key and the value.
+    pub fn set_big<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+        &self,
+        key: &Q1,
+        val: &Q2,
+    ) -> Result<bool>
+    where
+        K: Borrow<Q1>,
+        V: Borrow<Q2>,
+    {
+        let kbytes = Self::make_key(key);
+        let vbytes = val.to_bytes::<LE>();
+        self.store.set_big(&kbytes, &vbytes)
+    }
+
+    /// Same as [CandyStore::remove_big] but serializes the key
+    pub fn remove_big<Q: ?Sized + Encode>(&self, k: &Q) -> Result<bool>
+    where
+        K: Borrow<Q>,
+    {
+        let kbytes = Self::make_key(k);
+        self.store.remove_big(&kbytes)
+    }
 }
 
 /// A wrapper around [CandyStore] that exposes the list API in a typed manner. See [CandyTypedStore] for more
@@ -432,7 +469,7 @@ where
     }
 
     /// Same as [CandyStore::discard_list], but `list_key` is typed
-    pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<()>
+    pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<bool>
     where
         L: Borrow<Q>,
     {
