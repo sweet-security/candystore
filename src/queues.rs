@@ -21,19 +21,19 @@ enum QueuePos {
     Tail,
 }
 
-pub struct QueueIterator<'a, 'b> {
+pub struct QueueIterator<'a> {
     store: &'a CandyStore,
-    queue_key: &'b [u8],
+    queue_key: Vec<u8>,
     curr: Option<u64>,
     end: Option<u64>,
     fwd: bool,
 }
 
-impl<'a, 'b> Iterator for QueueIterator<'a, 'b> {
+impl<'a> Iterator for QueueIterator<'a> {
     type Item = Result<(usize, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.curr.is_none() {
-            match self.store.fetch_queue(self.queue_key) {
+            match self.store.fetch_queue(&self.queue_key) {
                 Ok(queue) => match queue {
                     Some(queue) => {
                         if self.fwd {
@@ -59,7 +59,7 @@ impl<'a, 'b> Iterator for QueueIterator<'a, 'b> {
             }
             match self
                 .store
-                .get_raw(&self.store.make_queue_item_key(self.queue_key, curr))
+                .get_raw(&self.store.make_queue_item_key(&self.queue_key, curr))
             {
                 Ok(v) => {
                     match v {
@@ -314,26 +314,45 @@ impl CandyStore {
         Ok(indices)
     }
 
-    pub fn iter_queue<'a, 'b, B: AsRef<[u8]> + ?Sized>(
-        &'a self,
-        queue_key: &'b B,
-    ) -> QueueIterator<'a, 'b> {
+    pub fn peek_queue_head<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(res) = self.iter_queue(queue_key).next() else {
+            return Ok(None);
+        };
+        let (_, v) = res?;
+        Ok(Some(v))
+    }
+
+    pub fn peek_queue_tail<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(res) = self.iter_queue_backwards(queue_key).next() else {
+            return Ok(None);
+        };
+        let (_, v) = res?;
+        Ok(Some(v))
+    }
+
+    pub fn iter_queue<'a, B: AsRef<[u8]> + ?Sized>(&'a self, queue_key: &B) -> QueueIterator<'a> {
         QueueIterator {
             store: &self,
-            queue_key: queue_key.as_ref(),
+            queue_key: queue_key.as_ref().to_owned(),
             curr: None,
             end: None,
             fwd: true,
         }
     }
 
-    pub fn iter_queue_backwards<'a, 'b, B: AsRef<[u8]> + ?Sized>(
+    pub fn iter_queue_backwards<'a, B: AsRef<[u8]> + ?Sized>(
         &'a self,
-        queue_key: &'b B,
-    ) -> QueueIterator<'a, 'b> {
+        queue_key: &B,
+    ) -> QueueIterator<'a> {
         QueueIterator {
             store: &self,
-            queue_key: queue_key.as_ref(),
+            queue_key: queue_key.as_ref().to_owned(),
             curr: None,
             end: None,
             fwd: false,

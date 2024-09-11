@@ -12,6 +12,10 @@ fn test_queues() -> Result<()> {
         db.push_to_queue_tail("work", "item1")?;
         db.push_to_queue_tail("work", "item2")?;
         db.push_to_queue_tail("work", "item3")?;
+
+        assert_eq!(db.peek_queue_head("work")?, Some("item1".into()));
+        assert_eq!(db.peek_queue_tail("work")?, Some("item3".into()));
+
         assert_eq!(db.pop_queue_head("work")?, Some("item1".into()));
         assert_eq!(db.pop_queue_head("work")?, Some("item2".into()));
         assert_eq!(db.pop_queue_head("work")?, Some("item3".into()));

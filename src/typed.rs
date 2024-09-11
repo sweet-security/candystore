@@ -579,17 +579,18 @@ where
     }
 }
 
-/// A wrapper around [CandyTypedList] that's specialized for double-ended queues - only allows pushing
-/// and popping from either the head or the tail. The keys are auto-generated internally and are not exposed to
-/// the caller
+/// A wrapper around [CandyStore] that exposes the queue API in a typed manner. See [CandyTypedStore] for more
+/// info
 pub struct CandyTypedDeque<L, V> {
-    pub list: CandyTypedList<L, EncodableUuid, V>,
+    store: Arc<CandyStore>,
+    _phantom: PhantomData<(L, V)>,
 }
 
 impl<L, V> Clone for CandyTypedDeque<L, V> {
     fn clone(&self) -> Self {
         Self {
-            list: self.list.clone(),
+            store: self.store.clone(),
+            _phantom: Default::default(),
         }
     }
 }
@@ -601,7 +602,8 @@ where
 {
     pub fn new(store: Arc<CandyStore>) -> Self {
         Self {
-            list: CandyTypedList::new(store),
+            store,
+            _phantom: Default::default(),
         }
     }
 
@@ -615,7 +617,9 @@ where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        self.list.push_head(list_key, val)?;
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let val = val.to_bytes::<LE>();
+        self.store.push_to_queue_head(&list_key, &val)?;
         Ok(())
     }
 
@@ -629,7 +633,9 @@ where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        self.list.push_tail(list_key, val)?;
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let val = val.to_bytes::<LE>();
+        self.store.push_to_queue_tail(&list_key, &val)?;
         Ok(())
     }
 
@@ -638,7 +644,11 @@ where
     where
         L: Borrow<Q>,
     {
-        Ok(self.list.pop_head(list_key)?.map(|kv| kv.1))
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let Some(v) = self.store.pop_queue_head(&list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
     }
 
     /// Pops a value from the end (tail) of the queue
@@ -646,7 +656,11 @@ where
     where
         L: Borrow<Q>,
     {
-        Ok(self.list.pop_tail(list_key)?.map(|kv| kv.1))
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let Some(v) = self.store.pop_queue_tail(&list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
     }
 
     /// Peek at the value from the beginning (head) of the queue
@@ -654,7 +668,11 @@ where
     where
         L: Borrow<Q>,
     {
-        Ok(self.list.peek_head(list_key)?.map(|kv| kv.1))
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let Some(v) = self.store.peek_queue_head(&list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
     }
 
     /// Peek at the value from the end (tail) of the queue
@@ -662,7 +680,11 @@ where
     where
         L: Borrow<Q>,
     {
-        Ok(self.list.peek_tail(list_key)?.map(|kv| kv.1))
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let Some(v) = self.store.peek_queue_tail(&list_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(from_bytes::<V>(&v)?))
     }
 
     /// See [CandyTypedList::iter]
@@ -673,9 +695,10 @@ where
     where
         L: Borrow<Q>,
     {
-        self.list.iter(list_key).map(|res| match res {
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        self.store.iter_queue(&list_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok((_, v)) => Ok(v),
+            Ok((_, v)) => Ok(from_bytes::<V>(&v).unwrap()),
         })
     }
 
@@ -687,9 +710,12 @@ where
     where
         L: Borrow<Q>,
     {
-        self.list.iter_backwards(list_key).map(|res| match res {
-            Err(e) => Err(e),
-            Ok((_, v)) => Ok(v),
-        })
+        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        self.store
+            .iter_queue_backwards(&list_key)
+            .map(|res| match res {
+                Err(e) => Err(e),
+                Ok((_, v)) => Ok(from_bytes::<V>(&v).unwrap()),
+            })
     }
 }
