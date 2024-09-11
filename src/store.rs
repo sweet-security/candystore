@@ -24,6 +24,8 @@ pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
 pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
 pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
 pub(crate) const CHAIN_NAMESPACE: u8 = 5;
+pub(crate) const QUEUE_NAMESPACE: &[u8] = &[6];
+pub(crate) const QUEUE_ITEM_NAMESPACE: &[u8] = &[7];
 
 #[derive(Debug, Clone)]
 pub(crate) struct InternalConfig {
@@ -506,11 +508,13 @@ impl CandyStore {
     /// sure the value is correct.
     ///
     /// Returns true if the value had existed before (thus it was replaced), false otherwise
-    pub fn set_big(&self, key: &[u8], val: &[u8]) -> Result<bool> {
-        let existed = self.discard_list(key)?;
-        for (i, chunk) in val.chunks(MAX_VALUE_SIZE).enumerate() {
-            self.set_in_list(key, &i.to_le_bytes(), chunk)?;
-        }
+    pub fn set_big<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+        &self,
+        key: &B1,
+        val: &B2,
+    ) -> Result<bool> {
+        let existed = self.discard_queue(key)?;
+        self.extend_queue(key, val.as_ref().chunks(MAX_VALUE_SIZE))?;
         Ok(existed)
     }
 
@@ -519,7 +523,7 @@ impl CandyStore {
     pub fn get_big(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut val = vec![];
         let mut exists = false;
-        for res in self.iter_list(key) {
+        for res in self.iter_queue(key) {
             let (_, chunk) = res?;
             exists = true;
             val.extend_from_slice(&chunk);
@@ -534,7 +538,7 @@ impl CandyStore {
     /// Removes a big item by key. Returns true if the key had existed, false otherwise.
     /// See also [Self::set_big]
     pub fn remove_big(&self, key: &[u8]) -> Result<bool> {
-        self.discard_list(key)
+        self.discard_queue(key)
     }
 }
 

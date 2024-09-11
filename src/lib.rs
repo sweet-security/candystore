@@ -48,6 +48,7 @@
 mod encodable;
 mod hashing;
 mod lists;
+mod queues;
 mod router;
 mod shard;
 mod stats;

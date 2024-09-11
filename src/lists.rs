@@ -141,7 +141,7 @@ enum InsertToListPos {
 }
 
 impl CandyStore {
-    const FIRST_IDX: u64 = 0x8000_0000_0000_0000;
+    const FIRST_LIST_IDX: u64 = 0x8000_0000_0000_0000;
 
     fn make_list_key(&self, mut list_key: Vec<u8>) -> (PartedHash, Vec<u8>) {
         list_key.extend_from_slice(LIST_NAMESPACE);
@@ -154,7 +154,7 @@ impl CandyStore {
         (PartedHash::new(&self.config.hash_seed, &item_key), item_key)
     }
 
-    fn lock_list(&self, list_ph: PartedHash) -> MutexGuard<()> {
+    pub(crate) fn lock_list(&self, list_ph: PartedHash) -> MutexGuard<()> {
         self.keyed_locks[(list_ph.signature() & self.keyed_locks_mask) as usize].lock()
     }
 
@@ -207,8 +207,8 @@ impl CandyStore {
         let res = self.get_or_create_raw(
             &list_key,
             bytes_of(&List {
-                head_idx: Self::FIRST_IDX,
-                tail_idx: Self::FIRST_IDX + 1,
+                head_idx: Self::FIRST_LIST_IDX,
+                tail_idx: Self::FIRST_LIST_IDX + 1,
                 num_items: 1,
             })
             .to_owned(),
@@ -220,14 +220,14 @@ impl CandyStore {
                 self.set_raw(
                     bytes_of(&ChainKey {
                         list_ph,
-                        idx: Self::FIRST_IDX,
+                        idx: Self::FIRST_LIST_IDX,
                         namespace: CHAIN_NAMESPACE,
                     }),
                     bytes_of(&item_ph),
                 )?;
 
                 // create item
-                val.extend_from_slice(bytes_of(&Self::FIRST_IDX));
+                val.extend_from_slice(bytes_of(&Self::FIRST_LIST_IDX));
                 self.set_raw(&item_key, &val)?;
             }
             crate::GetOrCreateStatus::ExistingValue(list_bytes) => {
