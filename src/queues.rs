@@ -17,8 +17,13 @@ struct Queue {
 }
 
 impl Queue {
-    fn span(&self) -> u64 {
+    #[allow(dead_code)]
+    fn span_len(&self) -> u64 {
         self.tail_idx - self.head_idx
+    }
+    #[allow(dead_code)]
+    fn holes(&self) -> u64 {
+        self.span_len() - self.num_items
     }
     fn is_empty(&self) -> bool {
         self.head_idx == self.tail_idx

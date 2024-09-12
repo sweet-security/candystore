@@ -120,12 +120,6 @@ impl<'a> Iterator for ListIterator<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for ListIterator<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
 #[derive(Debug)]
 enum InsertToListStatus {
     Created(Vec<u8>),
