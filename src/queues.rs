@@ -16,6 +16,15 @@ struct Queue {
     num_items: u64,
 }
 
+impl Queue {
+    fn span(&self) -> u64 {
+        self.tail_idx - self.head_idx
+    }
+    fn is_empty(&self) -> bool {
+        self.head_idx == self.tail_idx
+    }
+}
+
 enum QueuePos {
     Head,
     Tail,
@@ -141,6 +150,7 @@ impl CandyStore {
         Ok(item_idx as usize)
     }
 
+    /// Pushed a new element at the front (head) of the queue, returning the element's index in the queue
     pub fn push_to_queue_head<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B1,
@@ -148,6 +158,8 @@ impl CandyStore {
     ) -> Result<usize> {
         self._push_to_queue(queue_key.as_ref(), val.as_ref(), QueuePos::Head)
     }
+
+    /// Pushed a new element at the end (tail) of the queue, returning the element's index in the queue
     pub fn push_to_queue_tail<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B1,
@@ -191,7 +203,7 @@ impl CandyStore {
             }
         }
 
-        if queue.head_idx == queue.tail_idx {
+        if queue.is_empty() {
             self.remove_raw(&full_queue_key)?;
         } else {
             self.set_raw(&full_queue_key, &queue_bytes)?;
@@ -200,12 +212,15 @@ impl CandyStore {
         Ok(val)
     }
 
+    /// Removes and returns the head element of the queue, or None if the queue is empty
     pub fn pop_queue_head<B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
     ) -> Result<Option<Vec<u8>>> {
         self._pop_queue(queue_key.as_ref(), QueuePos::Head)
     }
+
+    /// Removes and returns the tail element of the queue, or None if the queue is empty
     pub fn pop_queue_tail<B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
@@ -213,6 +228,12 @@ impl CandyStore {
         self._pop_queue(queue_key.as_ref(), QueuePos::Tail)
     }
 
+    /// Removes an element by index from the queue, returning the value it had or None if it did not exist (as well
+    /// as if the queue itself does not exist).
+    ///
+    /// This will leave a "hole" in the queue, which means we will skip over it in future iterations, but this could
+    /// lead to inefficienies as if you keep only the head and tail elements of a long queue, while removing elements
+    /// from the middle.
     pub fn remove_from_queue<B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
@@ -236,7 +257,7 @@ impl CandyStore {
                 queue.tail_idx -= 1;
             }
             queue.num_items -= 1;
-            if queue.head_idx == queue.tail_idx {
+            if queue.is_empty() {
                 self.remove_raw(&full_queue_key)?;
             } else {
                 self.set_raw(&full_queue_key, &queue_bytes)?;
@@ -246,6 +267,7 @@ impl CandyStore {
         Ok(Some(val))
     }
 
+    /// Discards the queue (dropping all elements in contains). Returns true if it had existed before, false otherwise
     pub fn discard_queue<B: AsRef<[u8]> + ?Sized>(&self, queue_key: &B) -> Result<bool> {
         let queue_key = queue_key.as_ref();
         let (queue_ph, full_queue_key) = self.make_queue_key(queue_key);
@@ -275,6 +297,14 @@ impl CandyStore {
         }
     }
 
+    /// Extends the queue with elements from the given iterator. The queue will be created if it did not exist before,
+    /// and elements are pushed at the tail-end of the queue. This is more efficient than calling
+    /// [Self::push_to_queue_tail] in a loop
+    ///
+    /// Note: this is not an atomic (crash-safe) operation: if your program crashes while extending the queue, it
+    /// is possible that only some of the elements will have been appended.
+    ///
+    /// Returns the indices of the elements added (a range)
     pub fn extend_queue<'a, B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
@@ -314,6 +344,7 @@ impl CandyStore {
         Ok(indices)
     }
 
+    /// Returns (without removing) the head element of the queue, or None if the queue is empty
     pub fn peek_queue_head<B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
@@ -325,6 +356,7 @@ impl CandyStore {
         Ok(Some(v))
     }
 
+    /// Returns (without removing) the tail element of the queue, or None if the queue is empty
     pub fn peek_queue_tail<B: AsRef<[u8]> + ?Sized>(
         &self,
         queue_key: &B,
@@ -336,6 +368,8 @@ impl CandyStore {
         Ok(Some(v))
     }
 
+    /// Returns a forward iterator (head to tail) over the elements of the queue. If the queue does not exist,
+    /// this is an empty iterator.
     pub fn iter_queue<'a, B: AsRef<[u8]> + ?Sized>(&'a self, queue_key: &B) -> QueueIterator<'a> {
         QueueIterator {
             store: &self,
@@ -346,6 +380,8 @@ impl CandyStore {
         }
     }
 
+    /// Returns a backward iterator (tail to head) over the elements of the queue. If the queue does not exist,
+    /// this is an empty iterator.
     pub fn iter_queue_backwards<'a, B: AsRef<[u8]> + ?Sized>(
         &'a self,
         queue_key: &B,
@@ -359,6 +395,7 @@ impl CandyStore {
         }
     }
 
+    /// Returns a the length of the given queue (number of elements in the queue) or 0 if the queue does not exist
     pub fn queue_len<B: AsRef<[u8]> + ?Sized>(&self, queue_key: &B) -> Result<usize> {
         let Some(queue) = self.fetch_queue(queue_key.as_ref())? else {
             return Ok(0);

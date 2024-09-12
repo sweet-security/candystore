@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use fslock::LockFile;
 use parking_lot::Mutex;
 use std::{
@@ -10,7 +10,7 @@ use crate::{
     hashing::{HashSeed, PartedHash},
     router::ShardRouter,
     shard::{CompactionThreadPool, InsertMode, InsertStatus, KVPair},
-    Stats, MAX_TOTAL_VALUE_SIZE,
+    Stats, MAX_KEY_SIZE, MAX_TOTAL_VALUE_SIZE,
 };
 use crate::{
     shard::{NUM_ROWS, ROW_WIDTH},
@@ -266,6 +266,16 @@ impl CandyStore {
         Ok(())
     }
 
+    pub(crate) fn ensure_sizes(key: &[u8], val: &[u8]) -> Result<()> {
+        ensure!(key.len() <= MAX_KEY_SIZE, CandyError::KeyTooLong(key.len()));
+        ensure!(
+            val.len() <= MAX_VALUE_SIZE,
+            CandyError::ValueTooLong(val.len())
+        );
+
+        Ok(())
+    }
+
     pub(crate) fn make_user_key(&self, mut key: Vec<u8>) -> Vec<u8> {
         key.extend_from_slice(USER_NAMESPACE);
         key
@@ -329,12 +339,15 @@ impl CandyStore {
     ) -> Result<InsertStatus> {
         let ph = PartedHash::new(&self.config.hash_seed, full_key);
 
-        if full_key.len() > MAX_TOTAL_KEY_SIZE as usize {
-            return Err(anyhow!(CandyError::KeyTooLong(full_key.len())));
-        }
-        if val.len() > MAX_TOTAL_VALUE_SIZE as usize {
-            return Err(anyhow!(CandyError::ValueTooLong(val.len())));
-        }
+        ensure!(
+            full_key.len() <= MAX_TOTAL_KEY_SIZE,
+            CandyError::KeyTooLong(full_key.len())
+        );
+        ensure!(
+            val.len() <= MAX_TOTAL_VALUE_SIZE,
+            CandyError::ValueTooLong(val.len())
+        );
+
         if full_key.len() + val.len() > self.config.max_shard_size as usize {
             return Err(anyhow!(CandyError::EntryCannotFitInShard(
                 full_key.len() + val.len(),
@@ -373,6 +386,7 @@ impl CandyStore {
 
     /// Same as [Self::set], but the key passed owned to this function
     pub fn owned_set(&self, key: Vec<u8>, val: &[u8]) -> Result<SetStatus> {
+        Self::ensure_sizes(&key, &val)?;
         self.set_raw(&self.make_user_key(key), val)
     }
 
@@ -416,7 +430,8 @@ impl CandyStore {
         val: &[u8],
         expected_val: Option<&[u8]>,
     ) -> Result<ReplaceStatus> {
-        self.replace_raw(&self.make_user_key(key), val.as_ref(), expected_val)
+        Self::ensure_sizes(&key, &val)?;
+        self.replace_raw(&self.make_user_key(key), val, expected_val)
     }
 
     pub(crate) fn get_or_create_raw(
@@ -453,6 +468,7 @@ impl CandyStore {
         key: Vec<u8>,
         default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
+        Self::ensure_sizes(&key, &default_val)?;
         self.get_or_create_raw(&self.make_user_key(key), default_val)
     }
 

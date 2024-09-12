@@ -139,7 +139,7 @@ pub(crate) const MAX_TOTAL_VALUE_SIZE: usize = 0xffff; // 16 bits
 pub(crate) const NAMESPACING_RESERVED_SIZE: usize = 0xff;
 pub(crate) const VALUE_RESERVED_SIZE: usize = 0xff;
 pub const MAX_KEY_SIZE: usize = MAX_TOTAL_KEY_SIZE - NAMESPACING_RESERVED_SIZE;
-pub const MAX_VALUE_SIZE: usize = MAX_TOTAL_KEY_SIZE - VALUE_RESERVED_SIZE;
+pub const MAX_VALUE_SIZE: usize = MAX_TOTAL_VALUE_SIZE - VALUE_RESERVED_SIZE;
 
 const _: () = assert!(MAX_KEY_SIZE <= u16::MAX as usize);
 const _: () = assert!(MAX_VALUE_SIZE <= u16::MAX as usize);

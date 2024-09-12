@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use candystore::{CandyStore, Config, Result};
+use candystore::{CandyStore, Config, Result, MAX_VALUE_SIZE};
 
 use crate::common::{run_in_tempdir, LONG_VAL};
 
@@ -127,7 +127,7 @@ fn test_histogram() -> Result<()> {
         db.set("k4", &vec![b'b'; 5000])?;
         db.set("k4", &vec![b'b'; 4500])?;
         db.set("k5", &vec![b'b'; 50000])?;
-        db.set("kkkkkkkkkkkkkkk", &vec![b'b'; 0xffff])?;
+        db.set("kkkkkkkkkkkkkkk", &vec![b'b'; MAX_VALUE_SIZE])?;
 
         let stats = db.stats();
         assert_eq!(stats.entries_under_128, 2);
