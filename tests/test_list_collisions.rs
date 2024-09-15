@@ -20,7 +20,7 @@ fn test_list_collisions() -> Result<()> {
             if i % 10_000 == 0 {
                 println!("push {i}");
             }
-            db.push_to_list_tail("xxx", &i.to_le_bytes())?;
+            db.set_in_list("xxx", &i.to_le_bytes(), &i.to_le_bytes())?;
         }
 
         for i in 0u32..100_000 {
@@ -33,26 +33,6 @@ fn test_list_collisions() -> Result<()> {
         assert!(db.pop_list_head("xxx")?.is_none());
         assert!(db.pop_list_tail("xxx")?.is_none());
         assert_eq!(db.iter_list("xxx").count(), 0);
-
-        for i in 0u32..100_000 {
-            if i % 10_000 == 0 {
-                println!("push {i}");
-            }
-            db.push_to_list_head("xxx", &i.to_le_bytes())?;
-        }
-
-        for i in 0u32..100_000 {
-            if i % 10_000 == 0 {
-                println!("pop {i}");
-            }
-            assert_eq!(
-                db.pop_list_tail("xxx")?.unwrap().1,
-                &i.to_le_bytes(),
-                "i={i}"
-            );
-        }
-
-        assert!(db.pop_list_head("xxx")?.is_none());
 
         unsafe { HASH_BITS_TO_KEEP = 0x0000_000f_0000_00ff };
 

@@ -236,63 +236,6 @@ fn test_list_atomics() -> Result<()> {
 }
 
 #[test]
-fn test_queues() -> Result<()> {
-    run_in_tempdir(|dir| {
-        let db = CandyStore::open(dir, Config::default())?;
-
-        db.push_to_list_tail("mylist", "hello1")?;
-        db.push_to_list_tail("mylist", "hello2")?;
-        db.push_to_list_tail("mylist", "hello3")?;
-        db.push_to_list_tail("mylist", "hello4")?;
-
-        let mut items = vec![];
-        while let Some((_uuid, v)) = db.pop_list_head("mylist")? {
-            items.push(v);
-        }
-        assert_eq!(items, vec![b"hello1", b"hello2", b"hello3", b"hello4"]);
-
-        db.push_to_list_tail("mylist", "hello5")?;
-        db.push_to_list_tail("mylist", "hello6")?;
-        db.push_to_list_tail("mylist", "hello7")?;
-        db.push_to_list_tail("mylist", "hello8")?;
-
-        let mut items = vec![];
-        while let Some((_uuid, v)) = db.pop_list_tail("mylist")? {
-            items.push(v);
-        }
-        assert_eq!(items, vec![b"hello8", b"hello7", b"hello6", b"hello5"]);
-
-        db.push_to_list_tail("mylist", "hello9")?;
-        db.push_to_list_tail("mylist", "hello10")?;
-        db.push_to_list_tail("mylist", "hello11")?;
-        db.push_to_list_tail("mylist", "hello12")?;
-        db.push_to_list_tail("mylist", "hello13")?;
-        db.push_to_list_tail("mylist", "hello14")?;
-
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello9");
-        assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello14");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello10");
-        assert_eq!(db.pop_list_tail("mylist")?.unwrap().1, b"hello13");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello11");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello12");
-        assert_eq!(db.pop_list_head("mylist")?, None);
-
-        db.push_to_list_head("mylist", "hello15")?;
-        db.push_to_list_head("mylist", "hello16")?;
-        db.push_to_list_head("mylist", "hello17")?;
-        db.push_to_list_head("mylist", "hello18")?;
-
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello18");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello17");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello16");
-        assert_eq!(db.pop_list_head("mylist")?.unwrap().1, b"hello15");
-        assert_eq!(db.pop_list_head("mylist")?, None);
-
-        Ok(())
-    })
-}
-
-#[test]
 fn test_typed_queue() -> Result<()> {
     run_in_tempdir(|dir| {
         let db = Arc::new(CandyStore::open(dir, Config::default())?);

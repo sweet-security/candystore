@@ -96,6 +96,17 @@ impl<'a> Iterator for QueueIterator<'a> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if let (Some(curr), Some(end)) = (self.curr, self.end) {
+            if self.fwd {
+                return ((end - curr) as usize, None);
+            } else {
+                return ((curr + 1 - end) as usize, None);
+            }
+        }
+        (0, None)
+    }
 }
 
 impl CandyStore {
@@ -354,11 +365,10 @@ impl CandyStore {
         &self,
         queue_key: &B,
     ) -> Result<Option<Vec<u8>>> {
-        let Some(res) = self.iter_queue(queue_key).next() else {
-            return Ok(None);
-        };
-        let (_, v) = res?;
-        Ok(Some(v))
+        for res in self.iter_queue(queue_key) {
+            return Ok(Some(res?.1));
+        }
+        Ok(None)
     }
 
     /// Returns (without removing) the tail element of the queue, or None if the queue is empty
@@ -366,11 +376,10 @@ impl CandyStore {
         &self,
         queue_key: &B,
     ) -> Result<Option<Vec<u8>>> {
-        let Some(res) = self.iter_queue_backwards(queue_key).next() else {
-            return Ok(None);
-        };
-        let (_, v) = res?;
-        Ok(Some(v))
+        for res in self.iter_queue_backwards(queue_key) {
+            return Ok(Some(res?.1));
+        }
+        Ok(None)
     }
 
     /// Returns a forward iterator (head to tail) over the elements of the queue. If the queue does not exist,

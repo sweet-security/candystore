@@ -45,7 +45,6 @@
 //! }
 //! ```
 
-mod encodable;
 mod hashing;
 mod lists;
 mod queues;

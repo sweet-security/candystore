@@ -336,7 +336,7 @@ fn main() -> Result<()> {
             if i % 65536 == 0 {
                 println!("{i}");
             }
-            store.push_to_list_tail("xxx", &i.to_le_bytes())?;
+            store.set_in_list("xxx", &i.to_le_bytes(), &i.to_le_bytes())?;
         }
         println!(
             "{}us",

@@ -7,7 +7,6 @@ use crate::{
     CandyStore, ListCompactionParams,
 };
 
-use crate::encodable::EncodableUuid;
 use crate::Result;
 use databuf::{config::num::LE, DecodeOwned, Encode};
 
@@ -488,38 +487,6 @@ where
     {
         let list_key = Self::make_list_key(list_key);
         self.store.compact_list_if_needed(&list_key, params)
-    }
-
-    /// Same as [CandyStore::push_to_list_head], but `list_key` is typed
-    pub fn push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
-        &self,
-        list_key: &Q1,
-        val: &Q2,
-    ) -> Result<EncodableUuid>
-    where
-        L: Borrow<Q1>,
-        EncodableUuid: From<K>,
-        V: Borrow<Q2>,
-    {
-        let list_key = Self::make_list_key(list_key);
-        let val = val.to_bytes::<LE>();
-        self.store.owned_push_to_list_head(list_key, val)
-    }
-
-    /// Same as [CandyStore::push_to_list_tail], but `list_key` is typed
-    pub fn push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
-        &self,
-        list_key: &Q1,
-        val: &Q2,
-    ) -> Result<EncodableUuid>
-    where
-        L: Borrow<Q1>,
-        EncodableUuid: From<K>,
-        V: Borrow<Q2>,
-    {
-        let list_key = Self::make_list_key(list_key);
-        let val = val.to_bytes::<LE>();
-        self.store.owned_push_to_list_tail(list_key, val)
     }
 
     /// Same as [CandyStore::pop_list_tail], but `list_key` is typed

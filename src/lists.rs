@@ -1,5 +1,4 @@
 use crate::{
-    encodable::EncodableUuid,
     hashing::PartedHash,
     shard::{InsertMode, KVPair},
     store::{CHAIN_NAMESPACE, ITEM_NAMESPACE, LIST_NAMESPACE},
@@ -8,7 +7,6 @@ use crate::{
 
 use bytemuck::{bytes_of, from_bytes, Pod, Zeroable};
 use parking_lot::MutexGuard;
-use uuid::Uuid;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -118,6 +116,24 @@ impl<'a> Iterator for ListIterator<'a> {
 
         None
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if let Some(ref list) = self.list {
+            if self.fwd {
+                (
+                    (list.tail_idx - self.idx) as usize,
+                    Some((list.tail_idx - self.idx) as usize),
+                )
+            } else {
+                (
+                    (self.idx + 1 - list.head_idx) as usize,
+                    Some((self.idx + 1 - list.head_idx) as usize),
+                )
+            }
+        } else {
+            (0, None)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -127,11 +143,6 @@ enum InsertToListStatus {
     WrongValue(Vec<u8>),
     ExistingValue(Vec<u8>),
     Replaced(Vec<u8>),
-}
-
-enum InsertToListPos {
-    Head,
-    Tail,
 }
 
 impl CandyStore {
@@ -158,7 +169,6 @@ impl CandyStore {
         item_key: Vec<u8>,
         mut val: Vec<u8>,
         mode: InsertMode,
-        pos: InsertToListPos,
     ) -> Result<InsertToListStatus> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         let (item_ph, item_key) = self.make_item_key(list_ph, item_key);
@@ -227,17 +237,8 @@ impl CandyStore {
             crate::GetOrCreateStatus::ExistingValue(list_bytes) => {
                 let mut list = *from_bytes::<List>(&list_bytes);
 
-                let item_idx = match pos {
-                    InsertToListPos::Tail => {
-                        let idx = list.tail_idx;
-                        list.tail_idx += 1;
-                        idx
-                    }
-                    InsertToListPos::Head => {
-                        list.head_idx -= 1;
-                        list.head_idx
-                    }
-                };
+                let idx = list.tail_idx;
+                list.tail_idx += 1;
 
                 // update list
                 list.num_items += 1;
@@ -247,14 +248,14 @@ impl CandyStore {
                 self.set_raw(
                     bytes_of(&ChainKey {
                         list_ph,
-                        idx: item_idx,
+                        idx,
                         namespace: CHAIN_NAMESPACE,
                     }),
                     bytes_of(&item_ph),
                 )?;
 
                 // create item
-                val.extend_from_slice(bytes_of(&item_idx));
+                val.extend_from_slice(bytes_of(&idx));
                 self.set_raw(&item_key, &val)?;
             }
         }
@@ -319,13 +320,7 @@ impl CandyStore {
         if promote {
             self.owned_remove_from_list(list_key.clone(), item_key.clone())?;
         }
-        match self._insert_to_list(
-            list_key,
-            item_key,
-            val,
-            InsertMode::Set,
-            InsertToListPos::Tail,
-        )? {
+        match self._insert_to_list(list_key, item_key, val, InsertMode::Set)? {
             InsertToListStatus::Created(_v) => Ok(SetStatus::CreatedNew),
             InsertToListStatus::Replaced(v) => Ok(SetStatus::PrevValue(v)),
             _ => unreachable!(),
@@ -361,13 +356,7 @@ impl CandyStore {
         val: Vec<u8>,
         expected_val: Option<&[u8]>,
     ) -> Result<ReplaceStatus> {
-        match self._insert_to_list(
-            list_key,
-            item_key,
-            val,
-            InsertMode::Replace(expected_val),
-            InsertToListPos::Tail,
-        )? {
+        match self._insert_to_list(list_key, item_key, val, InsertMode::Replace(expected_val))? {
             InsertToListStatus::DoesNotExist => Ok(ReplaceStatus::DoesNotExist),
             InsertToListStatus::Replaced(v) => Ok(ReplaceStatus::PrevValue(v)),
             InsertToListStatus::WrongValue(v) => Ok(ReplaceStatus::WrongValue(v)),
@@ -401,13 +390,7 @@ impl CandyStore {
         item_key: Vec<u8>,
         default_val: Vec<u8>,
     ) -> Result<GetOrCreateStatus> {
-        match self._insert_to_list(
-            list_key,
-            item_key,
-            default_val,
-            InsertMode::GetOrCreate,
-            InsertToListPos::Tail,
-        )? {
+        match self._insert_to_list(list_key, item_key, default_val, InsertMode::GetOrCreate)? {
             InsertToListStatus::ExistingValue(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
             InsertToListStatus::Created(v) => Ok(GetOrCreateStatus::CreatedNew(v)),
             _ => unreachable!(),
@@ -746,64 +729,6 @@ impl CandyStore {
             }
         }
         Ok(None)
-    }
-
-    fn owned_push_to_list(
-        &self,
-        list_key: Vec<u8>,
-        val: Vec<u8>,
-        pos: InsertToListPos,
-    ) -> Result<EncodableUuid> {
-        let uuid = Uuid::from_bytes(rand::random());
-        let res = self._insert_to_list(
-            list_key,
-            uuid.as_bytes().to_vec(),
-            val,
-            InsertMode::GetOrCreate,
-            pos,
-        )?;
-        debug_assert!(matches!(res, InsertToListStatus::Created(_)));
-        Ok(EncodableUuid::from(uuid))
-    }
-
-    /// Pushed "value only" at the beginning (head) of the list. The key is actually a randomly-generated UUID,
-    /// which is returned to the caller and can be acted up like a regular list item. This is used to implement
-    /// double-ended queues, where elements are pushed/popped at the ends, thus the key is not meaningful.
-    pub fn push_to_list_head<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        list_key: &B1,
-        val: &B2,
-    ) -> Result<EncodableUuid> {
-        self.owned_push_to_list_head(list_key.as_ref().to_owned(), val.as_ref().to_owned())
-    }
-
-    /// Owned version of [Self::push_to_list_head]
-    pub fn owned_push_to_list_head(
-        &self,
-        list_key: Vec<u8>,
-        val: Vec<u8>,
-    ) -> Result<EncodableUuid> {
-        self.owned_push_to_list(list_key, val, InsertToListPos::Head)
-    }
-
-    /// Pushed "value only" at the end (tail) of the list. The key is actually a randomly-generated UUID,
-    /// which is returned to the caller and can be acted up like a regular list item. This is used to implement
-    /// double-ended queues, where elements are pushed/popped at the ends, thus the key is not meaningful.
-    pub fn push_to_list_tail<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        list_key: &B1,
-        val: &B2,
-    ) -> Result<EncodableUuid> {
-        self.owned_push_to_list_tail(list_key.as_ref().to_owned(), val.as_ref().to_owned())
-    }
-
-    /// Owned version of [Self::push_to_list_tail]
-    pub fn owned_push_to_list_tail(
-        &self,
-        list_key: Vec<u8>,
-        val: Vec<u8>,
-    ) -> Result<EncodableUuid> {
-        self.owned_push_to_list(list_key, val, InsertToListPos::Tail)
     }
 
     /// Returns the estimated list length
