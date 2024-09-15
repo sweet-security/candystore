@@ -168,7 +168,7 @@ impl CandyStore {
         self._push_to_queue(queue_key.as_ref(), val.as_ref(), QueuePos::Tail)
     }
 
-    fn _pop_queue(&self, queue_key: &[u8], pos: QueuePos) -> Result<Option<Vec<u8>>> {
+    fn _pop_queue(&self, queue_key: &[u8], pos: QueuePos) -> Result<Option<(usize, Vec<u8>)>> {
         let (queue_ph, full_queue_key) = self.make_queue_key(queue_key);
         let _guard = self.lock_list(queue_ph);
 
@@ -176,7 +176,7 @@ impl CandyStore {
             return Ok(None);
         };
         let queue = from_bytes_mut::<Queue>(&mut queue_bytes);
-        let mut val = None;
+        let mut res = None;
 
         match pos {
             QueuePos::Head => {
@@ -184,7 +184,7 @@ impl CandyStore {
                     let idx = queue.head_idx;
                     queue.head_idx += 1;
                     if let Some(v) = self.remove_raw(&self.make_queue_item_key(queue_key, idx))? {
-                        val = Some(v);
+                        res = Some((idx as usize, v));
                         queue.num_items -= 1;
                         break;
                     }
@@ -195,7 +195,7 @@ impl CandyStore {
                     queue.tail_idx -= 1;
                     let idx = queue.tail_idx;
                     if let Some(v) = self.remove_raw(&self.make_queue_item_key(queue_key, idx))? {
-                        val = Some(v);
+                        res = Some((idx as usize, v));
                         queue.num_items -= 1;
                         break;
                     }
@@ -209,7 +209,15 @@ impl CandyStore {
             self.set_raw(&full_queue_key, &queue_bytes)?;
         }
 
-        Ok(val)
+        Ok(res)
+    }
+
+    /// Removes and returns the head element and its index of the queue, or None if the queue is empty
+    pub fn pop_queue_head_with_idx<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
+        self._pop_queue(queue_key.as_ref(), QueuePos::Head)
     }
 
     /// Removes and returns the head element of the queue, or None if the queue is empty
@@ -217,7 +225,17 @@ impl CandyStore {
         &self,
         queue_key: &B,
     ) -> Result<Option<Vec<u8>>> {
-        self._pop_queue(queue_key.as_ref(), QueuePos::Head)
+        Ok(self
+            .pop_queue_head_with_idx(queue_key.as_ref())?
+            .map(|iv| iv.1))
+    }
+
+    /// Removes and returns the tail element and its index of the queue, or None if the queue is empty
+    pub fn pop_queue_tail_with_idx<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
+        self._pop_queue(queue_key.as_ref(), QueuePos::Tail)
     }
 
     /// Removes and returns the tail element of the queue, or None if the queue is empty
@@ -225,7 +243,7 @@ impl CandyStore {
         &self,
         queue_key: &B,
     ) -> Result<Option<Vec<u8>>> {
-        self._pop_queue(queue_key.as_ref(), QueuePos::Tail)
+        Ok(self.pop_queue_tail_with_idx(queue_key)?.map(|iv| iv.1))
     }
 
     /// Removes an element by index from the queue, returning the value it had or None if it did not exist (as well
@@ -344,6 +362,17 @@ impl CandyStore {
         Ok(indices)
     }
 
+    /// Returns (without removing) the head element of the queue and its index, or None if the queue is empty
+    pub fn peek_queue_head_with_idx<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
+        for res in self.iter_queue(queue_key) {
+            return Ok(Some(res?));
+        }
+        Ok(None)
+    }
+
     /// Returns (without removing) the head element of the queue, or None if the queue is empty
     pub fn peek_queue_head<B: AsRef<[u8]> + ?Sized>(
         &self,
@@ -351,6 +380,17 @@ impl CandyStore {
     ) -> Result<Option<Vec<u8>>> {
         for res in self.iter_queue(queue_key) {
             return Ok(Some(res?.1));
+        }
+        Ok(None)
+    }
+
+    /// Returns (without removing) the head element of the queue and its index, or None if the queue is empty
+    pub fn peek_queue_tail_with_idx<B: AsRef<[u8]> + ?Sized>(
+        &self,
+        queue_key: &B,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
+        for res in self.iter_queue_backwards(queue_key) {
+            return Ok(Some(res?));
         }
         Ok(None)
     }
@@ -403,5 +443,13 @@ impl CandyStore {
             return Ok(0);
         };
         Ok(queue.num_items as usize)
+    }
+
+    /// Returns a the range (indices) of the given queue or an empty range if the queue does not exist
+    pub fn queue_range<B: AsRef<[u8]> + ?Sized>(&self, queue_key: &B) -> Result<Range<usize>> {
+        let Some(queue) = self.fetch_queue(queue_key.as_ref())? else {
+            return Ok(Self::FIRST_QUEUE_IDX as usize..Self::FIRST_QUEUE_IDX as usize);
+        };
+        Ok(queue.head_idx as usize..queue.tail_idx as usize)
     }
 }

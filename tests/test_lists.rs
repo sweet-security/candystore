@@ -264,14 +264,14 @@ fn test_typed_queue() -> Result<()> {
 
         let items = queue
             .iter("orders")
-            .map(|res| res.unwrap())
+            .map(|res| res.unwrap().1)
             .collect::<Vec<_>>();
 
         assert_eq!(items, vec![105, 104, 103, 100, 101, 102]);
 
         let items = queue
             .iter_backwards("orders")
-            .map(|res| res.unwrap())
+            .map(|res| res.unwrap().1)
             .collect::<Vec<_>>();
 
         assert_eq!(items, vec![102, 101, 100, 103, 104, 105]);

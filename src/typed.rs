@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use bytemuck::bytes_of;
-use std::{borrow::Borrow, marker::PhantomData, sync::Arc};
+use std::{borrow::Borrow, marker::PhantomData, ops::Range, sync::Arc};
 
 use crate::{
     store::{ReplaceStatus, SetStatus, TYPED_NAMESPACE},
@@ -577,112 +577,166 @@ where
     /// Pushes a value at the beginning (head) of the queue
     pub fn push_head<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        list_key: &Q1,
+        queue_key: &Q1,
         val: &Q2,
     ) -> Result<()>
     where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
         let val = val.to_bytes::<LE>();
-        self.store.push_to_queue_head(&list_key, &val)?;
+        self.store.push_to_queue_head(&queue_key, &val)?;
         Ok(())
     }
 
     /// Pushes a value at the end (tail) of the queue
     pub fn push_tail<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
         &self,
-        list_key: &Q1,
+        queue_key: &Q1,
         val: &Q2,
     ) -> Result<()>
     where
         L: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
         let val = val.to_bytes::<LE>();
-        self.store.push_to_queue_tail(&list_key, &val)?;
+        self.store.push_to_queue_tail(&queue_key, &val)?;
         Ok(())
     }
 
     /// Pops a value from the beginning (head) of the queue
-    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    pub fn pop_head_with_idx<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<(usize, V)>>
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
-        let Some(v) = self.store.pop_queue_head(&list_key)? else {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        let Some((idx, v)) = self.store.pop_queue_head_with_idx(&queue_key)? else {
             return Ok(None);
         };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(Some((idx, from_bytes::<V>(&v)?)))
+    }
+
+    /// Pops a value from the beginning (head) of the queue
+    pub fn pop_head<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        Ok(self.pop_head_with_idx(queue_key)?.map(|iv| iv.1))
     }
 
     /// Pops a value from the end (tail) of the queue
-    pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    pub fn pop_tail_with_idx<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<(usize, V)>>
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
-        let Some(v) = self.store.pop_queue_tail(&list_key)? else {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        let Some((idx, v)) = self.store.pop_queue_tail_with_idx(&queue_key)? else {
             return Ok(None);
         };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(Some((idx, from_bytes::<V>(&v)?)))
+    }
+
+    /// Pops a value from the end (tail) of the queue
+    pub fn pop_tail<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        Ok(self.pop_tail_with_idx(queue_key)?.map(|iv| iv.1))
+    }
+
+    /// Peek at the value from the beginning (head) of the queue and its index
+    pub fn peek_head_with_idx<Q: ?Sized + Encode>(
+        &self,
+        queue_key: &Q,
+    ) -> Result<Option<(usize, V)>>
+    where
+        L: Borrow<Q>,
+    {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        let Some((idx, v)) = self.store.peek_queue_head_with_idx(&queue_key)? else {
+            return Ok(None);
+        };
+        Ok(Some((idx, from_bytes::<V>(&v)?)))
     }
 
     /// Peek at the value from the beginning (head) of the queue
-    pub fn peek_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    pub fn peek_head<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
-        let Some(v) = self.store.peek_queue_head(&list_key)? else {
-            return Ok(None);
-        };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(self.peek_head_with_idx(queue_key)?.map(|iv| iv.1))
     }
 
     /// Peek at the value from the end (tail) of the queue
-    pub fn peek_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<V>>
+    pub fn peek_tail_with_idx<Q: ?Sized + Encode>(
+        &self,
+        queue_key: &Q,
+    ) -> Result<Option<(usize, V)>>
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
-        let Some(v) = self.store.peek_queue_tail(&list_key)? else {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        let Some((idx, v)) = self.store.peek_queue_tail_with_idx(&queue_key)? else {
             return Ok(None);
         };
-        Ok(Some(from_bytes::<V>(&v)?))
+        Ok(Some((idx, from_bytes::<V>(&v)?)))
+    }
+
+    /// Peek at the value from the end (tail) of the queue
+    pub fn peek_tail<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    where
+        L: Borrow<Q>,
+    {
+        Ok(self.peek_tail_with_idx(queue_key)?.map(|iv| iv.1))
     }
 
     /// See [CandyTypedList::iter]
     pub fn iter<'a, Q: ?Sized + Encode>(
         &'a self,
-        list_key: &Q,
-    ) -> impl Iterator<Item = Result<V>> + 'a
+        queue_key: &Q,
+    ) -> impl Iterator<Item = Result<(usize, V)>> + 'a
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
-        self.store.iter_queue(&list_key).map(|res| match res {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        self.store.iter_queue(&queue_key).map(|res| match res {
             Err(e) => Err(e),
-            Ok((_, v)) => Ok(from_bytes::<V>(&v).unwrap()),
+            Ok((idx, v)) => Ok((idx, from_bytes::<V>(&v).unwrap())),
         })
     }
 
     /// See [CandyTypedList::iter_backwards]
     pub fn iter_backwards<'a, Q: ?Sized + Encode>(
         &'a self,
-        list_key: &Q,
-    ) -> impl Iterator<Item = Result<V>> + 'a
+        queue_key: &Q,
+    ) -> impl Iterator<Item = Result<(usize, V)>> + 'a
     where
         L: Borrow<Q>,
     {
-        let list_key = CandyTypedList::<L, (), ()>::make_list_key(list_key);
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
         self.store
-            .iter_queue_backwards(&list_key)
+            .iter_queue_backwards(&queue_key)
             .map(|res| match res {
                 Err(e) => Err(e),
-                Ok((_, v)) => Ok(from_bytes::<V>(&v).unwrap()),
+                Ok((idx, v)) => Ok((idx, from_bytes::<V>(&v).unwrap())),
             })
+    }
+
+    pub fn len<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<usize>
+    where
+        L: Borrow<Q>,
+    {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        self.store.queue_len(&queue_key)
+    }
+
+    pub fn range<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Range<usize>>
+    where
+        L: Borrow<Q>,
+    {
+        let queue_key = CandyTypedList::<L, (), ()>::make_list_key(queue_key);
+        self.store.queue_range(&queue_key)
     }
 }
