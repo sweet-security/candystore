@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::{
     hashing::PartedHash,
     shard::{InsertMode, KVPair},
@@ -65,8 +67,7 @@ pub struct ListIterator<'a> {
     store: &'a CandyStore,
     list_key: Vec<u8>,
     list_ph: PartedHash,
-    list: Option<List>,
-    idx: u64,
+    range: Option<Range<u64>>,
     fwd: bool,
 }
 
@@ -74,7 +75,7 @@ impl<'a> Iterator for ListIterator<'a> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.list.is_none() {
+        if self.range.is_none() {
             let _guard = self.store.lock_list(self.list_ph);
             let list_bytes = match self.store.get_raw(&self.list_key) {
                 Ok(Some(list_bytes)) => list_bytes,
@@ -82,28 +83,18 @@ impl<'a> Iterator for ListIterator<'a> {
                 Err(e) => return Some(Err(e)),
             };
             let list = *from_bytes::<List>(&list_bytes);
-            self.list = Some(list);
-            self.idx = if self.fwd {
-                list.head_idx
-            } else {
-                list.tail_idx - 1
-            };
+            self.range = Some(list.head_idx..list.tail_idx);
         }
-        let Some(list) = self.list else {
-            return None;
-        };
 
-        while if self.fwd {
-            self.idx < list.tail_idx
-        } else {
-            self.idx >= list.head_idx
-        } {
-            let idx = self.idx;
-            if self.fwd {
-                self.idx += 1;
+        loop {
+            let idx = if self.fwd {
+                self.range.as_mut().unwrap().next()
             } else {
-                self.idx -= 1;
-            }
+                self.range.as_mut().unwrap().next_back()
+            };
+            let Some(idx) = idx else {
+                return None;
+            };
 
             match self.store.get_from_list_at_index(self.list_ph, idx, true) {
                 Err(e) => return Some(Err(e)),
@@ -113,23 +104,11 @@ impl<'a> Iterator for ListIterator<'a> {
                 }
             }
         }
-
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if let Some(ref list) = self.list {
-            if self.fwd {
-                (
-                    (list.tail_idx - self.idx) as usize,
-                    Some((list.tail_idx - self.idx) as usize),
-                )
-            } else {
-                (
-                    (self.idx + 1 - list.head_idx) as usize,
-                    Some((self.idx + 1 - list.head_idx) as usize),
-                )
-            }
+        if let Some(ref range) = self.range {
+            range.size_hint()
         } else {
             (0, None)
         }
@@ -618,8 +597,7 @@ impl CandyStore {
             store: &self,
             list_key,
             list_ph,
-            list: None,
-            idx: 0,
+            range: None,
             fwd: true,
         }
     }
@@ -636,8 +614,7 @@ impl CandyStore {
             store: &self,
             list_key,
             list_ph,
-            list: None,
-            idx: 0,
+            range: None,
             fwd: false,
         }
     }
