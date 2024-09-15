@@ -38,25 +38,18 @@ enum QueuePos {
 pub struct QueueIterator<'a> {
     store: &'a CandyStore,
     queue_key: Vec<u8>,
-    curr: Option<u64>,
-    end: Option<u64>,
+    range: Option<Range<u64>>,
     fwd: bool,
 }
 
 impl<'a> Iterator for QueueIterator<'a> {
     type Item = Result<(usize, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.curr.is_none() {
+        if self.range.is_none() {
             match self.store.fetch_queue(&self.queue_key) {
                 Ok(queue) => match queue {
                     Some(queue) => {
-                        if self.fwd {
-                            self.curr = Some(queue.head_idx);
-                            self.end = Some(queue.tail_idx);
-                        } else {
-                            self.curr = Some(queue.tail_idx - 1);
-                            self.end = Some(queue.head_idx);
-                        }
+                        self.range = Some(queue.head_idx..queue.tail_idx);
                     }
                     None => return None,
                 },
@@ -65,29 +58,23 @@ impl<'a> Iterator for QueueIterator<'a> {
         }
 
         loop {
-            let curr = self.curr.unwrap();
-            if self.fwd {
-                self.curr = Some(curr + 1);
+            let idx = if self.fwd {
+                self.range.as_mut().unwrap().next()
             } else {
-                self.curr = Some(curr - 1);
-            }
+                self.range.as_mut().unwrap().next_back()
+            };
+            let Some(idx) = idx else {
+                return None;
+            };
+
             match self
                 .store
-                .get_raw(&self.store.make_queue_item_key(&self.queue_key, curr))
+                .get_raw(&self.store.make_queue_item_key(&self.queue_key, idx))
             {
                 Ok(v) => {
                     match v {
-                        Some(v) => return Some(Ok((curr as usize, v))),
+                        Some(v) => return Some(Ok((idx as usize, v))),
                         None => {
-                            if self.fwd {
-                                if curr >= self.end.unwrap() {
-                                    return None;
-                                }
-                            } else {
-                                if curr < self.end.unwrap() {
-                                    return None;
-                                }
-                            }
                             // continue, we might have holes
                         }
                     }
@@ -98,14 +85,11 @@ impl<'a> Iterator for QueueIterator<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if let (Some(curr), Some(end)) = (self.curr, self.end) {
-            if self.fwd {
-                return ((end - curr) as usize, None);
-            } else {
-                return ((curr + 1 - end) as usize, None);
-            }
+        if let Some(ref range) = self.range {
+            range.size_hint()
+        } else {
+            (0, None)
         }
-        (0, None)
     }
 }
 
@@ -384,18 +368,23 @@ impl CandyStore {
 
     /// Returns a forward iterator (head to tail) over the elements of the queue. If the queue does not exist,
     /// this is an empty iterator.
+    ///
+    /// Note: the iterator will go over the indices that existed when it was created -- new elements that are
+    /// pushed afterwards will not be returned
     pub fn iter_queue<'a, B: AsRef<[u8]> + ?Sized>(&'a self, queue_key: &B) -> QueueIterator<'a> {
         QueueIterator {
             store: &self,
             queue_key: queue_key.as_ref().to_owned(),
-            curr: None,
-            end: None,
+            range: None,
             fwd: true,
         }
     }
 
     /// Returns a backward iterator (tail to head) over the elements of the queue. If the queue does not exist,
     /// this is an empty iterator.
+    ///
+    /// Note: the iterator will go over the indices that existed when it was created -- new elements that are
+    /// pushed afterwards will not be returned
     pub fn iter_queue_backwards<'a, B: AsRef<[u8]> + ?Sized>(
         &'a self,
         queue_key: &B,
@@ -403,8 +392,7 @@ impl CandyStore {
         QueueIterator {
             store: &self,
             queue_key: queue_key.as_ref().to_owned(),
-            curr: None,
-            end: None,
+            range: None,
             fwd: false,
         }
     }
