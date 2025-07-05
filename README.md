@@ -1,5 +1,6 @@
 <div>
-<img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/rust.yml/badge.svg">
+<img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ubuntu.yml/badge.svg">
+<div align="left">🪟 v0.5.5 now supports Windows (at least some basic tests pass)! 🎉</div>
 <div align="left">💎 v0.5.4 now works on stable rust! ✨</div>
 </div>
 
