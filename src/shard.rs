@@ -176,7 +176,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Resu
         }
     }
     if !buf.is_empty() {
-        Err(std::io::Error::READ_EXACT_EOF)
+        Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
     } else {
         Ok(())
     }
@@ -186,12 +186,10 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Resu
 fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         match std::os::windows::fs::FileExt::seek_write(f, buf, offset) {
-            Ok(0) => {
-                return Err(std::io::Error::WRITE_ALL_EOF);
-            }
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => {
                 buf = &buf[n..];
-                offset += n as u64
+                offset += n as u64;
             }
             Err(e) => return Err(e),
         }

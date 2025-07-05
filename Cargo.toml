@@ -18,7 +18,7 @@ uuid = "1.10.0"
 rand = "0.9"
 fslock = "0.2.1"
 libc = "0.2.158"
-crossbeam-channel = "0.5.13"
+crossbeam-channel = "0.5.15"
 simd-itertools = "0.3.0"
 
 [features]
