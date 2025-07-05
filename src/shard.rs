@@ -5,7 +5,6 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     ops::Range,
-    os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -153,6 +152,55 @@ struct MmapFile {
     mmap: MmapMut,
 }
 
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+                offset += n as u64;
+            }
+            Err(ref e) if e.is_interrupted() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if !buf.is_empty() {
+        Err(io::Error::READ_EXACT_EOF)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::WRITE_ALL_EOF);
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64
+            }
+            Err(ref e) if e.is_interrupted() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl MmapFile {
     fn new(file: File, mlock_headers: bool) -> Result<Self> {
         let mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
@@ -165,7 +213,11 @@ impl MmapFile {
         // optimization, we don't care about the return code
         #[cfg(all(unix, not(target_os = "macos")))]
         unsafe {
-            libc::posix_fallocate(file.as_raw_fd(), 0, HEADER_SIZE as i64)
+            libc::posix_fallocate(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+                HEADER_SIZE as i64,
+            )
         };
 
         let header = unsafe { &mut *(mmap.as_ptr() as *mut ShardHeader) };
@@ -226,7 +278,7 @@ impl MmapFile {
         };
         let offset = (offset_and_size as u32) as u64;
         let mut buf = vec![0u8; klen + vlen];
-        self.file.read_exact_at(&mut buf, HEADER_SIZE + offset)?;
+        read_exact_at(&self.file, &mut buf, HEADER_SIZE + offset)?;
 
         stats.num_read_bytes.fetch_add(buf.len(), Ordering::Relaxed);
         stats.num_read_ops.fetch_add(1, Ordering::Relaxed);
@@ -260,7 +312,7 @@ impl MmapFile {
             .fetch_add(buf.len() as u64, Ordering::SeqCst) as u64;
 
         // now writing can be non-atomic (pwrite)
-        self.file.write_all_at(&buf, HEADER_SIZE + write_offset)?;
+        write_all_at(&self.file, &buf, HEADER_SIZE + write_offset)?;
         stats.add_entry(entry_size);
 
         Ok(((key.len() as u64) << 48) | ((val.len() as u64) << 32) | write_offset)
