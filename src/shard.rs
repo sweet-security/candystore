@@ -163,7 +163,7 @@ fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
             Ok(0) => break,
@@ -172,29 +172,27 @@ fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
                 buf = &mut tmp[n..];
                 offset += n as u64;
             }
-            Err(ref e) if e.is_interrupted() => {}
             Err(e) => return Err(e),
         }
     }
     if !buf.is_empty() {
-        Err(io::Error::READ_EXACT_EOF)
+        Err(std::io::Error::READ_EXACT_EOF)
     } else {
         Ok(())
     }
 }
 
 #[cfg(windows)]
-fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
-        match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
+        match std::os::windows::fs::FileExt::seek_write(f, buf, offset) {
             Ok(0) => {
-                return Err(io::Error::WRITE_ALL_EOF);
+                return Err(std::io::Error::WRITE_ALL_EOF);
             }
             Ok(n) => {
                 buf = &buf[n..];
                 offset += n as u64
             }
-            Err(ref e) if e.is_interrupted() => {}
             Err(e) => return Err(e),
         }
     }
