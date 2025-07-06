@@ -201,7 +201,10 @@ impl MmapFile {
     fn new(file: File, mlock_headers: bool) -> Result<Self> {
         let mmap = unsafe { MmapOptions::new().len(HEADER_SIZE as usize).map_mut(&file) }?;
 
-        #[cfg(target_family = "unix")]
+        #[cfg(windows)]
+        let _ = mlock_headers; // Prevent unused variable warning on Windows
+
+        #[cfg(unix)]
         if mlock_headers {
             unsafe { libc::mlock(mmap.as_ptr() as *const _, mmap.len()) };
         }
