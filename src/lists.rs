@@ -138,7 +138,7 @@ impl CandyStore {
         (PartedHash::new(&self.config.hash_seed, &item_key), item_key)
     }
 
-    pub(crate) fn lock_list(&self, list_ph: PartedHash) -> MutexGuard<()> {
+    pub(crate) fn lock_list(&self, list_ph: PartedHash) -> MutexGuard<'_, ()> {
         self.keyed_locks[(list_ph.signature() & self.keyed_locks_mask) as usize].lock()
     }
 
@@ -588,12 +588,12 @@ impl CandyStore {
     /// will need to skip these holes. If you remove elements from the middle (not head/tail) of the list
     /// frequently, and wish to use iteration, consider compacting the list every so often using
     /// [Self::compact_list_if_needed]
-    pub fn iter_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> ListIterator {
+    pub fn iter_list<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> ListIterator<'_> {
         self.owned_iter_list(list_key.as_ref().to_owned())
     }
 
     /// Owned version of [Self::iter_list]
-    pub fn owned_iter_list(&self, list_key: Vec<u8>) -> ListIterator {
+    pub fn owned_iter_list(&self, list_key: Vec<u8>) -> ListIterator<'_> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         ListIterator {
             store: &self,
@@ -605,12 +605,12 @@ impl CandyStore {
     }
 
     /// Same as [Self::iter_list] but iterates from the end (tail) to the beginning (head)
-    pub fn iter_list_backwards<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> ListIterator {
+    pub fn iter_list_backwards<B: AsRef<[u8]> + ?Sized>(&self, list_key: &B) -> ListIterator<'_> {
         self.owned_iter_list_backwards(list_key.as_ref().to_owned())
     }
 
     /// Owned version of [Self::iter_list_backwards]
-    pub fn owned_iter_list_backwards(&self, list_key: Vec<u8>) -> ListIterator {
+    pub fn owned_iter_list_backwards(&self, list_key: Vec<u8>) -> ListIterator<'_> {
         let (list_ph, list_key) = self.make_list_key(list_key);
         ListIterator {
             store: &self,

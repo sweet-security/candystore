@@ -507,7 +507,7 @@ impl CandyStore {
     }
 
     /// Returns an iterator over the whole store (skipping lists or typed items)
-    pub fn iter(&self) -> CandyStoreIterator {
+    pub fn iter(&self) -> CandyStoreIterator<'_> {
         CandyStoreIterator::new(self, false, true)
     }
 
@@ -519,12 +519,12 @@ impl CandyStore {
         })
     }
 
-    pub fn iter_raw(&self) -> CandyStoreIterator {
+    pub fn iter_raw(&self) -> CandyStoreIterator<'_> {
         CandyStoreIterator::new(self, true, true)
     }
 
     /// Returns an iterator starting from the specified cookie (obtained via [CandyStoreIterator::cookie])
-    pub fn iter_from_cookie(&self, cookie: u64) -> CandyStoreIterator {
+    pub fn iter_from_cookie(&self, cookie: u64) -> CandyStoreIterator<'_> {
         CandyStoreIterator::from_cookie(self, cookie, false, true)
     }
 
