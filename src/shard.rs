@@ -894,7 +894,7 @@ impl Shard {
             return Ok(());
         };
 
-        let do_sync = || {
+        let do_sync = || -> Result<()> {
             self.in_sync_agg_delay.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
             self.in_sync_agg_delay.store(false, Ordering::SeqCst);
