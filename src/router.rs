@@ -50,8 +50,9 @@ fn test_consolidate_ranges() {
     );
 }
 
+#[derive(Clone)]
 enum ShardNode {
-    Leaf(Shard),
+    Leaf(Arc<Shard>),
     Vertex(Arc<ShardRouter>, Arc<ShardRouter>),
 }
 
@@ -101,7 +102,7 @@ impl ShardRouter {
         config: &Arc<InternalConfig>,
         stats: &Arc<InternalStats>,
         threadpool: &Arc<CompactionThreadPool>,
-    ) -> Result<Vec<Shard>> {
+    ) -> Result<Vec<Arc<Shard>>> {
         let mut found_shards = vec![];
         for res in std::fs::read_dir(&config.dir_path)? {
             let entry = res?;
@@ -150,15 +151,60 @@ impl ShardRouter {
             )?;
         }
 
+        if shards_to_keep.is_empty() {
+            return Ok(vec![]);
+        }
+
         let mut shards = vec![];
+        let mut current = 0;
+
         for span in shards_to_keep {
-            shards.push(Shard::open(
-                span,
+            if span.start > current {
+                let mut gap_start = current;
+                let gap_end = span.start;
+                while gap_start < gap_end {
+                    let mut size = 1;
+                    while gap_start % (size * 2) == 0 && gap_start + (size * 2) <= gap_end {
+                        size *= 2;
+                    }
+                    shards.push(Arc::new(Shard::open(
+                        gap_start..gap_start + size,
+                        true,
+                        config.clone(),
+                        stats.clone(),
+                        threadpool.clone(),
+                    )?));
+                    gap_start += size;
+                }
+            }
+
+            shards.push(Arc::new(Shard::open(
+                span.clone(),
                 false,
                 config.clone(),
                 stats.clone(),
                 threadpool.clone(),
-            )?);
+            )?));
+            current = span.end;
+        }
+
+        if current < Self::END_OF_SHARDS {
+            let mut gap_start = current;
+            let gap_end = Self::END_OF_SHARDS;
+            while gap_start < gap_end {
+                let mut size = 1;
+                while gap_start % (size * 2) == 0 && gap_start + (size * 2) <= gap_end {
+                    size *= 2;
+                }
+                shards.push(Arc::new(Shard::open(
+                    gap_start..gap_start + size,
+                    true,
+                    config.clone(),
+                    stats.clone(),
+                    threadpool.clone(),
+                )?));
+                gap_start += size;
+            }
         }
 
         Ok(shards)
@@ -177,20 +223,20 @@ impl ShardRouter {
         config: &Arc<InternalConfig>,
         stats: &Arc<InternalStats>,
         threadpool: &Arc<CompactionThreadPool>,
-    ) -> Result<Vec<Shard>> {
+    ) -> Result<Vec<Arc<Shard>>> {
         let step = Self::calc_step(config.expected_number_of_keys);
 
         let mut shards = vec![];
         let mut start = 0;
         while start < Self::END_OF_SHARDS {
             let end = start + step;
-            shards.push(Shard::open(
+            shards.push(Arc::new(Shard::open(
                 start..end,
                 true,
                 config.clone(),
                 stats.clone(),
                 threadpool.clone(),
-            )?);
+            )?));
             start = end;
         }
 
@@ -216,7 +262,7 @@ impl ShardRouter {
     }
 
     fn treeify(
-        shards: Vec<Shard>,
+        shards: Vec<Arc<Shard>>,
         stats: &Arc<InternalStats>,
         threadpool: &Arc<CompactionThreadPool>,
     ) -> ShardNode {
@@ -371,14 +417,14 @@ impl ShardRouter {
                         Arc::new(ShardRouter {
                             span: bottom.span.clone(),
                             config: self.config.clone(),
-                            node: RwLock::new(ShardNode::Leaf(bottom)),
+                            node: RwLock::new(ShardNode::Leaf(Arc::new(bottom))),
                             stats: self.stats.clone(),
                             threadpool: self.threadpool.clone(),
                         }),
                         Arc::new(ShardRouter {
                             span: top.span.clone(),
                             config: self.config.clone(),
-                            node: RwLock::new(ShardNode::Leaf(top)),
+                            node: RwLock::new(ShardNode::Leaf(Arc::new(top))),
                             stats: self.stats.clone(),
                             threadpool: self.threadpool.clone(),
                         }),
@@ -404,10 +450,13 @@ impl ShardRouter {
             return Ok(None);
         }
 
-        let bottom_guard = bottom.node.write();
-        let top_guard = top.node.write();
+        let (bottom_node, top_node) = {
+            let bottom_guard = bottom.node.read();
+            let top_guard = top.node.read();
+            (bottom_guard.clone(), top_guard.clone())
+        };
 
-        match (&*bottom_guard, &*top_guard) {
+        match (bottom_node, top_node) {
             (ShardNode::Leaf(b), ShardNode::Leaf(t)) => {
                 if b.get_stats()?.num_items() > max_fill {
                     return Ok(None);
@@ -415,12 +464,12 @@ impl ShardRouter {
                 if t.get_stats()?.num_items() > max_fill {
                     return Ok(None);
                 }
-                if let Some(sh) = Shard::merge(b, t)? {
+                if let Some(sh) = Shard::merge(&b, &t)? {
                     *shards_to_remove = *shards_to_remove - 1;
                     let span = sh.span.clone();
                     Ok(Some(ShardRouter {
                         config: self.config.clone(),
-                        node: RwLock::new(ShardNode::Leaf(sh)),
+                        node: RwLock::new(ShardNode::Leaf(Arc::new(sh))),
                         span,
                         stats: self.stats.clone(),
                         threadpool: self.threadpool.clone(),
@@ -444,8 +493,8 @@ impl ShardRouter {
                 }
             }
             (ShardNode::Vertex(b1, t1), ShardNode::Vertex(b2, t2)) => {
-                let m1 = self._merge(b1, t1, max_fill, shards_to_remove)?;
-                let m2 = self._merge(b2, t2, max_fill, shards_to_remove)?;
+                let m1 = self._merge(&b1, &t1, max_fill, shards_to_remove)?;
+                let m2 = self._merge(&b2, &t2, max_fill, shards_to_remove)?;
                 match (m1, m2) {
                     (Some(m1), Some(m2)) => self._merge(&m1, &m2, max_fill, shards_to_remove),
                     (Some(m1), None) => self._merge(&m1, top, max_fill, shards_to_remove),

@@ -889,7 +889,7 @@ impl Shard {
     }
 
     #[cfg(feature = "flush_aggregation")]
-    fn flush_aggregation(&self) -> Result<()> {
+    fn flush_aggregation(&self, file: &MmapFile) -> Result<()> {
         let Some(delay) = self.config.flush_aggregation_delay else {
             return Ok(());
         };
@@ -898,7 +898,8 @@ impl Shard {
             self.in_sync_agg_delay.store(true, Ordering::SeqCst);
             std::thread::sleep(delay);
             self.in_sync_agg_delay.store(false, Ordering::SeqCst);
-            self.flush()
+            file.file.sync_data()?;
+            Ok(())
         };
 
         if let Some(_guard) = self.sync_agg_mutex.try_lock() {
@@ -963,7 +964,7 @@ impl Shard {
                 #[cfg(feature = "flush_aggregation")]
                 {
                     drop(row_guard);
-                    self.flush_aggregation()?;
+                    self.flush_aggregation(file)?;
                 }
             }
             return Ok(TryReplaceStatus::KeyExistsReplaced(existing_val));
@@ -1102,7 +1103,7 @@ impl Shard {
                             #[cfg(feature = "flush_aggregation")]
                             {
                                 drop(_guard);
-                                self.flush_aggregation()?;
+                                self.flush_aggregation(file)?;
                             }
                             Ok(InsertStatus::Added)
                         } else {
@@ -1141,7 +1142,7 @@ impl Shard {
                     #[cfg(feature = "flush_aggregation")]
                     {
                         drop(_guard);
-                        self.flush_aggregation()?;
+                        self.flush_aggregation(file)?;
                     }
                     return Ok(Some(v));
                 }

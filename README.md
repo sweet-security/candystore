@@ -1,7 +1,7 @@
 <div>
 <img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ubuntu.yml/badge.svg">
+<div align="left">v0.5.6 fixes some potential concurrency issues and panics on missing shards after a crash </div>
 <div align="left">🪟 v0.5.5 now supports Windows (experimental)! 🎉</div>
-<div align="left">💎 v0.5.4 now works on stable rust! ✨</div>
 </div>
 
 # CandyStore
