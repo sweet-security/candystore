@@ -5,7 +5,7 @@ fn test_max_key_len() {
     let dir = tempfile::tempdir().unwrap();
     let store = CandyStore::open(dir.path(), Config::default()).unwrap();
 
-    let key = vec![b'k'; MAX_KEY_LEN as usize];
+    let key = vec![b'k'; MAX_KEY_LEN];
     let val = b"value";
 
     store.set(&key, val).unwrap();
@@ -18,7 +18,7 @@ fn test_max_value_len() {
     let store = CandyStore::open(dir.path(), Config::default()).unwrap();
 
     let key = b"key";
-    let val = vec![b'v'; MAX_VALUE_LEN as usize];
+    let val = vec![b'v'; MAX_VALUE_LEN];
 
     store.set(key, &val).unwrap();
     assert_eq!(store.get(key).unwrap(), Some(val));
@@ -29,7 +29,7 @@ fn test_key_too_long() {
     let dir = tempfile::tempdir().unwrap();
     let store = CandyStore::open(dir.path(), Config::default()).unwrap();
 
-    let key = vec![b'k'; MAX_KEY_LEN as usize + 1];
+    let key = vec![b'k'; MAX_KEY_LEN + 1];
     let val = b"value";
 
     let res = store.set(&key, val);
@@ -42,7 +42,7 @@ fn test_value_too_long() {
     let store = CandyStore::open(dir.path(), Config::default()).unwrap();
 
     let key = b"key";
-    let val = vec![b'v'; MAX_VALUE_LEN as usize + 1];
+    let val = vec![b'v'; MAX_VALUE_LEN + 1];
 
     let res = store.set(key, &val);
     assert!(res.is_err());
