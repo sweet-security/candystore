@@ -13,8 +13,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Environment info
+        run: uname -a; lscpu; free -h; df -h
       - name: Build
-        run: uname -a; cargo build
+        run: cargo build
 
       - name: Run simple example
         run: RUST_BACKTRACE=1 cargo run --example simple
@@ -26,6 +28,6 @@ jobs:
         run: RUST_BACKTRACE=1 cargo run --example typed
 
       - name: Run tests (debug)
-        run: RUST_BACKTRACE=1 cargo test -- --nocapture
+        run: RUST_BACKTRACE=full cargo test -- --nocapture
       - name: Run tests (release)
-        run: RUST_BACKTRACE=1 cargo test --release -- --nocapture
+        run: RUST_BACKTRACE=full cargo test --release -- --nocapture
