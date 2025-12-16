@@ -30,7 +30,6 @@ fn test_basic_ops() {
         println!("Inserting {} items...", n);
         let start = Instant::now();
         for (key, value) in &items {
-            println!("{key}");
             store.set(key.as_bytes(), value.as_bytes()).unwrap();
         }
         let duration = start.elapsed();
