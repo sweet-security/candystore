@@ -71,7 +71,7 @@ impl Default for Config {
             max_data_file_size: 64 * 1024 * 1024,
             remapping_scaler: 0,
             max_concurrency: 16,
-            mlock_index: true,
+            mlock_index: false,
             recovery_mode: RecoveryMode::RebuildIndexIfCorrupted,
             flush_interval: Some(Duration::from_secs(10)),
             compaction_interval: Duration::from_secs(10),
