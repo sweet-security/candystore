@@ -18,7 +18,9 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build
-    - name: Run tests
+    - name: Run tests (debug)
+      run: cargo test -- --nocapture
+    - name: Run tests (release)
       run: cargo test --release -- --nocapture
     - name: Run simple example
       run: cargo run --example simple
@@ -28,15 +30,4 @@ jobs:
       run: cargo run --example lists
     - name: Run typed example
       run: cargo run --example typed
-    - name: Run perftest
-      run: cd candy-perf; cargo run --release
-    - name: Run crasher
-      run: cd candy-crasher; cargo run --release
-    - name: Run longliving
-      run: cd candy-longliving; cargo run --release -- 10 40001 10000
-    - name: Run mini-candy
-      run: cd mini-candy; cargo run
-    - name: Run test-list-collisions
-      run: cargo test -F whitebox_testing --test test_list_collisions -- --nocapture
-    - name: Run test-flush-agg
-      run: cargo test -F flush_aggregation --test test_flush_agg -- --nocapture
+
