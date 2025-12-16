@@ -6,7 +6,6 @@ use crate::{MAX_KEY_LEN, MAX_VALUE_LEN};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,7 +76,7 @@ fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn read_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(f, buf, offset)
 }
 
