@@ -61,6 +61,61 @@ impl KVBuf {
     }
 }
 
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, offset)
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+                offset += n as u64;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !buf.is_empty() {
+        Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(f, buf, offset) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct DataFile {
     pub file: File,
     pub serial: u64,
@@ -104,7 +159,7 @@ impl DataFile {
             header.serial = serial;
             header.checkpoint_offset = 0;
             header.aggregated_checksum = 0;
-            file.write_all_at(&buf, 0).map_err(CandyError::IOError)?;
+            write_all_at(&file, &buf, 0).map_err(CandyError::IOError)?;
 
             Ok(Self {
                 file,
@@ -120,8 +175,7 @@ impl DataFile {
                 )));
             }
             let mut buf = vec![0u8; header_size as usize];
-            file.read_exact_at(&mut buf, 0)
-                .map_err(CandyError::IOError)?;
+            read_exact_at(&file, &mut buf, 0).map_err(CandyError::IOError)?;
             let header = unsafe { &*(buf.as_ptr() as *const DataFileHeader) };
             if header.magic != *DATA_FILE_MAGIC {
                 return Err(CandyError::IOError(std::io::Error::new(
@@ -156,10 +210,11 @@ impl DataFile {
 
             let mut read = 0;
             while read < buf.len() {
-                match self
-                    .file
-                    .read_at(&mut buf[read..], start_file_offset + read as u64)
-                {
+                match read_at(
+                    &self.file,
+                    &mut buf[read..],
+                    start_file_offset + read as u64,
+                ) {
                     Ok(0) => break,
                     Ok(n) => read += n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -171,9 +226,7 @@ impl DataFile {
         } else {
             let header_len = Self::ENTRY_HEADER_LEN;
             let mut buf = vec![0u8; header_len];
-            self.file
-                .read_exact_at(&mut buf, start_file_offset)
-                .map_err(CandyError::IOError)?;
+            read_exact_at(&self.file, &mut buf, start_file_offset).map_err(CandyError::IOError)?;
 
             let key_len_raw = u16::from_le_bytes([buf[0], buf[1]]);
             let value_len = u16::from_le_bytes([buf[2], buf[3]]);
@@ -185,12 +238,12 @@ impl DataFile {
                 + value_len as usize
                 + Self::ENTRY_CHECKSUM_LEN;
             buf.resize(total_len, 0);
-            self.file
-                .read_exact_at(
-                    &mut buf[header_len..],
-                    start_file_offset + header_len as u64,
-                )
-                .map_err(CandyError::IOError)?;
+            read_exact_at(
+                &self.file,
+                &mut buf[header_len..],
+                start_file_offset + header_len as u64,
+            )
+            .map_err(CandyError::IOError)?;
             buf
         };
 
@@ -293,9 +346,12 @@ impl DataFile {
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         debug_assert!(offset + buf.len() as u64 <= u32::MAX as u64);
 
-        self.file
-            .write_all_at(&buf, offset + std::mem::size_of::<DataFileHeader>() as u64)
-            .map_err(CandyError::IOError)?;
+        write_all_at(
+            &self.file,
+            &buf,
+            offset + std::mem::size_of::<DataFileHeader>() as u64,
+        )
+        .map_err(CandyError::IOError)?;
 
         Ok((offset as u32, buf.len() as u32))
     }
@@ -327,9 +383,12 @@ impl DataFile {
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         debug_assert!(offset + buf.len() as u64 <= u32::MAX as u64);
 
-        self.file
-            .write_all_at(&buf, offset + std::mem::size_of::<DataFileHeader>() as u64)
-            .map_err(CandyError::IOError)?;
+        write_all_at(
+            &self.file,
+            &buf,
+            offset + std::mem::size_of::<DataFileHeader>() as u64,
+        )
+        .map_err(CandyError::IOError)?;
 
         Ok((offset as u32, buf.len() as u32))
     }
@@ -338,17 +397,14 @@ impl DataFile {
         let _lock = self.flush_lock.lock();
 
         let mut buf = vec![0u8; std::mem::size_of::<DataFileHeader>()];
-        self.file
-            .read_exact_at(&mut buf, 0)
-            .map_err(CandyError::IOError)?;
+
+        read_exact_at(&self.file, &mut buf, 0).map_err(CandyError::IOError)?;
 
         let header = unsafe { &mut *(buf.as_mut_ptr() as *mut DataFileHeader) };
         header.checkpoint_offset = offset;
         header.aggregated_checksum = checksum;
 
-        self.file
-            .write_all_at(&buf, 0)
-            .map_err(CandyError::IOError)?;
+        write_all_at(&self.file, &buf, 0).map_err(CandyError::IOError)?;
         self.file.sync_all().map_err(CandyError::IOError)?;
         Ok(())
     }
@@ -424,11 +480,12 @@ impl<'a> DataFileIterator<'a> {
             return Ok(());
         }
 
-        let n = self
-            .data_file
-            .file
-            .read_at(&mut self.buffer[self.buffer_valid..], read_start)
-            .map_err(CandyError::IOError)?;
+        let n = read_at(
+            &self.data_file.file,
+            &mut self.buffer[self.buffer_valid..],
+            read_start,
+        )
+        .map_err(CandyError::IOError)?;
         self.buffer_valid += n;
         Ok(())
     }

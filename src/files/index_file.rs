@@ -2,7 +2,7 @@ use crate::types::{
     CandyError, Config, EntryPointer, HashCoordinates, INDEX_FILE_MAGIC, INDEX_FILE_VERSION,
     PAGE_SIZE, ROW_WIDTH, RecoveryMode, Result,
 };
-use memmap2::{MmapMut, RemapOptions};
+use memmap2::{MmapMut, MmapOptions, RemapOptions};
 use parking_lot::RwLock;
 use simd_itertools::PositionSimd;
 use std::fs::File;
@@ -362,8 +362,18 @@ impl IndexFile {
                 as u64;
 
             self.file.set_len(new_len).map_err(CandyError::IOError)?;
+
+            #[cfg(target_os = "linux")]
             unsafe { write_guard.remap(new_len as usize, RemapOptions::new().may_move(true)) }
                 .map_err(CandyError::IOError)?;
+
+            #[cfg(not(target_os = "linux"))]
+            unsafe {
+                *write_guard = MmapOptions::new()
+                    .len(new_len as usize)
+                    .map_mut(&self.file)
+                    .map_err(CandyError::IOError)?;
+            }
         }
         Ok(())
     }
@@ -638,8 +648,18 @@ impl IndexFile {
             + (1 << final_level) * std::mem::size_of::<RowLayout>()) as u64;
 
         if new_len < map_guard.len() as u64 {
+            #[cfg(target_os = "linux")]
             unsafe { map_guard.remap(new_len as usize, RemapOptions::new().may_move(true)) }
                 .map_err(CandyError::IOError)?;
+
+            #[cfg(not(target_os = "linux"))]
+            unsafe {
+                *map_guard = MmapOptions::new()
+                    .len(new_len as usize)
+                    .map_mut(&self.file)
+                    .map_err(CandyError::IOError)?
+            };
+
             self.file.set_len(new_len).map_err(CandyError::IOError)?;
         }
 
