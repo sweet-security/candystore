@@ -17,15 +17,15 @@ jobs:
         run: uname -a; cargo build
 
       - name: Run simple example
-        run: cargo run --example simple
+        run: RUST_BACKTRACE=1 cargo run --example simple
       - name: Run multithreaded example
-        run: cargo run --example multithreaded
+        run: RUST_BACKTRACE=1 cargo run --example multithreaded
       - name: Run lists example
-        run: cargo run --example lists
+        run: RUST_BACKTRACE=1 cargo run --example lists
       - name: Run typed example
-        run: cargo run --example typed
+        run: RUST_BACKTRACE=1 cargo run --example typed
 
       - name: Run tests (debug)
-        run: cargo test -- --nocapture
+        run: RUST_BACKTRACE=1 cargo test -- --nocapture
       - name: Run tests (release)
-        run: cargo test --release -- --nocapture
+        run: RUST_BACKTRACE=1 cargo test --release -- --nocapture
