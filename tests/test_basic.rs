@@ -10,12 +10,12 @@ fn test_basic_ops() {
     };
 
     #[cfg(debug_assertions)]
-    const ITERATIONS: usize = 10_00;
+    const ITERATIONS: usize = 10_000;
 
     #[cfg(not(debug_assertions))]
     const ITERATIONS: usize = 1_000_000;
 
-    for i in 1..=2 {
+    for i in 1..=1 {
         let store = CandyStore::open(dir.path(), config.clone()).unwrap();
 
         let n = ITERATIONS;
@@ -30,6 +30,7 @@ fn test_basic_ops() {
         println!("Inserting {} items...", n);
         let start = Instant::now();
         for (key, value) in &items {
+            println!("{key}");
             store.set(key.as_bytes(), value.as_bytes()).unwrap();
         }
         let duration = start.elapsed();

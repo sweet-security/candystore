@@ -205,9 +205,6 @@ impl CandyStore {
         let val = val.as_ref();
         self.ensure_user_value_len(val.len())?;
         let outcome = self._set_with_options(KeyNamespace::User, key, val, SetOptions::Upsert)?;
-        self.inner
-            .inner_stats
-            .record_lookup(outcome.previous.is_some());
 
         Ok(match outcome.previous {
             Some(prev) => SetStatus::PrevValue(prev),
@@ -225,9 +222,7 @@ impl CandyStore {
     ///
     /// The removed value, or `None` if the key did not exist.
     pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        let res = self._remove(KeyNamespace::User, key.as_ref())?;
-        self.inner.inner_stats.record_lookup(res.is_some());
-        Ok(res)
+        self._remove(KeyNamespace::User, key.as_ref())
     }
 
     /// Checks if the store contains the given key.

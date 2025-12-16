@@ -370,7 +370,11 @@ impl IndexFile {
                     memmap2::RemapOptions::new().may_move(true),
                 )
             }
-            .map_err(CandyError::IOError)?;
+            .map_err(|e| {
+                assert_ne!(e.raw_os_error(), Some(11)); // EAGAIN
+                assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock);
+                CandyError::IOError(e)
+            })?;
 
             #[cfg(not(target_os = "linux"))]
             unsafe {
@@ -660,7 +664,11 @@ impl IndexFile {
                     memmap2::RemapOptions::new().may_move(true),
                 )
             }
-            .map_err(CandyError::IOError)?;
+            .map_err(|e| {
+                assert_ne!(e.raw_os_error(), Some(11)); // EAGAIN
+                assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock);
+                CandyError::IOError(e)
+            })?;
 
             #[cfg(not(target_os = "linux"))]
             unsafe {

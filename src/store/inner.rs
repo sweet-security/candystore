@@ -143,10 +143,13 @@ impl CandyStoreInner {
             return Ok(false);
         }
 
+        println!("Rotating data file from id {}", active_id);
+
         let current_serial = if let Some(old_file) = data_files_guard.get(&active_id) {
             if let Err(e) =
                 old_file.flush_checkpoint(old_file.write_offset.load(Ordering::SeqCst), 0)
             {
+                println!("Failed to flush old data file during rotation: {}", e);
                 error!("Failed to flush old data file during rotation: {}", e);
             }
             old_file.serial

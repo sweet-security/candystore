@@ -65,6 +65,7 @@ fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     match std::os::unix::fs::FileExt::read_at(f, buf, offset) {
         Ok(n) => Ok(n),
         Err(e) => {
+            assert_ne!(e.raw_os_error(), Some(11)); // EAGAIN
             assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock);
             Err(e)
         }
@@ -76,6 +77,7 @@ fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     match std::os::unix::fs::FileExt::read_exact_at(f, buf, offset) {
         Ok(()) => Ok(()),
         Err(e) => {
+            assert_ne!(e.raw_os_error(), Some(11)); // EAGAIN
             assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock);
             Err(e)
         }
@@ -87,6 +89,7 @@ fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     match std::os::unix::fs::FileExt::write_all_at(f, buf, offset) {
         Ok(()) => Ok(()),
         Err(e) => {
+            assert_ne!(e.raw_os_error(), Some(11)); // EAGAIN
             assert_ne!(e.kind(), std::io::ErrorKind::WouldBlock);
             Err(e)
         }
