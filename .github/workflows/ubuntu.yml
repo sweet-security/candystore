@@ -2,32 +2,28 @@ name: Linux
 
 on:
   push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build
-    - name: Run tests (debug)
-      run: cargo test -- --nocapture
-    - name: Run tests (release)
-      run: cargo test --release -- --nocapture
-    - name: Run simple example
-      run: cargo run --example simple
-    - name: Run multithreaded example
-      run: cargo run --example multithreaded
-    - name: Run lists example
-      run: cargo run --example lists
-    - name: Run typed example
-      run: cargo run --example typed
-
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build
+      - name: Run tests (debug)
+        run: cargo test -- --nocapture
+      - name: Run tests (release)
+        run: cargo test --release -- --nocapture
+      - name: Run simple example
+        run: cargo run --example simple
+      - name: Run multithreaded example
+        run: cargo run --example multithreaded
+      - name: Run lists example
+        run: cargo run --example lists
+      - name: Run typed example
+        run: cargo run --example typed
