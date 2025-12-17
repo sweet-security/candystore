@@ -26,11 +26,10 @@ jobs:
         run: RUST_BACKTRACE=1 cargo run --example lists
       - name: Run typed example
         run: RUST_BACKTRACE=1 cargo run --example typed
+      - name: Run perf
+        run: cargo run --release --example perf
 
       - name: Run tests (debug)
         run: RUST_BACKTRACE=full cargo test -- --nocapture
       - name: Run tests (release)
         run: RUST_BACKTRACE=full cargo test --release -- --nocapture
-
-      - name: Run perf
-        run: cargo run --release --example perf

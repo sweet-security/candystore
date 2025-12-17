@@ -37,6 +37,11 @@ fn test_concurrency_compaction() {
             let keys: Vec<String> = (0..100).map(|k| format!("key:{}:{}", i, k)).collect();
             let val = vec![0u8; 100]; // 100 bytes value
 
+            // Ensure each key exists at least once before random updates to avoid coverage gaps.
+            for key in &keys {
+                store.set(key.as_bytes(), &val).unwrap();
+            }
+
             // 1000 iterations of updates
             for _ in 0..1000 {
                 let key = keys.choose(&mut rng).unwrap();
