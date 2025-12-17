@@ -170,6 +170,12 @@ fn rebuild_index(
             data_file.iter_entries()
         };
 
+        let mut last_valid_offset = if file_id == start_file_id {
+            start_offset
+        } else {
+            0
+        };
+
         for entry in iter {
             let (offset, size, kvbuf) = match entry {
                 Ok(v) => v,
@@ -195,10 +201,34 @@ fn rebuild_index(
                 },
             )?;
 
+            last_valid_offset = offset + size;
+
             if file_id > max_file_id || (file_id == max_file_id && offset + size > max_offset) {
                 max_file_id = file_id;
                 max_offset = offset + size;
             }
+        }
+
+        let current_len = data_file
+            .file
+            .metadata()
+            .map_err(CandyError::IOError)?
+            .len();
+        let valid_len = last_valid_offset as u64 + crate::types::PAGE_SIZE as u64;
+        if current_len > valid_len {
+            warn!(
+                "Truncating file {} from {} to {} bytes to remove garbage",
+                file_id, current_len, valid_len
+            );
+            data_file
+                .file
+                .set_len(valid_len)
+                .map_err(CandyError::IOError)?;
+            data_file.file.sync_all().map_err(CandyError::IOError)?;
+            data_file.write_offset.store(
+                last_valid_offset as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
         }
     }
 

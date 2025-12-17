@@ -1,4 +1,4 @@
-use candystore::{CandyStore, Config};
+use candystore::{CandyStore, Config, OverwriteMode};
 use std::thread;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ fn test_compaction_triggers() {
         compaction_interval: Duration::from_millis(100),
         compaction_min_file_size: 1024, // Allow compacting small files
         compaction_min_waste_threshold: 0.1, // Low threshold
+        overwrite_mode: OverwriteMode::Disabled,
         ..Default::default()
     };
     let store = CandyStore::open(dir.path(), config).unwrap();
@@ -62,6 +63,7 @@ fn test_compaction_min_file_size_limit() {
         compaction_interval: Duration::from_millis(100),
         compaction_min_file_size: 100_000, // Much larger than max_data_file_size
         compaction_min_waste_threshold: 0.1,
+        overwrite_mode: OverwriteMode::Disabled,
         ..Default::default()
     };
     let store = CandyStore::open(dir.path(), config).unwrap();
@@ -91,6 +93,7 @@ fn test_compaction_waste_threshold_limit() {
         compaction_interval: Duration::from_millis(100),
         compaction_min_file_size: 1024,
         compaction_min_waste_threshold: 0.9, // Very high threshold (90% waste required)
+        overwrite_mode: OverwriteMode::Disabled,
         ..Default::default()
     };
     let store = CandyStore::open(dir.path(), config).unwrap();

@@ -36,6 +36,13 @@ pub enum RecoveryMode {
     ClearAllIfCorrupted,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OverwriteMode {
+    Disabled,
+    AllowInActiveFile,
+    AllowInAllFiles,
+}
+
 #[derive(Debug, Clone)]
 /// Configuration for the CandyStore.
 pub struct Config {
@@ -61,6 +68,8 @@ pub struct Config {
     pub compaction_min_file_size: u32,
     /// Threshold of wasted space ratio to trigger compaction.
     pub compaction_min_waste_threshold: f64,
+    /// Whether to allow overwriting existing keys in place, if the value has the same length as the existing one.
+    pub overwrite_mode: OverwriteMode,
 }
 
 impl Default for Config {
@@ -77,6 +86,7 @@ impl Default for Config {
             compaction_interval: Duration::from_secs(10),
             compaction_min_file_size: 8 * 1024 * 1024,
             compaction_min_waste_threshold: 0.3,
+            overwrite_mode: OverwriteMode::AllowInAllFiles,
         }
     }
 }

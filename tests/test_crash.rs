@@ -296,12 +296,8 @@ fn test_crash_recovery() -> Result<()> {
             store.remove("lowest")?,
             Some((TARGET - 1).to_le_bytes().to_vec())
         );
-        assert_eq!(
-            store.iter().count(),
-            0,
-            "{:?}",
-            store.iter().collect::<Vec<_>>()
-        );
+        let items = store.iter().collect::<Vec<_>>();
+        assert_eq!(items.len(), 0, "{items:?}");
 
         println!("DB validated successfully");
     }

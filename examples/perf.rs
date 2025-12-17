@@ -280,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // multi threaded
     run_perf(store.clone(), 250_000, 4, 16, 16)?;
-    run_perf(store.clone(), 10_000, 20, 16, 16)?;
+    //run_perf(store.clone(), 10_000, 20, 16, 16)?;
 
     // queues
     run_queue_perf(store.clone(), 500_000, 1, 16)?;

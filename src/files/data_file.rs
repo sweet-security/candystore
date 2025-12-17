@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[repr(C, packed)]
 struct DataFileHeader {
@@ -119,6 +119,7 @@ pub(crate) struct DataFile {
     pub file: File,
     pub serial: u64,
     pub write_offset: AtomicU64,
+    pub is_under_compaction: AtomicBool,
     pub flush_lock: Mutex<()>,
 }
 
@@ -164,6 +165,7 @@ impl DataFile {
                 file,
                 serial,
                 write_offset: AtomicU64::new(0),
+                is_under_compaction: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
             })
         } else {
@@ -196,6 +198,7 @@ impl DataFile {
                 file,
                 serial: header.serial,
                 write_offset: AtomicU64::new(write_offset),
+                is_under_compaction: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
             })
         }
@@ -314,14 +317,44 @@ impl DataFile {
         Ok(kv)
     }
 
-    pub fn append_kv<K: AsRef<[u8]> + ?Sized, V: AsRef<[u8]> + ?Sized>(
+    pub fn overwrite_inplace(
         &self,
         ns: KeyNamespace,
-        key: &K,
-        value: &V,
-    ) -> Result<(u32, u32)> {
-        let key = key.as_ref();
-        let value = value.as_ref();
+        key: &[u8],
+        value: &[u8],
+        entry_offset: u32,
+    ) -> Result<()> {
+        debug_assert!(key.len() <= MAX_KEY_LEN);
+        debug_assert!(value.len() <= MAX_VALUE_LEN);
+
+        let mut hasher = crc32fast::Hasher::new();
+        let key_len_and_type = (key.len() as u16) | ((DataEntryType::KV as u16) << KEY_LEN_BITS);
+        hasher.update(&key_len_and_type.to_le_bytes());
+
+        hasher.update(&(value.len() as u16).to_le_bytes());
+        hasher.update(&[ns as u8]);
+        hasher.update(key);
+        hasher.update(value);
+        let checksum = hasher.finalize();
+
+        let mut buf: SmallVec<[u8; 1024]> =
+            SmallVec::with_capacity(value.len() + Self::ENTRY_CHECKSUM_LEN);
+        buf.resize(value.len() + Self::ENTRY_CHECKSUM_LEN, 0);
+        buf[..value.len()].copy_from_slice(value);
+        buf[value.len()..].copy_from_slice(&checksum.to_le_bytes());
+
+        let base = Self::ENTRY_HEADER_LEN + 1 + key.len();
+        write_all_at(
+            &self.file,
+            &buf,
+            (entry_offset as usize + base) as u64 + std::mem::size_of::<DataFileHeader>() as u64,
+        )
+        .map_err(CandyError::IOError)?;
+
+        Ok(())
+    }
+
+    pub fn append_kv(&self, ns: KeyNamespace, key: &[u8], value: &[u8]) -> Result<(u32, u32)> {
         debug_assert!(key.len() <= MAX_KEY_LEN);
         debug_assert!(value.len() <= MAX_VALUE_LEN);
 
@@ -355,12 +388,7 @@ impl DataFile {
         Ok((offset as u32, buf.len() as u32))
     }
 
-    pub fn append_tombstone<K: AsRef<[u8]> + ?Sized>(
-        &self,
-        ns: KeyNamespace,
-        key: &K,
-    ) -> Result<(u32, u32)> {
-        let key = key.as_ref();
+    pub fn append_tombstone(&self, ns: KeyNamespace, key: &[u8]) -> Result<(u32, u32)> {
         debug_assert!(key.len() <= MAX_KEY_LEN);
 
         let data_len = Self::ENTRY_HEADER_LEN + 1 + key.len();

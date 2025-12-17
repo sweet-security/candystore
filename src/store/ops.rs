@@ -2,7 +2,7 @@ use crate::files::data_file::DataFile;
 use crate::files::index_file::RowLayout;
 use crate::types::{
     CandyError, EntryPointer, HashCoordinates, KeyNamespace, MAX_KEY_LEN, MAX_VALUE_LEN,
-    MAX_VALUE_LEN_INTERNAL, Result,
+    MAX_VALUE_LEN_INTERNAL, OverwriteMode, Result,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -148,6 +148,39 @@ impl CandyStore {
                             }
 
                             let old_ptr = row.pointers[idx];
+
+                            // optimization: overwrite in place if same size
+                            if old_value.len() == value.len()
+                                && !matches!(
+                                    self.inner.config.overwrite_mode,
+                                    OverwriteMode::Disabled,
+                                )
+                            {
+                                let succ = self.inner.overwrite_inplace(
+                                    old_ptr.file_id,
+                                    matches!(
+                                        self.inner.config.overwrite_mode,
+                                        OverwriteMode::AllowInActiveFile
+                                    ),
+                                    ns,
+                                    key,
+                                    value,
+                                    old_ptr.file_offset,
+                                );
+
+                                if matches!(succ, Ok(true)) {
+                                    header.num_updates.fetch_add(1, Ordering::Relaxed);
+
+                                    return Ok((
+                                        SetOutcome {
+                                            previous: Some(old_value),
+                                            wrong_value: false,
+                                        },
+                                        None,
+                                    ));
+                                }
+                            }
+
                             let old_checksum = old_ptr.calc_checksum(hc.signature);
 
                             let (active_id, new_offset, size) =

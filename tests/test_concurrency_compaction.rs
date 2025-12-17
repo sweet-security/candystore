@@ -1,4 +1,4 @@
-use candystore::{CandyStore, Config};
+use candystore::{CandyStore, Config, OverwriteMode};
 use rand::prelude::*;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -15,6 +15,7 @@ fn test_concurrency_compaction() {
         compaction_min_waste_threshold: 0.2, // 20% waste triggers compaction
         compaction_interval: Duration::from_millis(10), // Check often
         max_concurrency: 8,
+        overwrite_mode: OverwriteMode::Disabled,
         ..Default::default()
     };
 

@@ -7,7 +7,9 @@ pub(crate) mod types;
 pub use containers::list::{KVPair, ListCompactionParams, ListIterator};
 pub use store::{CandyStore, GetOrCreateStatus, ReplaceStatus, SetStatus};
 pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
-pub use types::{CandyError, Config, MAX_KEY_LEN, MAX_VALUE_LEN, RecoveryMode, Result, Stats};
+pub use types::{
+    CandyError, Config, MAX_KEY_LEN, MAX_VALUE_LEN, OverwriteMode, RecoveryMode, Result, Stats,
+};
 
 #[doc(hidden)]
 pub mod test_offsets {

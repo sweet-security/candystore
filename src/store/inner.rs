@@ -188,6 +188,39 @@ impl CandyStoreInner {
         Ok((active_id, new_offset, size))
     }
 
+    pub(crate) fn overwrite_inplace(
+        &self,
+        file_id: u16,
+        only_active: bool,
+        ns: KeyNamespace,
+        key: &[u8],
+        value: &[u8],
+        entry_offset: u32,
+    ) -> Result<bool> {
+        let data_files = self.data_files.read();
+        let Some(data_file) = data_files.get(&file_id) else {
+            return Ok(false);
+        };
+        if only_active && file_id != self.active_file_id.load(Ordering::Relaxed) as u16 {
+            return Ok(false);
+        }
+        if data_file.is_under_compaction.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        data_file.overwrite_inplace(ns, key, value, entry_offset)?;
+
+        // Double check: If compaction started while we were writing, we might have
+        // created a race where compaction read the old value but we wrote the new one.
+        // By returning false here, we force the caller to append the new value to the
+        // active file, ensuring the index is updated and compaction discards its stale read.
+        if data_file.is_under_compaction.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+
+        self.inner_stats.record_write(key.len() + value.len());
+        Ok(true)
+    }
+
     pub(crate) fn append_kv_to_active_file(
         &self,
         ns: KeyNamespace,

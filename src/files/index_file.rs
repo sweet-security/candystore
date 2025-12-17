@@ -1,6 +1,6 @@
 use crate::types::{
     CandyError, Config, EntryPointer, HashCoordinates, INDEX_FILE_MAGIC, INDEX_FILE_VERSION,
-    PAGE_SIZE, ROW_WIDTH, RecoveryMode, Result,
+    PAGE_SIZE, ROW_WIDTH, Result,
 };
 use memmap2::MmapMut;
 use parking_lot::RwLock;
@@ -8,7 +8,6 @@ use simd_itertools::PositionSimd;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::warn;
 
 #[repr(C)]
 pub(crate) struct RowLayout {
@@ -223,20 +222,13 @@ impl IndexFile {
 
         let stored_checksum = layout.header.index_checksum.load(Ordering::Relaxed);
         if computed_checksum != stored_checksum {
-            if config.recovery_mode == RecoveryMode::RebuildIndexIfCorrupted {
-                warn!(
-                    "Index checksum mismatch (expected {:x}, got {:x}). Proceeding because recovery mode is enabled.",
+            return Err(CandyError::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "index checksum mismatch, expected 0x{:x} got 0x{:x}",
                     stored_checksum, computed_checksum
-                );
-            } else {
-                return Err(CandyError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "index checksum mismatch, expected 0x{:x} got 0x{:x}",
-                        stored_checksum, computed_checksum
-                    ),
-                )));
-            }
+                ),
+            )));
         }
 
         Ok(Self {
