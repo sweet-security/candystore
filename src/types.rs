@@ -38,8 +38,11 @@ pub enum RecoveryMode {
 
 #[derive(Debug, Clone, Copy)]
 pub enum OverwriteMode {
+    /// The safest mode: do not allow overwriting existing keys in place.
     Disabled,
+    /// Less safe: allow overwriting existing keys in place only in the active data file. Saves on compaction.
     AllowInActiveFile,
+    /// Least safe: allow overwriting existing keys in place in all data files. Saves more on compaction.
     AllowInAllFiles,
 }
 
@@ -86,7 +89,7 @@ impl Default for Config {
             compaction_interval: Duration::from_secs(10),
             compaction_min_file_size: 8 * 1024 * 1024,
             compaction_min_waste_threshold: 0.3,
-            overwrite_mode: OverwriteMode::AllowInAllFiles,
+            overwrite_mode: OverwriteMode::Disabled,
         }
     }
 }
