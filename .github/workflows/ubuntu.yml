@@ -31,3 +31,6 @@ jobs:
         run: RUST_BACKTRACE=full cargo test -- --nocapture
       - name: Run tests (release)
         run: RUST_BACKTRACE=full cargo test --release -- --nocapture
+
+      - name: Run perf
+        run: cargo run --release --example perf
