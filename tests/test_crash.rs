@@ -63,6 +63,8 @@ fn child_removals() -> Result<()> {
 
     println!("child starting at {lowest}");
 
+    assert!(!store.contains("highest")?, "\"highest\" got resurrected");
+
     for i in lowest..TARGET {
         store.remove(&i.to_le_bytes())?;
         store.set("lowest", &i.to_le_bytes())?;
@@ -142,19 +144,6 @@ fn child_list_removals() -> Result<()> {
 
 fn child_list_iterator_removals() -> Result<()> {
     let store = CandyStore::open("dbdir_crash", get_config())?;
-
-    // Use retain_in_list to remove all items. This is more efficient than iterating and removing
-    // one by one because it updates metadata only at the end, avoiding O(N^2) behavior due to
-    // hole scanning when crashes prevent metadata updates.
-    /*let mut first = true;
-    store.retain_in_list("xxx", |_k, v| {
-        if first {
-            let v2 = u32::from_le_bytes(v.try_into().unwrap());
-            println!("Child starts processing at {v2}");
-            first = false;
-        }
-        Ok(false) // Remove everything
-    })?;*/
 
     if rand::random() {
         //println!("FWD");
