@@ -144,9 +144,17 @@ impl CandyStore {
             }
         }
 
+        let num_rows = self.inner.index_file.num_rows();
+        let capacity = num_rows * ROW_WIDTH;
+        let num_items = idx_stats.num_inserts.saturating_sub(idx_stats.num_deletes) as usize;
+
         Stats {
             num_data_files: data_files.len(),
-            num_rows: self.inner.index_file.num_rows(),
+            num_rows,
+            capacity,
+            num_items: num_items,
+            fill_level: num_items as f64 / capacity as f64,
+            index_size_bytes: self.inner.index_file.file_size_bytes(),
             num_compactions: idx_stats.num_compacted_files as usize,
 
             occupied_bytes: total_data_bytes as usize,

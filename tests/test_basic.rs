@@ -15,7 +15,7 @@ fn test_basic_ops() {
     #[cfg(not(debug_assertions))]
     const ITERATIONS: usize = 1_000_000;
 
-    for i in 1..=1 {
+    for i in 1..=2 {
         let store = CandyStore::open(dir.path(), config.clone()).unwrap();
 
         let n = ITERATIONS;

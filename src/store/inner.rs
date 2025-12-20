@@ -300,6 +300,48 @@ pub(super) fn load_data_files(
         }
     }
 
+    if !data_files.is_empty() {
+        if let Some(active_file) = data_files.get(&active_file_id) {
+            let start_offset = active_file.checkpoint_offset as u32;
+            let mut last_valid_offset = start_offset;
+            let mut truncated = false;
+
+            for entry in active_file.iter_entries_from(start_offset) {
+                match entry {
+                    Ok((offset, size, _)) => {
+                        last_valid_offset = offset + size;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Found garbage in active file {}: {}. Truncating.",
+                            active_file_id,
+                            e
+                        );
+                        active_file.truncate(last_valid_offset)?;
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+
+            if !truncated {
+                let current_len = active_file
+                    .file
+                    .metadata()
+                    .map_err(CandyError::IOError)?
+                    .len();
+                let valid_len = last_valid_offset as u64 + crate::types::PAGE_SIZE as u64;
+                if current_len > valid_len {
+                    tracing::warn!(
+                        "Found trailing garbage in active file {}. Truncating.",
+                        active_file_id
+                    );
+                    active_file.truncate(last_valid_offset)?;
+                }
+            }
+        }
+    }
+
     if data_files.is_empty() {
         let data_file = DataFile::open_trunc(&dir_path.join("data_00000.db"), Some(0))?;
         data_files.insert(0, Arc::new(data_file));

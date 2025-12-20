@@ -55,7 +55,7 @@ pub struct Config {
     pub initial_capacity: usize,
     /// Maximum size of a single data file in bytes.
     pub max_data_file_size: u32,
-    /// Maximum number of concurrent operations (used for lock sharding).
+    /// Maximum number of concurrent operations (used for lock sharding), defaults to num_cpus*2
     pub max_concurrency: usize,
     /// Factor for resizing the index (0 means default).
     pub remapping_scaler: u8,
@@ -82,7 +82,7 @@ impl Default for Config {
             initial_capacity: 1024,
             max_data_file_size: 64 * 1024 * 1024,
             remapping_scaler: 0,
-            max_concurrency: 16,
+            max_concurrency: num_cpus::get() * 2,
             mlock_index: false,
             recovery_mode: RecoveryMode::RebuildIndexIfCorrupted,
             flush_interval: Some(Duration::from_secs(10)),
@@ -377,6 +377,15 @@ pub(crate) const TYPED_LIST_NS: ListNamespaces = ListNamespaces {
 pub struct Stats {
     /// Number of rows in the index.
     pub num_rows: usize,
+    /// Total capacity of the index (in number of entries).
+    pub capacity: usize,
+    /// Number of stored items.
+    pub num_items: usize,
+    /// Fill level of the index (num_items / capacity).
+    pub fill_level: f64,
+    /// Size of the index file in bytes.
+    pub index_size_bytes: u64,
+
     /// Number of compactions performed.
     pub num_compactions: usize,
     /// Number of active data files.

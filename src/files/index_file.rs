@@ -241,6 +241,10 @@ impl IndexFile {
         })
     }
 
+    pub fn file_size_bytes(&self) -> u64 {
+        self.file.metadata().map_or(0, |m| m.len())
+    }
+
     fn initialize_index_file(file: &File, config: &Config) -> Result<MmapMut> {
         let initial_split_level = initial_split_level_for_config(config);
         let initial_rows = (1u64 << initial_split_level) as usize;

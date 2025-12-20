@@ -121,6 +121,7 @@ pub(crate) struct DataFile {
     pub write_offset: AtomicU64,
     pub is_under_compaction: AtomicBool,
     pub flush_lock: Mutex<()>,
+    pub checkpoint_offset: u64,
 }
 
 impl DataFile {
@@ -167,6 +168,7 @@ impl DataFile {
                 write_offset: AtomicU64::new(0),
                 is_under_compaction: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
+                checkpoint_offset: 0,
             })
         } else {
             if len < header_size {
@@ -200,6 +202,7 @@ impl DataFile {
                 write_offset: AtomicU64::new(write_offset),
                 is_under_compaction: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
+                checkpoint_offset: header.checkpoint_offset,
             })
         }
     }
@@ -452,6 +455,15 @@ impl DataFile {
         self.file.sync_all().map_err(CandyError::IOError)?;
         self.write_offset.store(0, Ordering::Relaxed);
         self.flush_checkpoint(0, 0)?;
+        Ok(())
+    }
+
+    pub(crate) fn truncate(&self, offset: u32) -> Result<()> {
+        let file_offset = offset as u64 + std::mem::size_of::<DataFileHeader>() as u64;
+        self.file
+            .set_len(file_offset)
+            .map_err(CandyError::IOError)?;
+        self.write_offset.store(offset as u64, Ordering::SeqCst);
         Ok(())
     }
 }

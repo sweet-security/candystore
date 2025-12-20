@@ -15,6 +15,7 @@ smallvec = { version = "1.15.1", features = ["const_generics"] }
 tracing = "0.1.43"
 databuf = "0.5.0"
 uuid = "1.11.0"
+num_cpus = "1.17.0"
 
 [dev-dependencies]
 libc = "0.2.178"
