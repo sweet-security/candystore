@@ -152,7 +152,7 @@ impl CandyStore {
             num_data_files: data_files.len(),
             num_rows,
             capacity,
-            num_items: num_items,
+            num_items,
             fill_level: num_items as f64 / capacity as f64,
             index_size_bytes: self.inner.index_file.file_size_bytes(),
             num_compactions: idx_stats.num_compacted_files as usize,
