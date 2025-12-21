@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::ptr::null_mut;
 use std::time::Duration;
 use std::{ops::Range, sync::atomic::AtomicU64, sync::atomic::Ordering::SeqCst};
