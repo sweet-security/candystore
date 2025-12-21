@@ -383,6 +383,7 @@ impl CandyStore {
     /// # Returns
     ///
     /// The new number of rows in the index file.
+    #[cfg(unix)]
     pub fn shrink_index_blocking(&self, min_wasted_pct: f64) -> Result<usize> {
         // Clamp to sane bounds to avoid surprises from caller inputs.
         let min_wasted_pct = min_wasted_pct.clamp(0.0, 1.0);

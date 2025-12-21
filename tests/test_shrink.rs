@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use candystore::{CandyStore, Config};
 use std::sync::Arc;
 

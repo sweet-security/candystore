@@ -557,6 +557,7 @@ impl IndexFile {
         }
     }
 
+    #[cfg(unix)]
     pub fn shrink(&self, min_rows: usize) -> Result<usize> {
         let mut map_guard = self.mmap.write();
         let layout = unsafe { &mut *(map_guard.as_ptr() as *mut IndexFileLayout) };
