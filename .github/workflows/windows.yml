@@ -11,9 +11,24 @@ jobs:
   build:
     runs-on: windows-latest
 
+    env:
+      RUST_BACKTRACE: 1
+
     steps:
       - uses: actions/checkout@v4
       - name: Build
         run: cargo build
+
       - name: Run simple example
         run: cargo run --example simple
+      - name: Run multithreaded example
+        run: cargo run --example multithreaded
+      - name: Run lists example
+        run: cargo run --example lists
+      - name: Run typed example
+        run: cargo run --example typed
+      - name: Run perf
+        run: cargo run --release --example perf
+
+      - name: Run tests (debug)
+        run: cargo test -- --nocapture
