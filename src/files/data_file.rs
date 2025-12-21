@@ -61,27 +61,27 @@ impl KVBuf {
 }
 
 #[cfg(unix)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(f, buf, offset)
 }
 
 #[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
 }
 
 #[cfg(unix)]
-fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+pub fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(f, buf, offset)
 }
 
 #[cfg(windows)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     std::os::windows::fs::FileExt::seek_read(f, buf, offset)
 }
 
 #[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+pub fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         match std::os::windows::fs::FileExt::seek_read(f, buf, offset) {
             Ok(0) => break,
@@ -101,7 +101,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Resu
 }
 
 #[cfg(windows)]
-fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         match std::os::windows::fs::FileExt::seek_write(f, buf, offset) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
@@ -463,6 +463,7 @@ impl DataFile {
         self.file
             .set_len(file_offset)
             .map_err(CandyError::IOError)?;
+        self.file.sync_all().map_err(CandyError::IOError)?;
         self.write_offset.store(offset as u64, Ordering::SeqCst);
         Ok(())
     }

@@ -1,6 +1,5 @@
-use candystore::{CandyStore, Config, RecoveryMode};
+use candystore::{CandyStore, Config, RecoveryMode, internal::write_all_at};
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
 
 #[test]
 fn test_reset_on_data_file_corruption() {
@@ -25,8 +24,7 @@ fn test_reset_on_data_file_corruption() {
     {
         let file = OpenOptions::new().write(true).open(&data_path).unwrap();
         // Corrupt magic
-        file.write_all_at(&[0; 8], candystore::test_offsets::DATA_MAGIC as u64)
-            .unwrap();
+        write_all_at(&file, &[0; 8], candystore::internal::DATA_MAGIC as u64).unwrap();
     }
 
     // 3. Open with RecoveryMode::ClearAllIfCorrupted
@@ -61,9 +59,10 @@ fn test_reset_on_data_file_version_mismatch() {
     {
         let file = OpenOptions::new().write(true).open(&data_path).unwrap();
         // Version is at offset 8 (after 8 bytes magic)
-        file.write_all_at(
+        write_all_at(
+            &file,
             &[0xFF, 0xFF, 0xFF, 0xFF],
-            candystore::test_offsets::DATA_VERSION as u64,
+            candystore::internal::DATA_VERSION as u64,
         )
         .unwrap();
     }

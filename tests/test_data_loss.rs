@@ -1,6 +1,5 @@
-use candystore::{CandyStore, Config, RecoveryMode};
+use candystore::{CandyStore, Config, RecoveryMode, internal::write_all_at};
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
 
 #[test]
 fn test_truncated_data_file_lookup() {
@@ -181,7 +180,7 @@ fn test_zeroed_tail_data_file_lookup() {
     {
         let file = OpenOptions::new().write(true).open(&data_path).unwrap();
         let zeros = vec![0u8; zero_len as usize];
-        file.write_all_at(&zeros, start_offset).unwrap();
+        write_all_at(&file, &zeros, start_offset).unwrap();
     }
 
     // 3. Reopen

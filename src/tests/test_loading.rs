@@ -1,7 +1,9 @@
 use crate::files::index_file::IndexFileHeader;
-use crate::{CandyStore, Config, RecoveryMode};
+use crate::{
+    CandyStore, Config, RecoveryMode,
+    internal::{read_exact_at, write_all_at},
+};
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
 
 #[test]
 fn test_happy_path_loading() {
@@ -50,7 +52,7 @@ fn test_validation_failures() {
     // Case 1: Corrupt Magic
     {
         let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.write_all_at(&[0, 0, 0, 0], 0).unwrap();
+        write_all_at(&file, &[0, 0, 0, 0], 0).unwrap();
     }
     assert!(
         CandyStore::open(dir.path(), config.clone()).is_err(),
@@ -67,7 +69,7 @@ fn test_validation_failures() {
     // Case 2: Corrupt Version
     {
         let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.write_all_at(&[0xFF, 0, 0, 0], 4).unwrap();
+        write_all_at(&file, &[0xFF, 0, 0, 0], 4).unwrap();
     }
     assert!(
         CandyStore::open(dir.path(), config.clone()).is_err(),
@@ -104,7 +106,7 @@ fn test_validation_failures() {
         // Offset 8 is global_split_level (after magic u32 + version u32)
         // Write a huge split level (e.g. 20) which requires a large file
         let huge_level = 20u64;
-        file.write_all_at(&huge_level.to_le_bytes(), 8).unwrap();
+        write_all_at(&file, &huge_level.to_le_bytes(), 8).unwrap();
     }
     assert!(
         CandyStore::open(dir.path(), config.clone()).is_err(),
@@ -136,12 +138,12 @@ fn test_checksum_header_corruption() {
     const CSUM_OFFSET: usize = std::mem::offset_of!(IndexFileHeader, index_checksum);
 
     let mut buf = [0u8; 8];
-    file.read_exact_at(&mut buf, CSUM_OFFSET as u64).unwrap();
+    read_exact_at(&file, &mut buf, CSUM_OFFSET as u64).unwrap();
     let old_checksum = u64::from_le_bytes(buf);
     println!("Old checksum: {:x}", old_checksum);
 
     buf[0] ^= 0xFF;
-    file.write_all_at(&buf, CSUM_OFFSET as u64).unwrap();
+    write_all_at(&file, &buf, CSUM_OFFSET as u64).unwrap();
 
     let new_checksum = u64::from_le_bytes(buf);
     println!("New checksum: {:x}", new_checksum);

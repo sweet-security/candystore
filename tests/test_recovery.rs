@@ -1,6 +1,5 @@
-use candystore::{CandyStore, Config, RecoveryMode};
+use candystore::{CandyStore, Config, RecoveryMode, internal::write_all_at};
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
 
 #[test]
 fn test_naive_recovery() {
@@ -30,8 +29,12 @@ fn test_naive_recovery() {
     {
         let file = OpenOptions::new().write(true).open(&index_path).unwrap();
         // Corrupt the checksum
-        file.write_all_at(&[0xFF; 8], candystore::test_offsets::INDEX_CHECKSUM as u64)
-            .unwrap();
+        write_all_at(
+            &file,
+            &[0xFF; 8],
+            candystore::internal::INDEX_CHECKSUM as u64,
+        )
+        .unwrap();
     }
 
     // 3. Open DB - should trigger recovery
@@ -72,8 +75,12 @@ fn test_data_corruption_recovery() {
     // 2. Corrupt the index file to force recovery
     {
         let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.write_all_at(&[0xFF; 8], candystore::test_offsets::INDEX_CHECKSUM as u64)
-            .unwrap();
+        write_all_at(
+            &file,
+            &[0xFF; 8],
+            candystore::internal::INDEX_CHECKSUM as u64,
+        )
+        .unwrap();
     }
 
     // 3. Corrupt the data file (truncate the last entry)
@@ -147,8 +154,12 @@ fn test_recovery_multiple_files() {
     // 2. Corrupt the index file
     {
         let file = OpenOptions::new().write(true).open(&index_path).unwrap();
-        file.write_all_at(&[0xFF; 8], candystore::test_offsets::INDEX_CHECKSUM as u64)
-            .unwrap();
+        write_all_at(
+            &file,
+            &[0xFF; 8],
+            candystore::internal::INDEX_CHECKSUM as u64,
+        )
+        .unwrap();
     }
 
     // 3. Open DB - should trigger recovery across all files

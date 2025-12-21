@@ -12,8 +12,9 @@ pub use types::{
 };
 
 #[doc(hidden)]
-pub mod test_offsets {
+pub mod internal {
     pub use crate::files::data_file::test_offsets::*;
+    pub use crate::files::data_file::{read_at, read_exact_at, write_all_at};
     pub use crate::files::index_file::test_offsets::*;
 }
 
