@@ -557,7 +557,6 @@ impl IndexFile {
         }
     }
 
-    #[cfg(unix)]
     pub fn shrink(&self, min_rows: usize) -> Result<usize> {
         let mut map_guard = self.mmap.write();
         let layout = unsafe { &mut *(map_guard.as_ptr() as *mut IndexFileLayout) };
@@ -651,23 +650,37 @@ impl IndexFile {
 
         if new_len < map_guard.len() as u64 {
             #[cfg(target_os = "linux")]
-            unsafe {
-                map_guard.remap(
-                    new_len as usize,
-                    memmap2::RemapOptions::new().may_move(true),
-                )
+            {
+                unsafe {
+                    map_guard.remap(
+                        new_len as usize,
+                        memmap2::RemapOptions::new().may_move(true),
+                    )
+                }
+                .map_err(CandyError::IOError)?;
+                self.file.set_len(new_len).map_err(CandyError::IOError)?;
             }
-            .map_err(CandyError::IOError)?;
 
             #[cfg(not(target_os = "linux"))]
-            unsafe {
-                *map_guard = memmap2::MmapOptions::new()
-                    .len(new_len as usize)
-                    .map_mut(&self.file)
-                    .map_err(CandyError::IOError)?
-            };
+            {
+                map_guard.flush().map_err(CandyError::IOError)?;
+                // On Windows, we cannot truncate the file while it is mapped.
+                // We replace the mapping with a dummy anonymous mapping to drop the file mapping.
+                let dummy = memmap2::MmapOptions::new()
+                    .len(1)
+                    .map_anon()
+                    .map_err(CandyError::IOError)?;
+                *map_guard = dummy;
 
-            self.file.set_len(new_len).map_err(CandyError::IOError)?;
+                self.file.set_len(new_len).map_err(CandyError::IOError)?;
+
+                unsafe {
+                    *map_guard = memmap2::MmapOptions::new()
+                        .len(new_len as usize)
+                        .map_mut(&self.file)
+                        .map_err(CandyError::IOError)?;
+                }
+            }
         }
 
         Ok(1 << final_level)
