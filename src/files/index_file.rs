@@ -735,13 +735,17 @@ impl IndexFile {
             #[cfg(not(target_os = "linux"))]
             {
                 layout.0.flush().map_err(CandyError::IOError)?;
+
                 // On Windows, we cannot truncate the file while it is mapped.
                 // We replace the mapping with a dummy anonymous mapping to drop the file mapping.
-                let dummy = memmap2::MmapOptions::new()
-                    .len(1)
-                    .map_anon()
-                    .map_err(CandyError::IOError)?;
-                *layout.0 = dummy;
+                #[cfg(windows)]
+                {
+                    let dummy = memmap2::MmapOptions::new()
+                        .len(1)
+                        .map_anon()
+                        .map_err(CandyError::IOError)?;
+                    *layout.0 = dummy;
+                }
 
                 self.file.set_len(new_len).map_err(CandyError::IOError)?;
 
