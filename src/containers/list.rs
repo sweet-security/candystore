@@ -1,3 +1,5 @@
+use siphasher::sip::SipHasher13;
+use std::hash::Hasher;
 use std::ops::Range;
 
 use crate::store::CandyStore;
@@ -1061,18 +1063,24 @@ fn set_list_meta(
     Ok(())
 }
 
+fn hash_list_key(list: &[u8]) -> u64 {
+    let mut hasher = SipHasher13::new_with_keys(0x7ac1485be800c70e, 0x22ac1dcc7992c592);
+    hasher.write(list);
+    hasher.finish()
+}
+
 fn make_list_data_key(list: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(list.len() + 1 + key.len());
-    k.extend_from_slice(list);
-    k.push(b'#');
+    let hash = hash_list_key(list);
+    let mut k = Vec::with_capacity(8 + key.len());
+    k.extend_from_slice(&hash.to_le_bytes());
     k.extend_from_slice(key);
     k
 }
 
 fn make_list_index_key(list: &[u8], idx: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(list.len() + 9);
-    k.extend_from_slice(list);
-    k.push(b':');
+    let hash = hash_list_key(list);
+    let mut k = Vec::with_capacity(16);
+    k.extend_from_slice(&hash.to_le_bytes());
     k.extend_from_slice(&idx.to_be_bytes());
     k
 }
