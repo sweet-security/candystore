@@ -1,3 +1,5 @@
+use siphasher::sip::SipHasher13;
+use std::hash::Hasher;
 use std::ops::Range;
 
 use crate::MAX_VALUE_LEN;
@@ -717,8 +719,12 @@ fn set_queue_meta(
 }
 
 fn make_queue_data_key(queue: &[u8], seq: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(queue.len() + 8);
-    key.extend_from_slice(queue);
+    let mut hasher = SipHasher13::new_with_keys(0xb1ccc559a9924eaa, 0x1b1a682059c2d599);
+    hasher.write(queue);
+    let hash = hasher.finish();
+
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&hash.to_le_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
 }
