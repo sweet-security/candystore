@@ -673,6 +673,35 @@ fn test_trust_dirty_index_rebuilds_on_checksum_mismatch() -> Result<(), Error> {
 }
 
 #[test]
+fn test_trust_dirty_index_resets_on_checksum_mismatch() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrReset,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("key", "value")?;
+        db._abort_for_testing();
+    }
+
+    fs::write(dir.path().join("extra.txt"), b"junk").map_err(Error::IOError)?;
+    fs::create_dir(dir.path().join("extra_dir")).map_err(Error::IOError)?;
+    fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
+
+    common::corrupt_first_row_checksum(dir.path());
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert!(!db.was_clean_shutdown());
+    assert!(db.get("key")?.is_none());
+    assert!(!dir.path().join("extra.txt").exists());
+    assert!(!dir.path().join("extra_dir").exists());
+
+    Ok(())
+}
+
+#[test]
 fn test_reset_db_if_dirty_clears_state() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let config = Config {

@@ -14,7 +14,8 @@ use super::CandyStore;
 
 impl CandyStore {
     pub(super) fn recover_index(&self) -> Result<()> {
-        self.inner.index_file.reset()?;
+        let row_table = self.inner.index_file.rows_table_mut();
+        self.inner.index_file.reset(row_table)?;
 
         let mut sorted_files: Vec<Arc<DataFile>> =
             self.inner.data_files.read().values().cloned().collect();

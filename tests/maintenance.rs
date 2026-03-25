@@ -13,7 +13,7 @@ fn test_clear_resets_store_files_and_contents() -> Result<(), Error> {
         ..Config::default()
     };
 
-    let mut db = CandyStore::open(dir.path(), config)?;
+    let db = CandyStore::open(dir.path(), config)?;
 
     for i in 0..100 {
         db.set(format!("key{i:04}"), vec![b'x'; 64])?;
