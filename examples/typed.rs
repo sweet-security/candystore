@@ -3,6 +3,7 @@ use std::sync::Arc;
 use candystore::{CandyStore, CandyTypedStore, Config, Result};
 
 fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("/tmp/candy-dir");
     let db = Arc::new(CandyStore::open("/tmp/candy-dir", Config::default())?);
 
     let typed = CandyTypedStore::<String, Vec<u32>>::new(db);

@@ -14,11 +14,8 @@ use candystore::{CandyStore, Config, GetOrCreateStatus, Result};
 //   ...
 
 fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("/tmp/candy-dir");
     let db = Arc::new(CandyStore::open("/tmp/candy-dir", Config::default())?);
-
-    // clear the DB just in case we has something there before. in real-life scenarios you would probably
-    // not clear the DB every time
-    db.clear()?;
 
     let mut handles = vec![];
     for thd in 0..3 {

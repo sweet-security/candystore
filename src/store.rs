@@ -1,622 +1,951 @@
-use anyhow::{anyhow, bail, ensure};
-use bytemuck::{bytes_of, from_bytes};
-use fslock::LockFile;
-use parking_lot::Mutex;
+mod compaction;
+mod list;
+mod open;
+mod queue;
+mod recovery;
+mod typed;
+
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use siphasher::sip::SipHasher13;
+
 use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
+    collections::HashMap,
+    hash::Hasher,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+    },
 };
 
 use crate::{
-    hashing::{HashSeed, PartedHash},
-    router::ShardRouter,
-    shard::{CompactionThreadPool, InsertMode, InsertStatus, KVPair},
-    Stats, MAX_KEY_SIZE, MAX_TOTAL_VALUE_SIZE,
+    data_file::DataFile,
+    index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
+    internal::{
+        HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH,
+        aligned_data_entry_size, aligned_data_entry_waste, aligned_tombstone_entry_waste, sync_dir,
+    },
+    types::{Config, Error, GetOrCreateStatus, ReplaceStatus, Result, Stats},
 };
-use crate::{
-    shard::{NUM_ROWS, ROW_WIDTH},
-    stats::InternalStats,
-};
 
-use crate::{CandyError, Config, Result, MAX_TOTAL_KEY_SIZE, MAX_VALUE_SIZE};
-
-pub(crate) const USER_NAMESPACE: &[u8] = &[1];
-pub(crate) const TYPED_NAMESPACE: &[u8] = &[2];
-pub(crate) const LIST_NAMESPACE: &[u8] = &[3];
-pub(crate) const ITEM_NAMESPACE: &[u8] = &[4];
-pub(crate) const CHAIN_NAMESPACE: u8 = 5;
-pub(crate) const QUEUE_NAMESPACE: &[u8] = &[6];
-pub(crate) const QUEUE_ITEM_NAMESPACE: &[u8] = &[7];
-
-#[derive(Debug, Clone)]
-pub(crate) struct InternalConfig {
-    pub dir_path: PathBuf,
-    pub max_shard_size: u32,
-    pub min_compaction_threashold: u32,
-    pub hash_seed: HashSeed,
-    pub expected_number_of_keys: usize,
-    pub max_concurrent_list_ops: u32,
-    pub truncate_up: bool,
-    pub clear_on_unsupported_version: bool,
-    pub mlock_headers: bool,
-    pub num_compaction_threads: usize,
-    #[cfg(feature = "flush_aggregation")]
-    pub flush_aggregation_delay: Option<std::time::Duration>,
+#[derive(Default)]
+struct CompactionState {
+    wake_requested: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReplaceStatus {
-    PrevValue(Vec<u8>),
-    WrongValue(Vec<u8>),
-    DoesNotExist,
-}
-impl ReplaceStatus {
-    pub fn was_replaced(&self) -> bool {
-        matches!(*self, Self::PrevValue(_))
-    }
-    pub fn failed(&self) -> bool {
-        !matches!(*self, Self::PrevValue(_))
-    }
-    pub fn is_key_missing(&self) -> bool {
-        matches!(*self, Self::DoesNotExist)
-    }
-    pub fn is_wrong_value(&self) -> bool {
-        matches!(*self, Self::WrongValue(_))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SetStatus {
-    PrevValue(Vec<u8>),
-    CreatedNew,
-}
-impl SetStatus {
-    pub fn was_created(&self) -> bool {
-        matches!(*self, Self::CreatedNew)
-    }
-    pub fn was_replaced(&self) -> bool {
-        matches!(*self, Self::PrevValue(_))
-    }
+struct StoreInner {
+    base_path: PathBuf,
+    config: Arc<Config>,
+    index_file: IndexFile,
+    logical_locks: Vec<RwLock<()>>,
+    logical_locks_mask: usize,
+    data_files: RwLock<HashMap<u16, Arc<DataFile>>>,
+    active_file_idx: AtomicU16,
+    active_file_ordinal: AtomicU64,
+    rotation_lock: Mutex<()>,
+    compaction_state: Mutex<CompactionState>,
+    compaction_condvar: Condvar,
+    shutting_down: AtomicBool,
+    num_compactions: AtomicU64,
+    compaction_time_ms: AtomicU64,
+    compaction_errors: AtomicU64,
+    num_positive_lookups: AtomicU64,
+    num_negative_lookups: AtomicU64,
+    num_read_ops: AtomicU64,
+    num_read_bytes: AtomicU64,
+    num_write_ops: AtomicU64,
+    num_write_bytes: AtomicU64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GetOrCreateStatus {
-    ExistingValue(Vec<u8>),
-    CreatedNew(Vec<u8>),
-}
-impl GetOrCreateStatus {
-    pub fn was_created(&self) -> bool {
-        matches!(*self, Self::CreatedNew(_))
-    }
-    pub fn already_exists(&self) -> bool {
-        matches!(*self, Self::ExistingValue(_))
-    }
-    pub fn value(self) -> Vec<u8> {
-        match self {
-            Self::CreatedNew(val) => val,
-            Self::ExistingValue(val) => val,
-        }
-    }
-}
-/// The CandyStore object. Note that it's fully sync'ed, so can be shared between threads using `Arc`
+/// A persistent key-value store backed by append-only data files and a mutable index.
 pub struct CandyStore {
-    pub(crate) root: ShardRouter,
-    pub(crate) config: Arc<InternalConfig>,
-    // locks for complicated operations
-    pub(crate) keyed_locks_mask: u32,
-    pub(crate) keyed_locks: Vec<Mutex<()>>,
-    _lockfile: LockFile,
-    stats: Arc<InternalStats>,
-    //threadpool: Arc<CompactionThreadPool>,
+    inner: Arc<StoreInner>,
+    _lockfile: fslock::LockFile,
+    compaction_thd: Option<std::thread::JoinHandle<()>>,
+    allow_clean_shutdown: bool,
+    was_clean_shutdown: bool,
 }
 
-/// An iterator over a CandyStore. Note that it's safe to modify (insert/delete) keys while iterating,
-/// but the results of the iteration may or may not include these changes. This is considered a
-/// well-defined behavior of the store.
-pub struct CandyStoreIterator<'a> {
-    store: &'a CandyStore,
-    shard_selector: u32,
-    row_idx: usize,
-    entry_idx: usize,
-    raw: bool,
-    include_val: bool,
+pub use list::{KVPair, ListIterator};
+pub use typed::{CandyTypedDeque, CandyTypedKey, CandyTypedList, CandyTypedStore};
+
+pub(super) struct OpenState {
+    index_file: IndexFile,
+    data_files: HashMap<u16, Arc<DataFile>>,
+    active_file_idx: u16,
+    active_file_ordinal: u64,
+    was_clean_shutdown: bool,
 }
 
-impl<'a> CandyStoreIterator<'a> {
-    fn new(store: &'a CandyStore, raw: bool, include_val: bool) -> Self {
+pub(super) enum DirtyOpenAction {
+    None,
+    RebuildIndex,
+    TrustIndex,
+    ResetDb,
+}
+
+impl StoreInner {
+    fn new(
+        base_path: PathBuf,
+        config: Arc<Config>,
+        state: OpenState,
+        num_logical_locks: usize,
+    ) -> Self {
         Self {
-            store,
-            shard_selector: 0,
-            row_idx: 0,
-            entry_idx: 0,
-            raw,
-            include_val,
+            base_path,
+            config,
+            index_file: state.index_file,
+            logical_locks: (0..num_logical_locks).map(|_| RwLock::new(())).collect(),
+            logical_locks_mask: num_logical_locks - 1,
+            data_files: RwLock::new(state.data_files),
+            active_file_idx: AtomicU16::new(state.active_file_idx),
+            active_file_ordinal: AtomicU64::new(state.active_file_ordinal),
+            rotation_lock: Mutex::new(()),
+            compaction_state: Mutex::new(CompactionState::default()),
+            compaction_condvar: Condvar::new(),
+            shutting_down: AtomicBool::new(false),
+            num_compactions: AtomicU64::new(0),
+            compaction_time_ms: AtomicU64::new(0),
+            compaction_errors: AtomicU64::new(0),
+            num_positive_lookups: AtomicU64::new(0),
+            num_negative_lookups: AtomicU64::new(0),
+            num_read_ops: AtomicU64::new(0),
+            num_read_bytes: AtomicU64::new(0),
+            num_write_ops: AtomicU64::new(0),
+            num_write_bytes: AtomicU64::new(0),
         }
     }
 
-    /// Returns the cookie of the next item in the store. This can be used later to construct an iterator
-    /// that starts at the given point.
-    pub fn cookie(&self) -> u64 {
-        ((self.shard_selector as u64 & 0xffff) << 32)
-            | ((self.row_idx as u64 & 0xffff) << 16)
-            | (self.entry_idx as u64 & 0xffff)
-    }
-
-    // Constructs an iterator starting at the given cookie
-    pub fn from_cookie(store: &'a CandyStore, cookie: u64, raw: bool, include_val: bool) -> Self {
-        Self {
-            store,
-            shard_selector: ((cookie >> 32) & 0xffff) as u32,
-            row_idx: ((cookie >> 16) & 0xffff) as usize,
-            entry_idx: (cookie & 0xffff) as usize,
-            raw,
-            include_val,
+    fn record_lookup(&self, found: bool) {
+        if found {
+            self.num_positive_lookups.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.num_negative_lookups.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
 
-impl<'a> Iterator for CandyStoreIterator<'a> {
-    type Item = Result<KVPair>;
+    fn record_read(&self, bytes: u64) {
+        self.num_read_ops.fetch_add(1, Ordering::Relaxed);
+        self.num_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.shard_selector < ShardRouter::END_OF_SHARDS {
-            let res = self.store.root.shared_op(self.shard_selector, |sh| {
-                while self.row_idx < NUM_ROWS {
-                    let row_idx = self.row_idx;
-                    let entry_idx = self.entry_idx;
+    fn record_write(&self, bytes: u64) {
+        self.num_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.num_write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 
-                    self.entry_idx += 1;
-                    if self.entry_idx >= ROW_WIDTH {
-                        self.entry_idx = 0;
-                        self.row_idx += 1;
-                    }
+    fn signal_compaction_scan(&self) {
+        let mut state = self.compaction_state.lock();
+        if state.wake_requested {
+            return;
+        }
+        state.wake_requested = true;
+        self.compaction_condvar.notify_one();
+    }
 
-                    let Some((mut k, v)) = sh.read_at(row_idx, entry_idx, self.include_val)? else {
-                        continue;
-                    };
-                    if self.raw {
-                        return Ok((sh.span.start, Some((k, v))));
-                    } else if k.ends_with(USER_NAMESPACE) {
-                        k.truncate(k.len() - USER_NAMESPACE.len());
-                        return Ok((sh.span.start, Some((k, v))));
-                    }
+    fn maybe_signal_compaction_threshold_crossing(
+        &self,
+        file_idx: u16,
+        previous_waste: u32,
+        new_waste: u32,
+    ) {
+        if file_idx == self.active_file_idx.load(Ordering::Acquire) {
+            return;
+        }
+
+        let threshold = self.config.compaction_min_threshold;
+        if previous_waste <= threshold && new_waste > threshold {
+            self.signal_compaction_scan();
+        }
+    }
+
+    fn next_compaction_candidate(&self) -> Option<(u16, u64)> {
+        let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
+        let files = self.data_files.read();
+        files
+            .iter()
+            .filter_map(|(&file_idx, data_file)| {
+                if file_idx == active_file_idx
+                    || self.index_file.file_waste(file_idx) <= self.config.compaction_min_threshold
+                {
+                    return None;
                 }
+                Some((file_idx, data_file.file_ordinal))
+            })
+            .min_by_key(|(_, file_ordinal)| *file_ordinal)
+    }
 
-                self.entry_idx = 0;
-                self.row_idx = 0;
-                Ok((sh.span.end, None))
-            });
+    fn logical_lock_index(&self, ns: KeyNamespace, key: &[u8]) -> usize {
+        let mut hasher = SipHasher13::new_with_keys(0x1701_0a66_2024_6b90, 0x284f_fa2e_3e02_3e2a);
+        hasher.write_u8(ns as u8);
+        hasher.write(key);
+        (hasher.finish() as usize) & self.logical_locks_mask
+    }
 
-            match res {
-                Ok((shard_selector, kv)) => {
-                    self.shard_selector = shard_selector;
-                    if let Some(kv) = kv {
-                        return Some(Ok(kv));
-                    }
-                    // continue
-                }
-                Err(e) => return Some(Err(e)),
+    fn data_file(&self, file_idx: u16) -> Result<Arc<DataFile>> {
+        self.data_files
+            .read()
+            .get(&file_idx)
+            .cloned()
+            .ok_or(Error::MissingDataFile(file_idx))
+    }
+
+    fn bump_histogram(&self, entry_size: u64) {
+        // Buckets: [<64, <256, <1K, <4K, <16K, >=16K]
+        // Boundaries at ilog2 = 6, 8, 10, 12, 14 → bucket = ((ilog2 - 4) / 2).clamp(0, 5)
+        let bucket = ((entry_size.max(1).ilog2() as usize).saturating_sub(4) / 2).min(5);
+        self.index_file.header_ref().size_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
+        let nsl = sl + 1;
+        let low_row_idx = hc.row_index(sl);
+        let high_row_idx = low_row_idx | (1 << sl);
+
+        if nsl > gsl {
+            self.index_file.grow(nsl)?;
+        }
+
+        let rows_table = self.index_file.rows_table();
+
+        let low_shard = rows_table.shard_id(low_row_idx);
+        let high_shard = rows_table.shard_id(high_row_idx);
+
+        let _high_guard = if low_shard < high_shard {
+            None // low_row will automatically lock low_shard
+        } else if low_shard > high_shard {
+            Some(rows_table.lock_shard(high_shard))
+        } else {
+            None
+        };
+
+        let mut low_row = rows_table.row_mut(low_row_idx);
+
+        let _high_guard_post = if low_shard < high_shard {
+            Some(rows_table.lock_shard(high_shard))
+        } else {
+            None
+        };
+
+        if low_row.split_level.load(Ordering::Acquire) != sl {
+            return Ok(());
+        }
+        // SAFETY: the high row (being created) has a split_level of 0, making it unusable by anyone.
+        // We properly hold the high_row shard lock if it differs from the low_row shard.
+        let high_row = unsafe { &mut *rows_table.unlocked_row_ptr(high_row_idx) };
+        debug_assert_eq!(high_row.split_level.load(Ordering::Acquire), 0);
+        let split_bit = 1 << (sl - MIN_SPLIT_LEVEL as u64);
+        for col in 0..ROW_WIDTH {
+            let entry = low_row.pointers[col];
+            if low_row.signatures[col] != HashCoord::INVALID_SIG
+                && entry.is_valid()
+                && (entry.masked_row_selector() as u64) & split_bit != 0
+            {
+                high_row.insert(col, low_row.signatures[col], entry);
+                low_row.remove(col);
             }
         }
 
-        None
+        low_row.set_split_level(nsl);
+        high_row.set_split_level(nsl);
+
+        Ok(())
+    }
+
+    /// Rotate to a new data file when the active one is full.
+    ///
+    /// The `rotation_lock` serializes concurrent rotations, so the read-then-write
+    /// on `data_files` (find a free index, then insert) is not a TOCTOU race.
+    /// `compact_file` also writes to `data_files` (removing files) but only
+    /// touches non-active indices, so there is no conflict.
+    fn _rotate_data_file(&self, active_idx: u16) -> Result<()> {
+        let _rot_lock = self.rotation_lock.lock();
+
+        if self.active_file_idx.load(Ordering::Acquire) != active_idx {
+            return Ok(());
+        }
+
+        let active_ordinal = if let Ok(active_file) = self.data_file(active_idx) {
+            let _ = active_file.file.sync_all();
+            active_file.file_ordinal
+        } else {
+            0
+        };
+
+        let mut next_idx = (self.active_file_idx.load(Ordering::Relaxed) + 1) & MAX_DATA_FILE_IDX;
+        let mut attempts = 0;
+        {
+            let files = self.data_files.read();
+            while files.contains_key(&next_idx) {
+                next_idx = (next_idx + 1) & MAX_DATA_FILE_IDX;
+                attempts += 1;
+                if attempts > MAX_DATA_FILES {
+                    return Err(Error::TooManyDataFiles);
+                }
+            }
+        }
+
+        let ordinal = self.active_file_ordinal.fetch_add(1, Ordering::Relaxed) + 1;
+        let data_file = Arc::new(DataFile::create(
+            self.base_path.as_path(),
+            self.config.clone(),
+            next_idx,
+            ordinal,
+        )?);
+
+        self.data_files.write().insert(next_idx, data_file);
+        self.active_file_idx.store(next_idx, Ordering::Release);
+
+        if active_ordinal != 0
+            && self.index_file.file_waste(active_idx) > self.config.compaction_min_threshold
+        {
+            self.signal_compaction_scan();
+        }
+
+        Ok(())
+    }
+
+    fn _mut_op<T>(
+        &self,
+        ns: KeyNamespace,
+        key: &[u8],
+        val: &[u8],
+        mut op: impl FnMut(HashCoord, RowWriteGuard, &[u8], &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let entry_size = aligned_data_entry_size(key.len(), val.len()) as usize;
+        if key.len() > crate::types::MAX_USER_KEY_SIZE
+            || val.len() > crate::types::MAX_USER_VALUE_SIZE
+            || entry_size > self.config.max_data_file_size as usize
+        {
+            return Err(Error::PayloadTooLarge(entry_size));
+        }
+
+        let hc = HashCoord::new(ns, key, self.config.hash_key);
+
+        loop {
+            let res = {
+                let row_table = self.index_file.rows_table();
+                let gsl = self
+                    .index_file
+                    .header_ref()
+                    .global_split_level
+                    .load(Ordering::Acquire);
+                let mut sl = gsl;
+                let mut res = None;
+
+                loop {
+                    debug_assert!(sl >= MIN_SPLIT_LEVEL as u64, "sl={sl}");
+                    let row = row_table.row_mut(hc.row_index(sl));
+                    let row_sl = row.split_level.load(Ordering::Acquire);
+                    if row_sl == 0 {
+                        sl -= 1;
+                        continue;
+                    }
+                    if row_sl > sl {
+                        break;
+                    }
+
+                    res = Some(op(hc, row, key, val));
+                    break;
+                }
+
+                res
+            };
+
+            let Some(res) = res else {
+                continue;
+            };
+
+            match res {
+                Ok(res) => return Ok(res),
+                Err(Error::SplitRow(sl)) => {
+                    let gsl = self
+                        .index_file
+                        .header_ref()
+                        .global_split_level
+                        .load(Ordering::Acquire);
+                    self._split_row(hc, sl, gsl)?;
+                }
+                Err(Error::RotateDataFile(active_idx)) => {
+                    self._rotate_data_file(active_idx)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 
 impl CandyStore {
-    /// Opens or creates a new CandyStore.
-    /// * dir_path - the directory where shards will be kept
-    /// * config - the configuration options for the store
-    pub fn open(dir_path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let config = Arc::new(InternalConfig {
-            dir_path: dir_path.as_ref().to_path_buf(),
-            expected_number_of_keys: config.expected_number_of_keys,
-            hash_seed: config.hash_seed,
-            max_concurrent_list_ops: config.max_concurrent_list_ops,
-            max_shard_size: config.max_shard_size,
-            min_compaction_threashold: config.min_compaction_threashold,
-            truncate_up: config.truncate_up,
-            clear_on_unsupported_version: config.clear_on_unsupported_version,
-            mlock_headers: config.mlock_headers,
-            num_compaction_threads: config.num_compaction_threads,
-            #[cfg(feature = "flush_aggregation")]
-            flush_aggregation_delay: config.flush_aggregation_delay,
-        });
+    fn logical_read_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockReadGuard<'_, ()> {
+        self.inner.logical_locks[self.inner.logical_lock_index(ns, key)].read()
+    }
 
-        std::fs::create_dir_all(dir_path)?;
-        let lockfilename = config.dir_path.join(".lock");
-        let mut lockfile = LockFile::open(&lockfilename)?;
-        if !lockfile.try_lock_with_pid()? {
-            let (pid, comm, stat) = if let Ok(mut pid) = std::fs::read_to_string(&lockfilename) {
-                // this may fail on non-linux OSs, but we default to "?" anyway
-                pid = pid.trim().to_owned();
-                let exe: String = std::fs::read_link(format!("/proc/{pid}/exe"))
-                    .unwrap_or("?".into())
-                    .to_string_lossy()
-                    .to_string()
-                    .to_owned();
+    fn logical_write_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockWriteGuard<'_, ()> {
+        self.inner.logical_locks[self.inner.logical_lock_index(ns, key)].write()
+    }
 
-                let stat: String = std::fs::read_link(format!("/proc/{pid}/stat"))
-                    .unwrap_or("?".into())
-                    .to_string_lossy()
-                    .to_string()
-                    .to_owned();
-
-                (pid, exe, stat)
-            } else {
-                ("?".into(), "?".into(), "?".into())
-            };
-
-            bail!(
-                "Lock file {lockfilename:?} is held by pid {:?} exe={:?} stat {:?}",
-                pid,
-                comm,
-                stat
-            );
+    fn _immut_op<T>(
+        &self,
+        ns: KeyNamespace,
+        key: &[u8],
+        mut op: impl FnMut(HashCoord, RowReadGuard, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let hc = HashCoord::new(ns, key, self.inner.config.hash_key);
+        loop {
+            let row_table = self.inner.index_file.rows_table();
+            let gsl = self
+                .inner
+                .index_file
+                .header_ref()
+                .global_split_level
+                .load(Ordering::Acquire);
+            let mut sl = gsl;
+            loop {
+                debug_assert!(sl >= MIN_SPLIT_LEVEL as u64, "sl={sl}");
+                let row = row_table.row(hc.row_index(sl));
+                let row_sl = row.split_level.load(Ordering::Acquire);
+                if row_sl == 0 {
+                    sl -= 1;
+                    continue;
+                }
+                if row_sl > sl {
+                    break;
+                }
+                return op(hc, row, key);
+            }
         }
+    }
 
-        let mut num_keyed_locks = config.max_concurrent_list_ops.max(4);
-        if !num_keyed_locks.is_power_of_two() {
-            num_keyed_locks = 1 << (num_keyed_locks.ilog2() + 1);
-        }
-
-        let mut keyed_locks = vec![];
-        for _ in 0..num_keyed_locks {
-            keyed_locks.push(Mutex::new(()));
-        }
-
-        let stats = Arc::new(InternalStats::default());
-        let threadpool = Arc::new(CompactionThreadPool::new(config.num_compaction_threads));
-        let root = ShardRouter::new(config.clone(), stats.clone(), threadpool.clone())?;
-
-        Ok(Self {
-            config,
-            root,
-            keyed_locks_mask: num_keyed_locks - 1,
-            keyed_locks,
-            _lockfile: lockfile,
-            stats,
-            //threadpool,
+    fn get_ns(&self, ns: KeyNamespace, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self._immut_op(ns, key, |hc, row, key| {
+            let files = self.inner.data_files.read();
+            for (_, entry) in row.iter_matches(hc) {
+                let Some(file) = files.get(&entry.file_idx()) else {
+                    continue;
+                };
+                self.inner.record_read(entry.size_hint() as u64);
+                let kv = match file.read_kv(entry.file_offset(), entry.size_hint()) {
+                    Ok(kv) => kv,
+                    Err(Error::IOError(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof
+                            || e.kind() == std::io::ErrorKind::InvalidData =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if kv.key() == key {
+                    return Ok(Some(kv.value().to_vec()));
+                }
+            }
+            Ok(None)
         })
     }
 
-    /// returns the directory where shards are kept
-    pub fn get_shards_directory(&self) -> &Path {
-        &self.config.dir_path
+    /// Returns the current value for `key`, if it exists.
+    pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        let value = self.get_ns(KeyNamespace::User, key.as_ref())?;
+        self.inner.record_lookup(value.is_some());
+        Ok(value)
     }
 
-    /// Syncs all in-memory changes of all shards to disk. Concurrent changes are allowed while
-    /// flushing, and may result in partially-sync'ed store. Use sparingly, as this is a costly operaton.
-    pub fn flush(&self) -> Result<()> {
-        self.root.call_on_all_shards(|sh| sh.flush())?;
-        Ok(())
+    /// Returns `true` if `key` currently exists.
+    pub fn contains(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        self.get(key).map(|value| value.is_some())
     }
 
-    /// Clears the store (erasing all keys), and removing all shard files
-    pub fn clear(&self) -> Result<()> {
-        self.root.clear()?;
-        self.stats.clear();
-
-        Ok(())
-    }
-
-    pub(crate) fn ensure_sizes(key: &[u8], val: &[u8]) -> Result<()> {
-        ensure!(key.len() <= MAX_KEY_SIZE, CandyError::KeyTooLong(key.len()));
-        ensure!(
-            val.len() <= MAX_VALUE_SIZE,
-            CandyError::ValueTooLong(val.len())
-        );
-
-        Ok(())
-    }
-
-    pub(crate) fn make_user_key(&self, mut key: Vec<u8>) -> Vec<u8> {
-        key.extend_from_slice(USER_NAMESPACE);
-        key
-    }
-
-    pub(crate) fn get_by_hash(&self, ph: PartedHash) -> Result<Vec<KVPair>> {
-        debug_assert!(ph.is_valid());
-        self.root
-            .shared_op(ph.shard_selector(), |sh| sh.get_by_hash(ph))
-    }
-
-    pub(crate) fn get_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let ph = PartedHash::new(&self.config.hash_seed, full_key);
-        self.root
-            .shared_op(ph.shard_selector(), |sh| sh.get(ph, &full_key))
-    }
-
-    /// Gets the value of a key from the store. If the key does not exist, `None` will be returned.
-    /// The data is fully-owned, no references are returned.
-    pub fn get<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        self.owned_get(key.as_ref().to_owned())
-    }
-
-    /// Same as [Self::get] but takes an owned key
-    pub fn owned_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        self.get_raw(&self.make_user_key(key))
-    }
-
-    /// Checks whether the given key exists in the store
-    pub fn contains<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<bool> {
-        self.owned_contains(key.as_ref().to_owned())
-    }
-
-    /// Same as [Self::contains] but takes an owned key
-    pub fn owned_contains(&self, key: Vec<u8>) -> Result<bool> {
-        Ok(self.get_raw(&self.make_user_key(key))?.is_some())
-    }
-
-    pub(crate) fn remove_raw(&self, full_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let ph = PartedHash::new(&self.config.hash_seed, full_key);
-        self.root
-            .shared_op(ph.shard_selector(), |sh| sh.remove(ph, &full_key))
-    }
-
-    /// Removes a key-value pair from the store, returning `None` if the key did not exist,
-    /// or `Some(old_value)` if it did
-    pub fn remove<B: AsRef<[u8]> + ?Sized>(&self, key: &B) -> Result<Option<Vec<u8>>> {
-        self.owned_remove(key.as_ref().to_owned())
-    }
-
-    /// Same as [Self::remove] but takes an owned key
-    pub fn owned_remove(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        self.remove_raw(&self.make_user_key(key))
-    }
-
-    pub(crate) fn insert_internal(
+    fn get_or_create_ns(
         &self,
-        full_key: &[u8],
-        val: &[u8],
-        mode: InsertMode,
-    ) -> Result<InsertStatus> {
-        let ph = PartedHash::new(&self.config.hash_seed, full_key);
-
-        ensure!(
-            full_key.len() <= MAX_TOTAL_KEY_SIZE,
-            CandyError::KeyTooLong(full_key.len())
-        );
-        ensure!(
-            val.len() <= MAX_TOTAL_VALUE_SIZE,
-            CandyError::ValueTooLong(val.len())
-        );
-
-        if full_key.len() + val.len() > self.config.max_shard_size as usize {
-            return Err(anyhow!(CandyError::EntryCannotFitInShard(
-                full_key.len() + val.len(),
-                self.config.max_shard_size as usize
-            )));
-        }
-
-        self.root.insert(ph, full_key, val, mode)
-    }
-
-    pub(crate) fn set_raw(&self, full_key: &[u8], val: &[u8]) -> Result<SetStatus> {
-        match self.insert_internal(full_key, val, InsertMode::Set)? {
-            InsertStatus::Added => Ok(SetStatus::CreatedNew),
-            InsertStatus::Replaced(v) => Ok(SetStatus::PrevValue(v)),
-            InsertStatus::AlreadyExists(v) => Ok(SetStatus::PrevValue(v)),
-            InsertStatus::KeyDoesNotExist => unreachable!(),
-            InsertStatus::SplitNeeded => unreachable!(),
-        }
-    }
-
-    /// Inserts a key-value pair, creating it or replacing an existing pair. Note that if the program crashed
-    /// while or "right after" this operation, or if the operating system is unable to flush the page cache,
-    /// you may lose some data. However, you will still be in a consistent state, where you will get a previous
-    /// version of the state.
-    ///
-    /// While this method is O(1) amortized, every so often it will trigger either a shard compaction or a
-    /// shard split, which requires rewriting the whole shard. However, unlike LSM trees, this operation is
-    /// constant in size
-    pub fn set<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        key: &B1,
-        val: &B2,
-    ) -> Result<SetStatus> {
-        self.owned_set(key.as_ref().to_owned(), val.as_ref())
-    }
-
-    /// Same as [Self::set], but the key passed owned to this function
-    pub fn owned_set(&self, key: Vec<u8>, val: &[u8]) -> Result<SetStatus> {
-        Self::ensure_sizes(&key, &val)?;
-        self.set_raw(&self.make_user_key(key), val)
-    }
-
-    pub(crate) fn replace_raw(
-        &self,
-        full_key: &[u8],
-        val: &[u8],
-        expected_val: Option<&[u8]>,
-    ) -> Result<ReplaceStatus> {
-        match self.insert_internal(full_key, val, InsertMode::Replace(expected_val))? {
-            InsertStatus::Added => unreachable!(),
-            InsertStatus::Replaced(v) => Ok(ReplaceStatus::PrevValue(v)),
-            InsertStatus::AlreadyExists(v) => Ok(ReplaceStatus::WrongValue(v)),
-            InsertStatus::KeyDoesNotExist => Ok(ReplaceStatus::DoesNotExist),
-            InsertStatus::SplitNeeded => unreachable!(),
-        }
-    }
-
-    /// Replaces the value of an existing key with a new value. If the key existed, returns
-    /// `PrevValue(value)` with its old value, and if it did not, returns `DoesNotExist` but
-    /// does not create the key.
-    ///
-    /// See [Self::set] for more details
-    pub fn replace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
-        &self,
-        key: &B1,
-        val: &B2,
-        expected_val: Option<&B2>,
-    ) -> Result<ReplaceStatus> {
-        self.owned_replace(
-            key.as_ref().to_owned(),
-            val.as_ref(),
-            expected_val.map(|ev| ev.as_ref()),
-        )
-    }
-
-    /// Same as [Self::replace], but the key passed owned to this function
-    pub fn owned_replace(
-        &self,
-        key: Vec<u8>,
-        val: &[u8],
-        expected_val: Option<&[u8]>,
-    ) -> Result<ReplaceStatus> {
-        Self::ensure_sizes(&key, &val)?;
-        self.replace_raw(&self.make_user_key(key), val, expected_val)
-    }
-
-    pub(crate) fn get_or_create_raw(
-        &self,
-        full_key: &[u8],
-        default_val: Vec<u8>,
+        ns: KeyNamespace,
+        key: &[u8],
+        default_val: &[u8],
     ) -> Result<GetOrCreateStatus> {
-        match self.insert_internal(full_key, &default_val, InsertMode::GetOrCreate)? {
-            InsertStatus::Added => Ok(GetOrCreateStatus::CreatedNew(default_val)),
-            InsertStatus::AlreadyExists(v) => Ok(GetOrCreateStatus::ExistingValue(v)),
-            InsertStatus::Replaced(_) => unreachable!(),
-            InsertStatus::KeyDoesNotExist => unreachable!(),
-            InsertStatus::SplitNeeded => unreachable!(),
-        }
+        self.inner
+            ._mut_op(ns, key, default_val, |hc, mut row, key, val| {
+                let files = self.inner.data_files.read();
+                for (_, entry) in row.iter_matches(hc) {
+                    let Some(file) = files.get(&entry.file_idx()) else {
+                        continue;
+                    };
+                    self.inner.record_read(entry.size_hint() as u64);
+                    let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
+                    if kv.key() == key {
+                        return Ok(GetOrCreateStatus::ExistingValue(kv.into_value()));
+                    }
+                }
+
+                if let Some(col) = row.find_free_slot() {
+                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+                    let active_file = files
+                        .get(&active_idx)
+                        .ok_or(Error::MissingDataFile(active_idx))?;
+                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    self.inner.record_write(size as u64);
+                    row.insert(
+                        col,
+                        hc.sig,
+                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
+                    );
+                    self.record_write_stats(key.len(), val.len());
+                    Ok(GetOrCreateStatus::CreatedNew(val.to_vec()))
+                } else {
+                    Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
+                }
+            })
     }
 
-    /// Gets the value of the given key or creates it with the given default value. If the key did not exist,
-    /// returns `CreatedNew(default_val)`, and if it did, returns `ExistingValue(value)`.
-    /// This is done atomically, so it can be used to create a key only if it did not exist before,
-    /// like `open` with `O_EXCL`.
-    ///
-    /// See [Self::set] for more details
+    /// Returns the existing value for `key`, or inserts `default_val` and returns it.
     pub fn get_or_create<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
         default_val: &B2,
     ) -> Result<GetOrCreateStatus> {
-        self.owned_get_or_create(key.as_ref().to_owned(), default_val.as_ref().to_owned())
+        self.get_or_create_ns(KeyNamespace::User, key.as_ref(), default_val.as_ref())
     }
 
-    /// Same as [Self::get_or_create], but the `key` and `default_val` are passed owned to this function
-    pub fn owned_get_or_create(
+    fn track_update_waste(&self, file_idx: u16, _file_ordinal: u64, klen: usize, vlen: usize) {
+        let added_waste = aligned_data_entry_waste(klen, vlen);
+        let new_waste = self.inner.index_file.add_file_waste(file_idx, added_waste);
+        self.inner.maybe_signal_compaction_threshold_crossing(
+            file_idx,
+            new_waste.saturating_sub(added_waste),
+            new_waste,
+        );
+    }
+
+    fn record_write_stats(&self, klen: usize, vlen: usize) {
+        let entry_size = aligned_data_entry_size(klen, vlen);
+        let h = self.inner.index_file.header_ref();
+        h.written_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        h.num_created.fetch_add(1, Ordering::Relaxed);
+        self.inner.bump_histogram(entry_size);
+    }
+
+    fn record_replace_stats(
         &self,
-        key: Vec<u8>,
-        default_val: Vec<u8>,
-    ) -> Result<GetOrCreateStatus> {
-        Self::ensure_sizes(&key, &default_val)?;
-        self.get_or_create_raw(&self.make_user_key(key), default_val)
+        old_klen: usize,
+        old_vlen: usize,
+        new_klen: usize,
+        new_vlen: usize,
+    ) {
+        let old_entry_size = aligned_data_entry_size(old_klen, old_vlen);
+        let new_entry_size = aligned_data_entry_size(new_klen, new_vlen);
+        let h = self.inner.index_file.header_ref();
+        h.written_bytes.fetch_add(new_entry_size, Ordering::Relaxed);
+        h.waste_bytes.fetch_add(old_entry_size, Ordering::Relaxed);
+        h.num_replaced.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns an iterator over the whole store (skipping lists or typed items)
-    pub fn iter(&self) -> CandyStoreIterator<'_> {
-        CandyStoreIterator::new(self, false, true)
+    fn record_remove_stats(&self, klen: usize, vlen: usize) {
+        let entry_size = aligned_data_entry_size(klen, vlen);
+        let h = self.inner.index_file.header_ref();
+        h.waste_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        h.num_removed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns an iterator of keys only over the whole store (skipping lists or typed items)
-    pub fn iter_keys(&self) -> impl Iterator<Item = Result<Vec<u8>>> + use<'_> {
-        CandyStoreIterator::new(self, false, true).map(|res| match res {
-            Ok(kv) => Ok(kv.0),
-            Err(e) => Err(e),
+    fn set_ns(&self, ns: KeyNamespace, key: &[u8], val: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner._mut_op(ns, key, val, |hc, mut row, key, val| {
+            let files = self.inner.data_files.read();
+            for (col, entry) in row.iter_matches(hc) {
+                let Some(file) = files.get(&entry.file_idx()) else {
+                    continue;
+                };
+                self.inner.record_read(entry.size_hint() as u64);
+                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
+                if kv.key() == key {
+                    let klen = kv.key().len();
+                    let vlen = kv.value().len();
+                    let old_val = kv.into_value();
+                    let src_file_idx = file.file_idx;
+                    let src_file_ordinal = file.file_ordinal;
+
+                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+                    let active_file = files
+                        .get(&active_idx)
+                        .ok_or(Error::MissingDataFile(active_idx))?;
+                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    self.inner.record_write(size as u64);
+
+                    row.replace_pointer(
+                        col,
+                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
+                    );
+                    self.track_update_waste(src_file_idx, src_file_ordinal, klen, vlen);
+                    self.record_replace_stats(klen, vlen, key.len(), val.len());
+                    return Ok(Some(old_val));
+                }
+            }
+
+            if let Some(col) = row.find_free_slot() {
+                let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+                let active_file = files
+                    .get(&active_idx)
+                    .ok_or(Error::MissingDataFile(active_idx))?;
+                let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                self.inner.record_write(size as u64);
+                row.insert(
+                    col,
+                    hc.sig,
+                    EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
+                );
+                self.record_write_stats(key.len(), val.len());
+                Ok(None)
+            } else {
+                Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
+            }
         })
     }
 
-    pub fn iter_raw(&self) -> CandyStoreIterator<'_> {
-        CandyStoreIterator::new(self, true, true)
+    /// Inserts or replaces `key` with `val`.
+    pub fn set(&self, key: impl AsRef<[u8]>, val: impl AsRef<[u8]>) -> Result<crate::SetStatus> {
+        Ok(
+            match self.set_ns(KeyNamespace::User, key.as_ref(), val.as_ref())? {
+                Some(previous) => crate::SetStatus::PrevValue(previous),
+                None => crate::SetStatus::CreatedNew,
+            },
+        )
     }
 
-    /// Returns an iterator starting from the specified cookie (obtained via [CandyStoreIterator::cookie])
-    pub fn iter_from_cookie(&self, cookie: u64) -> CandyStoreIterator<'_> {
-        CandyStoreIterator::from_cookie(self, cookie, false, true)
-    }
-
-    /// Returns an iterator of keys only starting from the specified cookie (obtained via [CandyStoreIterator::cookie])
-    pub fn iter_keys_from_cookie(
+    fn replace_ns(
         &self,
-        cookie: u64,
-    ) -> impl Iterator<Item = Result<Vec<u8>>> + use<'_> {
-        CandyStoreIterator::from_cookie(self, cookie, false, true).map(|res| match res {
-            Ok(kv) => Ok(kv.0),
-            Err(e) => Err(e),
+        ns: KeyNamespace,
+        key: &[u8],
+        val: &[u8],
+        expected_val: Option<&[u8]>,
+    ) -> Result<ReplaceStatus> {
+        self.inner._mut_op(ns, key, val, |hc, mut row, key, val| {
+            let files = self.inner.data_files.read();
+            for (col, entry) in row.iter_matches(hc) {
+                let Some(file) = files.get(&entry.file_idx()) else {
+                    continue;
+                };
+                self.inner.record_read(entry.size_hint() as u64);
+                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
+                if kv.key() == key {
+                    if let Some(expected) = expected_val
+                        && kv.value() != expected
+                    {
+                        return Ok(ReplaceStatus::WrongValue(kv.into_value()));
+                    }
+
+                    let klen = kv.key().len();
+                    let vlen = kv.value().len();
+                    let old_val = kv.into_value();
+                    let src_file_idx = file.file_idx;
+                    let src_file_ordinal = file.file_ordinal;
+
+                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+                    let active_file = files
+                        .get(&active_idx)
+                        .ok_or(Error::MissingDataFile(active_idx))?;
+                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    self.inner.record_write(size as u64);
+                    row.replace_pointer(
+                        col,
+                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
+                    );
+                    self.track_update_waste(src_file_idx, src_file_ordinal, klen, vlen);
+                    self.record_replace_stats(klen, vlen, key.len(), val.len());
+                    return Ok(ReplaceStatus::PrevValue(old_val));
+                }
+            }
+            Ok(ReplaceStatus::DoesNotExist)
         })
     }
 
-    /// Returns useful stats about the store
-    pub fn stats(&self) -> Stats {
-        let shard_stats = self.root.call_on_all_shards(|sh| sh.get_stats()).unwrap();
-
-        let mut stats = Stats::default();
-        self.stats.fill_stats(&mut stats);
-
-        for stats2 in shard_stats {
-            stats.num_shards += 1;
-            stats.occupied_bytes += stats2.write_offset;
-            stats.wasted_bytes += stats2.wasted_bytes;
-            stats.num_inserts += stats2.num_inserts;
-            stats.num_removals += stats2.num_removals;
-        }
-        stats
-    }
-
-    /// Merges small shards (shards with a used capacity of less than `max_fill_level`), `max_fill_level` should
-    /// be a number between 0 and 0.5, the reasonable choice is 0.25.
-    ///
-    /// Note 1: this is an expensive operation that takes a global lock on the store (no other operations can
-    /// take place while merging is in progress). Only use it if you expect the number of items to be at half or
-    /// less than what it was (i.e., after a peak period)
-    ///
-    /// Note 2: merging will stop once we reach the number of shards required for [Config::expected_number_of_keys],
-    /// if configured
-    ///
-    /// Returns true if any shards were merged, false otherwise
-    pub fn merge_small_shards(&self, max_fill_level: f32) -> Result<bool> {
-        self.root.merge_small_shards(max_fill_level)
-    }
-
-    /// Sets a big item, whose value is unlimited in size. Behind the scenes the value is split into chunks
-    /// and stored as a list. This makes this API non-atomic, i.e., crashing while writing a big value may later
-    /// allow you to retrieve a partial result. It is up to the caller to add a length field or a checksum to make
-    /// sure the value is correct.
-    ///
-    /// Returns true if the value had existed before (thus it was replaced), false otherwise
-    pub fn set_big<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized>(
+    /// Replaces `key` with `val` only if the current value matches `expected_val` when provided.
+    pub fn replace<B1: AsRef<[u8]> + ?Sized, B2: AsRef<[u8]> + ?Sized, B3: AsRef<[u8]> + ?Sized>(
         &self,
         key: &B1,
         val: &B2,
-    ) -> Result<bool> {
-        let existed = self.discard_queue(key)?;
-        self.extend_queue(key, val.as_ref().chunks(MAX_VALUE_SIZE))?;
-        self.push_to_queue_tail(key, bytes_of(&val.as_ref().len()))?;
-        Ok(existed)
+        expected_val: Option<&B3>,
+    ) -> Result<ReplaceStatus> {
+        self.replace_ns(
+            KeyNamespace::User,
+            key.as_ref(),
+            val.as_ref(),
+            expected_val.map(|expected| expected.as_ref()),
+        )
     }
 
-    /// Returns a big item, collecting all the underlying chunks into a single value that's returned to the
-    /// caller.
-    pub fn get_big(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut val = vec![];
-        let range = self.queue_range(key)?;
-        for res in self.iter_queue(key) {
-            let (idx, chunk) = res?;
-            // last element should encode the byte length of the item - if it's missing or encodes a different length,
-            // consider it corrupt and ignore this element
-            if idx + 1 == range.end {
-                if chunk.len() == size_of::<usize>() && *from_bytes::<usize>(&chunk) == val.len() {
-                    return Ok(Some(val));
-                }
-            } else {
-                val.extend_from_slice(&chunk);
-            }
+    fn track_tombstone_waste(&self, file_idx: u16, _file_ordinal: u64, klen: usize, vlen: usize) {
+        let active_idx = self.inner.active_file_idx.load(Ordering::Relaxed);
+        if file_idx == active_idx {
+            self.inner.index_file.add_file_waste(
+                file_idx,
+                aligned_data_entry_waste(klen, vlen) + aligned_tombstone_entry_waste(klen),
+            );
+        } else {
+            let old_entry_waste = aligned_data_entry_waste(klen, vlen);
+            let new_waste = self
+                .inner
+                .index_file
+                .add_file_waste(file_idx, old_entry_waste);
+            self.inner.maybe_signal_compaction_threshold_crossing(
+                file_idx,
+                new_waste.saturating_sub(old_entry_waste),
+                new_waste,
+            );
+            self.inner
+                .index_file
+                .add_file_waste(active_idx, aligned_tombstone_entry_waste(klen));
         }
-        Ok(None)
     }
 
-    /// Removes a big item by key. Returns true if the key had existed, false otherwise.
-    /// See also [Self::set_big]
-    pub fn remove_big(&self, key: &[u8]) -> Result<bool> {
-        self.discard_queue(key)
+    fn remove_ns(&self, ns: KeyNamespace, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
+            let files = self.inner.data_files.read();
+            for (col, entry) in row.iter_matches(hc) {
+                let Some(file) = files.get(&entry.file_idx()) else {
+                    continue;
+                };
+                self.inner.record_read(entry.size_hint() as u64);
+                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
+
+                if kv.key() == key {
+                    let klen = kv.key().len();
+                    let vlen = kv.value().len();
+                    let old_val = kv.into_value();
+                    let src_file_idx = file.file_idx;
+                    let src_file_ordinal = file.file_ordinal;
+
+                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+                    let active_file = files
+                        .get(&active_idx)
+                        .ok_or(Error::MissingDataFile(active_idx))?;
+                    let tombstone_size = active_file.append_tombstone(ns, key)?;
+                    self.inner.record_write(tombstone_size as u64);
+
+                    row.remove(col);
+                    self.track_tombstone_waste(src_file_idx, src_file_ordinal, klen, vlen);
+                    self.record_remove_stats(klen, vlen);
+                    return Ok(Some(old_val));
+                }
+            }
+
+            Ok(None)
+        })
+    }
+
+    /// Removes `key` and returns its previous value if it existed.
+    pub fn remove(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        self.remove_ns(KeyNamespace::User, key.as_ref())
+    }
+
+    /// Iterates over all currently live user key/value pairs.
+    pub fn iter_items(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        let mut row_idx = 0usize;
+        let mut row_entries: Vec<EntryPointer> = Vec::with_capacity(ROW_WIDTH);
+        let mut batch_files = None::<RwLockReadGuard<'_, HashMap<u16, Arc<DataFile>>>>;
+        let mut scratch_buf = Vec::new();
+        let mut ptr_idx = 0usize;
+
+        std::iter::from_fn(move || {
+            loop {
+                if ptr_idx < row_entries.len() {
+                    let ptr = row_entries[ptr_idx];
+                    ptr_idx += 1;
+                    let files = batch_files
+                        .as_ref()
+                        .expect("row entries should only be drained with a file map guard");
+                    let Some(file) = files.get(&ptr.file_idx()) else {
+                        continue;
+                    };
+                    self.inner.record_read(ptr.size_hint() as u64);
+                    let kv = match file.read_kv_into(
+                        ptr.file_offset(),
+                        ptr.size_hint(),
+                        &mut scratch_buf,
+                    ) {
+                        Ok(kv) => kv,
+                        Err(Error::IOError(e))
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof
+                                || e.kind() == std::io::ErrorKind::InvalidData =>
+                        {
+                            continue;
+                        }
+                        Err(e) => return Some(Err(e)),
+                    };
+                    if kv.ns != KeyNamespace::User as u8 {
+                        continue;
+                    }
+                    let key = kv.key().to_vec();
+                    let value = kv.value().to_vec();
+                    return Some(Ok((key, value)));
+                }
+
+                row_entries.clear();
+                batch_files = None;
+                ptr_idx = 0;
+
+                loop {
+                    let row_table = self.inner.index_file.rows_table();
+                    let gsl = self
+                        .inner
+                        .index_file
+                        .header_ref()
+                        .global_split_level
+                        .load(Ordering::Acquire);
+                    let active_rows = 1usize << gsl;
+
+                    if row_idx >= active_rows {
+                        break;
+                    }
+
+                    let idx = row_idx;
+                    row_idx += 1;
+
+                    let row = row_table.row(idx);
+                    if row.split_level.load(Ordering::Acquire) == 0 {
+                        continue;
+                    }
+                    for col in 0..ROW_WIDTH {
+                        if row.signatures[col] != HashCoord::INVALID_SIG
+                            && row.pointers[col].is_valid()
+                        {
+                            row_entries.push(row.pointers[col]);
+                        }
+                    }
+                    batch_files = Some(self.inner.data_files.read());
+                    break;
+                }
+
+                if row_entries.is_empty() {
+                    return None;
+                }
+            }
+        })
+    }
+
+    /// Flushes index and data files to stable storage.
+    pub fn flush(&self) -> Result<()> {
+        self.inner.index_file.sync_all()?;
+        let files = self.inner.data_files.read();
+        for data_file in files.values() {
+            data_file.file.sync_all().map_err(Error::IOError)?;
+        }
+        sync_dir(&self.inner.base_path)
+    }
+
+    /// Returns whether the store was opened from a clean shutdown state.
+    pub fn was_clean_shutdown(&self) -> bool {
+        self.was_clean_shutdown
+    }
+
+    /// Returns the number of background compaction errors observed since open.
+    pub fn compaction_errors(&self) -> u64 {
+        self.inner.compaction_errors.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of currently live entries.
+    pub fn num_items(&self) -> usize {
+        self.stats().num_entries() as usize
+    }
+
+    /// Returns the current index capacity in entries.
+    pub fn capacity(&self) -> usize {
+        let row_table = self.inner.index_file.rows_table();
+        let row_count = row_table.row_guard.len() / std::mem::size_of::<RowLayout>();
+        row_count * ROW_WIDTH
+    }
+
+    /// Shrinks the index when the reclaimable row ratio is at least `min_wasted_ratio`.
+    pub fn shrink_to_fit(&self, min_wasted_ratio: f64) -> Result<usize> {
+        let _key_guards = self
+            .inner
+            .logical_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+
+        let min_wasted_ratio = min_wasted_ratio.clamp(0.0, 1.0);
+        let current_rows = self.inner.index_file.num_rows();
+        if current_rows == 0 {
+            return Ok(0);
+        }
+
+        let required_rows = self.num_items().div_ceil(ROW_WIDTH * 8 / 10).max(1);
+        let min_rows_cfg = (self.inner.config.initial_capacity / ROW_WIDTH)
+            .max(1usize << MIN_SPLIT_LEVEL)
+            .max(1);
+        let min_rows = required_rows.max(min_rows_cfg);
+
+        let reclaimable_rows = current_rows.saturating_sub(min_rows);
+        let reclaimable_ratio = reclaimable_rows as f64 / current_rows as f64;
+        if reclaimable_ratio < min_wasted_ratio {
+            return Ok(current_rows);
+        }
+
+        self.inner.index_file.shrink(min_rows_cfg)
+    }
+
+    /// Synchronous alias for [`CandyStore::shrink_to_fit`].
+    pub fn shrink_index_blocking(&self, min_wasted_ratio: f64) -> Result<usize> {
+        self.shrink_to_fit(min_wasted_ratio)
+    }
+
+    /// Returns a snapshot of store statistics and accounting counters.
+    pub fn stats(&self) -> Stats {
+        let h = self.inner.index_file.header_ref();
+        let num_rows = self.inner.index_file.num_rows() as u64;
+        let capacity = num_rows.saturating_mul(ROW_WIDTH as u64);
+        let num_items = h
+            .num_created
+            .load(Ordering::Relaxed)
+            .saturating_sub(h.num_removed.load(Ordering::Relaxed));
+        Stats {
+            num_rows,
+            capacity,
+            num_items,
+            index_size_bytes: self.inner.index_file.file_size_bytes(),
+            num_compactions: self.inner.num_compactions.load(Ordering::Relaxed),
+            compaction_time_ms: self.inner.compaction_time_ms.load(Ordering::Relaxed),
+            num_data_files: self.inner.data_files.read().len() as u64,
+            num_positive_lookups: self.inner.num_positive_lookups.load(Ordering::Relaxed),
+            num_negative_lookups: self.inner.num_negative_lookups.load(Ordering::Relaxed),
+            num_read_ops: self.inner.num_read_ops.load(Ordering::Relaxed),
+            num_read_bytes: self.inner.num_read_bytes.load(Ordering::Relaxed),
+            num_write_ops: self.inner.num_write_ops.load(Ordering::Relaxed),
+            num_write_bytes: self.inner.num_write_bytes.load(Ordering::Relaxed),
+            num_created: h.num_created.load(Ordering::Relaxed),
+            num_removed: h.num_removed.load(Ordering::Relaxed),
+            num_replaced: h.num_replaced.load(Ordering::Relaxed),
+            written_bytes: h.written_bytes.load(Ordering::Relaxed),
+            waste_bytes: h.waste_bytes.load(Ordering::Relaxed),
+            reclaimed_bytes: h.reclaimed_bytes.load(Ordering::Relaxed),
+            entries_under_64: h.size_histogram[0].load(Ordering::Relaxed),
+            entries_under_256: h.size_histogram[1].load(Ordering::Relaxed),
+            entries_under_1024: h.size_histogram[2].load(Ordering::Relaxed),
+            entries_under_4096: h.size_histogram[3].load(Ordering::Relaxed),
+            entries_under_16384: h.size_histogram[4].load(Ordering::Relaxed),
+            entries_over_16384: h.size_histogram[5].load(Ordering::Relaxed),
+        }
+    }
+
+    /// Simulates a crash by dropping the instance without performing clean shutdown operations (e.g. marking the index as clean).
+    pub fn _abort_for_testing(mut self) {
+        self.allow_clean_shutdown = false;
+        drop(self);
     }
 }
 
-// impl Drop for CandyStore {
-//     fn drop(&mut self) {
-//         _ = self.threadpool.terminate();
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_compaction_errors_reports_counter() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        assert_eq!(db.compaction_errors(), 0);
+
+        db.inner.compaction_errors.store(7, Ordering::Relaxed);
+
+        assert_eq!(db.compaction_errors(), 7);
+
+        Ok(())
+    }
+}

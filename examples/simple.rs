@@ -3,11 +3,8 @@ use core::str;
 use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("/tmp/candy-dir");
     let db = CandyStore::open("/tmp/candy-dir", Config::default())?;
-
-    // clear the DB just in case we has something there before. in real-life scenarios you would probably
-    // not clear the DB every time
-    db.clear()?;
 
     println!("{:?}", db.get("mykey")?); // None
 
@@ -20,9 +17,9 @@ fn main() -> Result<()> {
     println!("{:?}", db.get("mykey")?); // None
 
     for i in 0..10 {
-        db.set(&format!("mykey{i}"), &format!("myval{i}"))?;
+        db.set(format!("mykey{i}"), format!("myval{i}"))?;
     }
-    for res in db.iter() {
+    for res in db.iter_items() {
         let (k, v) = res?;
         println!(
             "{} = {}",

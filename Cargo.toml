@@ -1,29 +1,24 @@
 [package]
 name = "candystore"
-version = "0.5.6"
-edition = "2021"
-license = "Apache-2.0"
-keywords = ["key-value", "database", "persistent", "store", "rocksdb"]
-description = "A lean, efficient and fast peristent in-process key-value store"
-repository = "https://github.com/sweet-security/candystore"
+version = "0.6.0"
+edition = "2024"
 
 [dependencies]
-bytemuck = { version = "1.24.0", features = ["derive"] }
+crc16-ibm3740-fast = "0.5.0"
 databuf = "0.5.0"
-memmap = "0.7.0"
-siphasher = "1.0.1"
-anyhow = "1.0.100"
-parking_lot = "0.12.5"
-uuid = "1.10.0"
-rand = "0.9.2"
 fslock = "0.2.1"
-libc = "0.2.158"
-crossbeam-channel = "0.5.15"
+memmap2 = "0.9.10"
+num_cpus = "1.17.0"
+parking_lot = "0.12.5"
 simd-itertools = "0.3.0"
+siphasher = "1.0.2"
+smallvec = { version = "1.15.1", features = ["write"] }
+thiserror = "2.0.18"
+uuid = "1.18.1"
+zerocopy = { version = "0.8.47", features = ["derive"] }
 
-[features]
-whitebox_testing = []
-flush_aggregation = []
-
-[workspace]
-members = ["simulator", "candy-crasher", "candy-longliving", "candy-perf", "mini-candy"]
+[dev-dependencies]
+proptest = "1.10.0"
+tempfile = "3"
+rand = "0.10.0"
+libc = "0.2.183"

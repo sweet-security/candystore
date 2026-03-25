@@ -1,0 +1,97 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+env:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: "-D warnings"
+
+jobs:
+    fmt:
+        name: Rustfmt
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - run: rustup component add rustfmt
+            - run: cargo fmt -- --check
+
+    clippy:
+        name: Clippy
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+            - run: rustup component add clippy
+            - run: cargo clippy --all-targets -- -D warnings
+
+    test-ubuntu:
+        name: Test (Ubuntu, ${{ matrix.profile }})
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                profile: [debug, release]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: test-ubuntu-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+            - name: Run tests
+              run: |
+                  if [ "${{ matrix.profile }}" = "release" ]; then
+                    cargo test --release
+                  else
+                    cargo test
+                  fi
+            - name: Run examples
+              run: |
+                  cargo run --example simple
+                  cargo run --example multithreaded
+                  cargo run --example atomics
+                  cargo run --example lists
+                  cargo run --example typed
+                  cargo run --release --example perf
+
+    test-windows:
+        name: Test (Windows, ${{ matrix.profile }})
+        runs-on: windows-latest
+        strategy:
+            matrix:
+                profile: [debug, release]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: test-windows-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+            - name: Run tests
+              run: |
+                  if ("${{ matrix.profile }}" -eq "release") {
+                    cargo test --release
+                  } else {
+                    cargo test
+                  }
+            - name: Run examples
+              run: |
+                  cargo run --example simple
+                  cargo run --example multithreaded
+                  cargo run --example atomics
+                  cargo run --example lists
+                  cargo run --example typed
+                  cargo run --release --example perf
