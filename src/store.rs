@@ -11,11 +11,12 @@ use siphasher::sip::SipHasher13;
 use std::{
     collections::HashMap,
     hash::Hasher,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{
@@ -23,14 +24,55 @@ use crate::{
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
         HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH,
-        aligned_data_entry_size, aligned_data_entry_waste, aligned_tombstone_entry_waste, sync_dir,
+        aligned_data_entry_size, aligned_data_entry_waste, aligned_tombstone_entry_waste,
+        index_file_path, index_rows_file_path, sync_dir,
     },
-    types::{Config, Error, GetOrCreateStatus, ReplaceStatus, Result, Stats},
+    types::{
+        Config, Error, GetOrCreateStatus, INITIAL_DATA_FILE_ORDINAL, ReplaceStatus, Result, Stats,
+    },
 };
 
 #[derive(Default)]
 struct CompactionState {
     wake_requested: bool,
+}
+
+#[derive(Default)]
+struct InnerStats {
+    num_compactions: AtomicU64,
+    compaction_time_ms: AtomicU64,
+    compaction_errors: AtomicU64,
+    num_positive_lookups: AtomicU64,
+    num_negative_lookups: AtomicU64,
+    num_collisions: AtomicU64,
+    last_remap_dur_ms: AtomicU64,
+    last_compaction_dur_ms: AtomicU64,
+    last_compaction_reclaimed_bytes: AtomicU32,
+    last_compaction_moved_bytes: AtomicU32,
+    num_read_ops: AtomicU64,
+    num_read_bytes: AtomicU64,
+    num_write_ops: AtomicU64,
+    num_write_bytes: AtomicU64,
+}
+
+impl InnerStats {
+    fn reset(&self) {
+        self.num_compactions.store(0, Ordering::Relaxed);
+        self.compaction_time_ms.store(0, Ordering::Relaxed);
+        self.compaction_errors.store(0, Ordering::Relaxed);
+        self.num_positive_lookups.store(0, Ordering::Relaxed);
+        self.num_negative_lookups.store(0, Ordering::Relaxed);
+        self.num_collisions.store(0, Ordering::Relaxed);
+        self.last_remap_dur_ms.store(0, Ordering::Relaxed);
+        self.last_compaction_dur_ms.store(0, Ordering::Relaxed);
+        self.last_compaction_reclaimed_bytes
+            .store(0, Ordering::Relaxed);
+        self.last_compaction_moved_bytes.store(0, Ordering::Relaxed);
+        self.num_read_ops.store(0, Ordering::Relaxed);
+        self.num_read_bytes.store(0, Ordering::Relaxed);
+        self.num_write_ops.store(0, Ordering::Relaxed);
+        self.num_write_bytes.store(0, Ordering::Relaxed);
+    }
 }
 
 struct StoreInner {
@@ -46,24 +88,16 @@ struct StoreInner {
     compaction_state: Mutex<CompactionState>,
     compaction_condvar: Condvar,
     shutting_down: AtomicBool,
-    num_compactions: AtomicU64,
-    compaction_time_ms: AtomicU64,
-    compaction_errors: AtomicU64,
-    num_positive_lookups: AtomicU64,
-    num_negative_lookups: AtomicU64,
-    num_read_ops: AtomicU64,
-    num_read_bytes: AtomicU64,
-    num_write_ops: AtomicU64,
-    num_write_bytes: AtomicU64,
+    stats: InnerStats,
 }
 
 /// A persistent key-value store backed by append-only data files and a mutable index.
 pub struct CandyStore {
     inner: Arc<StoreInner>,
     _lockfile: fslock::LockFile,
-    compaction_thd: Option<std::thread::JoinHandle<()>>,
-    allow_clean_shutdown: bool,
-    was_clean_shutdown: bool,
+    compaction_thd: Mutex<Option<std::thread::JoinHandle<()>>>,
+    allow_clean_shutdown: AtomicBool,
+    was_clean_shutdown: AtomicBool,
 }
 
 pub use list::{KVPair, ListIterator};
@@ -104,34 +138,91 @@ impl StoreInner {
             compaction_state: Mutex::new(CompactionState::default()),
             compaction_condvar: Condvar::new(),
             shutting_down: AtomicBool::new(false),
-            num_compactions: AtomicU64::new(0),
-            compaction_time_ms: AtomicU64::new(0),
-            compaction_errors: AtomicU64::new(0),
-            num_positive_lookups: AtomicU64::new(0),
-            num_negative_lookups: AtomicU64::new(0),
-            num_read_ops: AtomicU64::new(0),
-            num_read_bytes: AtomicU64::new(0),
-            num_write_ops: AtomicU64::new(0),
-            num_write_bytes: AtomicU64::new(0),
+            stats: InnerStats::default(),
         }
+    }
+
+    fn reset(&self) -> Result<()> {
+        let _rotation_lock = self.rotation_lock.lock();
+        let _logical_guards = self
+            .logical_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+        let row_table = self.index_file.rows_table_mut();
+        let mut data_files = self.data_files.write();
+
+        data_files.clear();
+        self.index_file.reset(row_table)?;
+
+        let index_path = index_file_path(self.base_path.as_path());
+        let rows_path = index_rows_file_path(self.base_path.as_path());
+        let mut removed_any = false;
+        for entry in std::fs::read_dir(&self.base_path).map_err(Error::IOError)? {
+            let entry = entry.map_err(Error::IOError)?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(".lockfile")
+                || path == index_path
+                || path == rows_path
+            {
+                continue;
+            }
+
+            let file_type = entry.file_type().map_err(Error::IOError)?;
+            if file_type.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(Error::IOError)?;
+                removed_any = true;
+            } else if file_type.is_file() || file_type.is_symlink() {
+                std::fs::remove_file(&path).map_err(Error::IOError)?;
+                removed_any = true;
+            }
+        }
+        if removed_any {
+            sync_dir(self.base_path.as_path())?;
+        }
+
+        let active_file_idx = 0;
+        let active_file_ordinal = INITIAL_DATA_FILE_ORDINAL;
+        let data_file = Arc::new(DataFile::create(
+            self.base_path.as_path(),
+            self.config.clone(),
+            active_file_idx,
+            active_file_ordinal,
+        )?);
+        data_files.insert(active_file_idx, data_file);
+        self.active_file_idx
+            .store(active_file_idx, Ordering::Release);
+        self.active_file_ordinal
+            .store(active_file_ordinal, Ordering::Release);
+        self.stats.reset();
+
+        Ok(())
     }
 
     fn record_lookup(&self, found: bool) {
         if found {
-            self.num_positive_lookups.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .num_positive_lookups
+                .fetch_add(1, Ordering::Relaxed);
         } else {
-            self.num_negative_lookups.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .num_negative_lookups
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
     fn record_read(&self, bytes: u64) {
-        self.num_read_ops.fetch_add(1, Ordering::Relaxed);
-        self.num_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.stats.num_read_ops.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .num_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn record_write(&self, bytes: u64) {
-        self.num_write_ops.fetch_add(1, Ordering::Relaxed);
-        self.num_write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.stats.num_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .num_write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn signal_compaction_scan(&self) {
@@ -202,8 +293,13 @@ impl StoreInner {
         let low_row_idx = hc.row_index(sl);
         let high_row_idx = low_row_idx | (1 << sl);
 
-        if nsl > gsl {
-            self.index_file.grow(nsl)?;
+        if nsl > gsl
+            && let Some(remap_dur) = self.index_file.grow(nsl)?
+        {
+            self.stats.last_remap_dur_ms.store(
+                u64::try_from(remap_dur.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
 
         let rows_table = self.index_file.rows_table();
@@ -376,6 +472,10 @@ impl StoreInner {
 }
 
 impl CandyStore {
+    pub fn get_db_path(&self) -> &Path {
+        &self.inner.base_path
+    }
+
     fn logical_read_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockReadGuard<'_, ()> {
         self.inner.logical_locks[self.inner.logical_lock_index(ns, key)].read()
     }
@@ -436,6 +536,11 @@ impl CandyStore {
                 };
                 if kv.key() == key {
                     return Ok(Some(kv.value().to_vec()));
+                } else {
+                    self.inner
+                        .stats
+                        .num_collisions
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
             Ok(None)
@@ -573,6 +678,11 @@ impl CandyStore {
                     self.track_update_waste(src_file_idx, src_file_ordinal, klen, vlen);
                     self.record_replace_stats(klen, vlen, key.len(), val.len());
                     return Ok(Some(old_val));
+                } else {
+                    self.inner
+                        .stats
+                        .num_collisions
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -829,12 +939,12 @@ impl CandyStore {
 
     /// Returns whether the store was opened from a clean shutdown state.
     pub fn was_clean_shutdown(&self) -> bool {
-        self.was_clean_shutdown
+        self.was_clean_shutdown.load(Ordering::Relaxed)
     }
 
     /// Returns the number of background compaction errors observed since open.
     pub fn compaction_errors(&self) -> u64 {
-        self.inner.compaction_errors.load(Ordering::Relaxed)
+        self.inner.stats.compaction_errors.load(Ordering::Relaxed)
     }
 
     /// Returns the number of currently live entries.
@@ -850,7 +960,7 @@ impl CandyStore {
     }
 
     /// Shrinks the index when the reclaimable row ratio is at least `min_wasted_ratio`.
-    pub fn shrink_to_fit(&self, min_wasted_ratio: f64) -> Result<usize> {
+    pub fn shrink_to_fit_blocking(&self, min_wasted_ratio: f64) -> Result<usize> {
         let _key_guards = self
             .inner
             .logical_locks
@@ -879,11 +989,6 @@ impl CandyStore {
         self.inner.index_file.shrink(min_rows_cfg)
     }
 
-    /// Synchronous alias for [`CandyStore::shrink_to_fit`].
-    pub fn shrink_index_blocking(&self, min_wasted_ratio: f64) -> Result<usize> {
-        self.shrink_to_fit(min_wasted_ratio)
-    }
-
     /// Returns a snapshot of store statistics and accounting counters.
     pub fn stats(&self) -> Stats {
         let h = self.inner.index_file.header_ref();
@@ -898,15 +1003,43 @@ impl CandyStore {
             capacity,
             num_items,
             index_size_bytes: self.inner.index_file.file_size_bytes(),
-            num_compactions: self.inner.num_compactions.load(Ordering::Relaxed),
-            compaction_time_ms: self.inner.compaction_time_ms.load(Ordering::Relaxed),
+            num_compactions: self.inner.stats.num_compactions.load(Ordering::Relaxed),
+            compaction_time_ms: self.inner.stats.compaction_time_ms.load(Ordering::Relaxed),
             num_data_files: self.inner.data_files.read().len() as u64,
-            num_positive_lookups: self.inner.num_positive_lookups.load(Ordering::Relaxed),
-            num_negative_lookups: self.inner.num_negative_lookups.load(Ordering::Relaxed),
-            num_read_ops: self.inner.num_read_ops.load(Ordering::Relaxed),
-            num_read_bytes: self.inner.num_read_bytes.load(Ordering::Relaxed),
-            num_write_ops: self.inner.num_write_ops.load(Ordering::Relaxed),
-            num_write_bytes: self.inner.num_write_bytes.load(Ordering::Relaxed),
+            num_positive_lookups: self
+                .inner
+                .stats
+                .num_positive_lookups
+                .load(Ordering::Relaxed),
+            num_negative_lookups: self
+                .inner
+                .stats
+                .num_negative_lookups
+                .load(Ordering::Relaxed),
+            num_collisions: self.inner.stats.num_collisions.load(Ordering::Relaxed),
+            last_remap_dur: Duration::from_millis(
+                self.inner.stats.last_remap_dur_ms.load(Ordering::Relaxed),
+            ),
+            last_compaction_dur: Duration::from_millis(
+                self.inner
+                    .stats
+                    .last_compaction_dur_ms
+                    .load(Ordering::Relaxed),
+            ),
+            last_compaction_reclaimed_bytes: self
+                .inner
+                .stats
+                .last_compaction_reclaimed_bytes
+                .load(Ordering::Relaxed),
+            last_compaction_moved_bytes: self
+                .inner
+                .stats
+                .last_compaction_moved_bytes
+                .load(Ordering::Relaxed),
+            num_read_ops: self.inner.stats.num_read_ops.load(Ordering::Relaxed),
+            num_read_bytes: self.inner.stats.num_read_bytes.load(Ordering::Relaxed),
+            num_write_ops: self.inner.stats.num_write_ops.load(Ordering::Relaxed),
+            num_write_bytes: self.inner.stats.num_write_bytes.load(Ordering::Relaxed),
             num_created: h.num_created.load(Ordering::Relaxed),
             num_removed: h.num_removed.load(Ordering::Relaxed),
             num_replaced: h.num_replaced.load(Ordering::Relaxed),
@@ -923,8 +1056,8 @@ impl CandyStore {
     }
 
     /// Simulates a crash by dropping the instance without performing clean shutdown operations (e.g. marking the index as clean).
-    pub fn _abort_for_testing(mut self) {
-        self.allow_clean_shutdown = false;
+    pub fn _abort_for_testing(self) {
+        self.allow_clean_shutdown.store(false, Ordering::Relaxed);
         drop(self);
     }
 }
@@ -942,9 +1075,62 @@ mod tests {
 
         assert_eq!(db.compaction_errors(), 0);
 
-        db.inner.compaction_errors.store(7, Ordering::Relaxed);
+        db.inner.stats.compaction_errors.store(7, Ordering::Relaxed);
 
         assert_eq!(db.compaction_errors(), 7);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stats_reports_transient_collision_counter() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.inner.stats.num_collisions.store(11, Ordering::Relaxed);
+
+        assert_eq!(db.stats().num_collisions, 11);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stats_reports_last_remap_duration() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.inner
+            .stats
+            .last_remap_dur_ms
+            .store(17, Ordering::Relaxed);
+
+        assert_eq!(db.stats().last_remap_dur, Duration::from_millis(17));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stats_reports_last_compaction_stats() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.inner
+            .stats
+            .last_compaction_dur_ms
+            .store(23, Ordering::Relaxed);
+        db.inner
+            .stats
+            .last_compaction_reclaimed_bytes
+            .store(1234, Ordering::Relaxed);
+        db.inner
+            .stats
+            .last_compaction_moved_bytes
+            .store(5678, Ordering::Relaxed);
+
+        let stats = db.stats();
+        assert_eq!(stats.last_compaction_dur, Duration::from_millis(23));
+        assert_eq!(stats.last_compaction_reclaimed_bytes, 1234);
+        assert_eq!(stats.last_compaction_moved_bytes, 5678);
 
         Ok(())
     }

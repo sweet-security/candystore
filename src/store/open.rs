@@ -7,7 +7,9 @@ use std::{
 use crate::{
     data_file::DataFile,
     index_file::IndexFile,
-    internal::{MAX_REPRESENTABLE_FILE_SIZE, is_resettable_open_error, parse_data_file_idx},
+    internal::{
+        MAX_REPRESENTABLE_FILE_SIZE, is_resettable_open_error, parse_data_file_idx, sync_dir,
+    },
     types::{Config, Error, INITIAL_DATA_FILE_ORDINAL, RebuildStrategy, Result},
 };
 
@@ -15,7 +17,27 @@ use super::{CandyStore, DirtyOpenAction, OpenState, StoreInner};
 
 impl CandyStore {
     fn clear_db_files(base_path: &Path) -> Result<()> {
-        Self::clear_directory_contents(base_path)
+        let mut removed_any = false;
+        for entry in std::fs::read_dir(base_path).map_err(Error::IOError)? {
+            let entry = entry.map_err(Error::IOError)?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(".lockfile") {
+                continue;
+            }
+
+            let file_type = entry.file_type().map_err(Error::IOError)?;
+            if file_type.is_dir() {
+                std::fs::remove_dir_all(&path).map_err(Error::IOError)?;
+                removed_any = true;
+            } else if file_type.is_file() || file_type.is_symlink() {
+                std::fs::remove_file(&path).map_err(Error::IOError)?;
+                removed_any = true;
+            }
+        }
+        if removed_any {
+            sync_dir(base_path)?;
+        }
+        Ok(())
     }
 
     fn open_state(base_path: &Path, config: Arc<Config>) -> Result<OpenState> {
@@ -153,6 +175,17 @@ impl CandyStore {
                     Err(err) => return Err(err),
                 }
             }
+            RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrReset => {
+                match state.index_file.verify_row_checksums() {
+                    Ok(()) => DirtyOpenAction::TrustIndex,
+                    Err(Error::IOError(io_err))
+                        if io_err.kind() == std::io::ErrorKind::InvalidData =>
+                    {
+                        DirtyOpenAction::ResetDb
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         };
 
         if matches!(action, DirtyOpenAction::ResetDb) {
@@ -169,10 +202,10 @@ impl CandyStore {
     /// Opens a store at `path`, creating it if needed.
     ///
     /// If `config.reset_on_invalid_data` is enabled, or if
-    /// `config.rebuild_strategy` is `ResetDBIfDirty`, opening may reset the
-    /// database directory by removing all contents and recreating fresh store
-    /// files. While the store is open, the active `.lockfile` is preserved so
-    /// the directory remains locked against concurrent opens.
+    /// `config.rebuild_strategy` can reset the database during dirty recovery,
+    /// opening may remove all contents and recreate fresh store files. While
+    /// the store is open, the active `.lockfile` is preserved so the directory
+    /// remains locked against concurrent opens.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path).map_err(Error::IOError)?;
@@ -186,7 +219,7 @@ impl CandyStore {
         let was_clean_shutdown = state.was_clean_shutdown;
         let num_logical_locks = config.max_concurrency.max(8).next_power_of_two();
 
-        let mut store = Self {
+        let store = Self {
             inner: Arc::new(StoreInner::new(
                 base_path,
                 config.clone(),
@@ -194,9 +227,9 @@ impl CandyStore {
                 num_logical_locks,
             )),
             _lockfile: lockfile,
-            compaction_thd: None,
-            allow_clean_shutdown: was_clean_shutdown,
-            was_clean_shutdown,
+            compaction_thd: parking_lot::Mutex::new(None),
+            allow_clean_shutdown: std::sync::atomic::AtomicBool::new(was_clean_shutdown),
+            was_clean_shutdown: std::sync::atomic::AtomicBool::new(was_clean_shutdown),
         };
 
         if !was_clean_shutdown {
@@ -204,7 +237,9 @@ impl CandyStore {
                 DirtyOpenAction::None | DirtyOpenAction::ResetDb | DirtyOpenAction::TrustIndex => {}
                 DirtyOpenAction::RebuildIndex => store.recover_index()?,
             }
-            store.allow_clean_shutdown = true;
+            store
+                .allow_clean_shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         store.start_compaction();
@@ -218,21 +253,17 @@ impl CandyStore {
     /// subdirectories, before recreating the store files. While the store is
     /// open, the active `.lockfile` is preserved so the directory remains
     /// locked against concurrent opens.
-    pub fn clear(&mut self) -> Result<()> {
-        let base_path = self.inner.base_path.clone();
-        let config = self.inner.config.clone();
-        let num_logical_locks = self.inner.logical_locks.len();
-
+    pub fn clear(&self) -> Result<()> {
+        // stop bg thread
         self.stop_compaction();
 
-        self.inner.data_files.write().clear();
-        Self::clear_db_files(base_path.as_path())?;
+        // now we're single-threaded. take all locks and clear state
+        self.inner.reset()?;
 
-        let state = Self::open_state(base_path.as_path(), config.clone())?;
-        self.inner = Arc::new(StoreInner::new(base_path, config, state, num_logical_locks));
-
-        self.allow_clean_shutdown = true;
-        self.was_clean_shutdown = true;
+        self.allow_clean_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.was_clean_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.start_compaction();
 
         Ok(())

@@ -12,6 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::internal::{
@@ -592,15 +593,17 @@ impl IndexFile {
         self.full_header_ref().waste_levels[file_idx as usize].swap(0, Ordering::Relaxed)
     }
 
-    pub(crate) fn grow(&self, nsl: u64) -> Result<()> {
+    pub(crate) fn grow(&self, nsl: u64) -> Result<Option<Duration>> {
         let mut layout_mut = self.rows_table_mut();
         let gsl = self.header_ref().global_split_level.load(Ordering::Acquire);
         if nsl <= gsl {
-            return Ok(());
+            return Ok(None);
         }
 
+        let mut remap_dur = None;
         let required_rows_size = (1usize << nsl) * size_of::<RowLayout>();
         if layout_mut.row_guard.len() < required_rows_size {
+            let remap_start = Instant::now();
             let alloc_split = nsl + self.config.remap_scaler as u64;
             let new_rows_size = (1usize << alloc_split) * size_of::<RowLayout>();
 
@@ -627,12 +630,13 @@ impl IndexFile {
             }
 
             Self::maybe_lock_mmap(self.config.as_ref(), &layout_mut.row_guard);
+            remap_dur = Some(remap_start.elapsed());
         }
 
         self.header_ref()
             .global_split_level
             .store(nsl, Ordering::Release);
-        Ok(())
+        Ok(remap_dur)
     }
 
     pub(crate) fn num_rows(&self) -> usize {
@@ -814,9 +818,8 @@ impl IndexFile {
         Ok(())
     }
 
-    pub(crate) fn reset(&self) -> Result<()> {
+    pub(crate) fn reset(&self, mut row_table: RowsTableWriteGuard<'_>) -> Result<()> {
         let min_rows_size = MIN_INITIAL_ROWS * size_of::<RowLayout>();
-        let mut row_table = self.rows_table_mut();
 
         #[cfg(target_os = "linux")]
         unsafe {

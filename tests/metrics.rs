@@ -1,4 +1,5 @@
 use candystore::{CandyStore, Config};
+use std::time::Duration;
 
 const ROW_WIDTH: u64 = (16 * 21) as u64;
 
@@ -19,6 +20,11 @@ fn test_metrics_updates() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.fill_level(), 0.0);
     assert_eq!(stats.num_positive_lookups, 0);
     assert_eq!(stats.num_negative_lookups, 0);
+    assert_eq!(stats.num_collisions, 0);
+    assert_eq!(stats.last_remap_dur, Duration::ZERO);
+    assert_eq!(stats.last_compaction_dur, Duration::ZERO);
+    assert_eq!(stats.last_compaction_reclaimed_bytes, 0);
+    assert_eq!(stats.last_compaction_moved_bytes, 0);
     assert_eq!(stats.num_read_ops, 0);
     assert_eq!(stats.num_read_bytes, 0);
     assert_eq!(stats.num_write_ops, 0);

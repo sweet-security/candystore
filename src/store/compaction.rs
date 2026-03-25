@@ -1,7 +1,4 @@
-use std::{
-    path::Path,
-    sync::{Arc, atomic::Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
     index_file::EntryPointer,
@@ -12,6 +9,11 @@ use crate::{
 
 use super::{CandyStore, StoreInner};
 
+pub(super) struct CompactionOutcome {
+    pub(super) reclaimed_bytes: u32,
+    pub(super) moved_bytes: u32,
+}
+
 impl StoreInner {
     pub(super) fn compact_file(
         &self,
@@ -19,28 +21,43 @@ impl StoreInner {
         expected_ordinal: u64,
         pacer: &mut Pacer,
         #[cfg(windows)] pending_deletions: &mut Vec<std::path::PathBuf>,
-    ) -> Result<()> {
+    ) -> Result<CompactionOutcome> {
         if self.active_file_idx.load(Ordering::Acquire) == file_idx {
-            return Ok(());
+            return Ok(CompactionOutcome {
+                reclaimed_bytes: 0,
+                moved_bytes: 0,
+            });
         }
 
         let source_file = match self.data_file(file_idx) {
             Ok(f) => f,
-            Err(Error::MissingDataFile(_)) => return Ok(()),
+            Err(Error::MissingDataFile(_)) => {
+                return Ok(CompactionOutcome {
+                    reclaimed_bytes: 0,
+                    moved_bytes: 0,
+                });
+            }
             Err(e) => return Err(e),
         };
         if source_file.file_ordinal != expected_ordinal {
-            return Ok(());
+            return Ok(CompactionOutcome {
+                reclaimed_bytes: 0,
+                moved_bytes: 0,
+            });
         }
 
         let mut offset = 0u64;
+        let mut moved_bytes = 0u64;
         let mut read_buf = Vec::new();
         let mut buf_file_offset = 0u64;
         let mut match_scratch = Vec::new();
 
         loop {
             if self.shutting_down.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(CompactionOutcome {
+                    reclaimed_bytes: 0,
+                    moved_bytes: 0,
+                });
             }
 
             let Some((kv, entry_offset, next_offset)) =
@@ -84,6 +101,7 @@ impl StoreInner {
                                 .ok_or(Error::MissingDataFile(active_idx))?;
                             let (file_off, size) = active_file.append_kv(ns, key, val)?;
                             self.record_write(size as u64);
+                            moved_bytes = moved_bytes.saturating_add(size as u64);
                             row.replace_pointer(
                                 col,
                                 EntryPointer::new(
@@ -120,45 +138,24 @@ impl StoreInner {
             #[cfg(not(windows))]
             Err(err) => return Err(Error::IOError(err)),
         }
-        Ok(())
+        Ok(CompactionOutcome {
+            reclaimed_bytes: reclaimed,
+            moved_bytes: moved_bytes.min(u64::from(u32::MAX)) as u32,
+        })
     }
 }
 
 impl CandyStore {
-    pub(super) fn stop_compaction(&mut self) {
+    pub(super) fn stop_compaction(&self) {
         self.inner.shutting_down.store(true, Ordering::Release);
         {
             let mut state = self.inner.compaction_state.lock();
             state.wake_requested = true;
             self.inner.compaction_condvar.notify_all();
         }
-        if let Some(thd) = self.compaction_thd.take() {
+        if let Some(thd) = self.compaction_thd.lock().take() {
             let _ = thd.join();
         }
-    }
-
-    pub(super) fn clear_directory_contents(base_path: &Path) -> Result<()> {
-        let mut removed_any = false;
-        for entry in std::fs::read_dir(base_path).map_err(Error::IOError)? {
-            let entry = entry.map_err(Error::IOError)?;
-            let path = entry.path();
-            if path.file_name().and_then(|name| name.to_str()) == Some(".lockfile") {
-                continue;
-            }
-
-            let file_type = entry.file_type().map_err(Error::IOError)?;
-            if file_type.is_dir() {
-                std::fs::remove_dir_all(&path).map_err(Error::IOError)?;
-                removed_any = true;
-            } else if file_type.is_file() || file_type.is_symlink() {
-                std::fs::remove_file(&path).map_err(Error::IOError)?;
-                removed_any = true;
-            }
-        }
-        if removed_any {
-            sync_dir(base_path)?;
-        }
-        Ok(())
     }
 
     #[cfg(windows)]
@@ -170,7 +167,13 @@ impl CandyStore {
         }
     }
 
-    pub(super) fn start_compaction(&mut self) {
+    pub(super) fn start_compaction(&self) {
+        let mut compaction_thd = self.compaction_thd.lock();
+        if compaction_thd.is_some() {
+            return;
+        }
+
+        self.inner.shutting_down.store(false, Ordering::Release);
         let ctx = Arc::clone(&self.inner);
         let thd = std::thread::spawn(move || {
             let throughput_bytes_per_sec =
@@ -212,14 +215,26 @@ impl CandyStore {
                         #[cfg(windows)]
                         &mut pending_deletions,
                     );
-                    ctx.compaction_time_ms
-                        .fetch_add(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    let compaction_millis =
+                        u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    ctx.stats
+                        .compaction_time_ms
+                        .fetch_add(compaction_millis, Ordering::Relaxed);
                     match res {
-                        Ok(()) => {
-                            ctx.num_compactions.fetch_add(1, Ordering::Relaxed);
+                        Ok(outcome) => {
+                            ctx.stats.num_compactions.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats
+                                .last_compaction_dur_ms
+                                .store(compaction_millis, Ordering::Relaxed);
+                            ctx.stats
+                                .last_compaction_reclaimed_bytes
+                                .store(outcome.reclaimed_bytes, Ordering::Relaxed);
+                            ctx.stats
+                                .last_compaction_moved_bytes
+                                .store(outcome.moved_bytes, Ordering::Relaxed);
                         }
                         Err(_e) => {
-                            ctx.compaction_errors.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats.compaction_errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -228,7 +243,7 @@ impl CandyStore {
             }
         });
 
-        self.compaction_thd = Some(thd);
+        *compaction_thd = Some(thd);
         self.inner.signal_compaction_scan();
     }
 }
@@ -237,7 +252,7 @@ impl Drop for CandyStore {
     fn drop(&mut self) {
         self.stop_compaction();
 
-        if !self.allow_clean_shutdown {
+        if !self.allow_clean_shutdown.load(Ordering::Relaxed) {
             return;
         }
         let data_files_synced = self

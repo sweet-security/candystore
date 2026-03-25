@@ -9,6 +9,7 @@ pub(crate) const ROW_WIDTH: usize = crate::internal::ROW_WIDTH;
 pub(crate) const INITIAL_DATA_FILE_ORDINAL: u64 = 0x00bd_38a0_2a35_1cdf;
 
 use crate::internal::MIN_INITIAL_ROWS;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 /// How opening a store should handle a dirty index.
@@ -27,6 +28,8 @@ pub enum RebuildStrategy {
     TrustDirtyIndexIfChecksumCorrectOrFail,
     /// Trust a dirty index if row checksums match; otherwise rebuild.
     TrustDirtyIndexIfChecksumCorrectOrRebuild,
+    /// Trust a dirty index if row checksums match; otherwise reset the database.
+    TrustDirtyIndexIfChecksumCorrectOrReset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -231,6 +234,16 @@ pub struct Stats {
     pub num_positive_lookups: u64,
     /// Number of failed key lookups.
     pub num_negative_lookups: u64,
+    /// Number of probes that had to inspect a second matching index entry.
+    pub num_collisions: u64,
+    /// Time spent in the most recent grow remap operation.
+    pub last_remap_dur: Duration,
+    /// Time spent in the most recent successful file compaction.
+    pub last_compaction_dur: Duration,
+    /// Bytes reclaimed by the most recent successful file compaction.
+    pub last_compaction_reclaimed_bytes: u32,
+    /// Bytes rewritten by the most recent successful file compaction.
+    pub last_compaction_moved_bytes: u32,
     /// Number of read operations performed against data files.
     pub num_read_ops: u64,
     /// Total bytes read from data files.

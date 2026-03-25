@@ -109,6 +109,7 @@ If the store is reopened while dirty, behavior depends on `Config::rebuild_strat
 - `ResetDBIfDirty`: clear the directory and recreate an empty store
 - `TrustDirtyIndexIfChecksumCorrectOrFail`: accept the dirty index only if row checksums match
 - `TrustDirtyIndexIfChecksumCorrectOrRebuild`: trust valid checksums, otherwise rebuild
+- `TrustDirtyIndexIfChecksumCorrectOrReset`: trust valid checksums, otherwise reset the database
 
 ## Operational Notes
 

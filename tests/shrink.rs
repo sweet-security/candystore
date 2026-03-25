@@ -26,7 +26,7 @@ fn test_shrink_to_fit_preserves_remaining_keys() -> Result<()> {
         store.remove(key.as_bytes())?;
     }
 
-    let shrunk_rows = store.shrink_to_fit(0.2)?;
+    let shrunk_rows = store.shrink_to_fit_blocking(0.2)?;
     assert!(shrunk_rows > 0);
     assert!(store.capacity() <= before);
 
