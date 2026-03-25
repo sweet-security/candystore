@@ -2,12 +2,15 @@ name: CI
 
 on:
     push:
-        branches: [main]
     pull_request:
-        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
 
 env:
     CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: "1"
     RUSTFLAGS: "-D warnings"
 
 jobs:
@@ -15,7 +18,12 @@ jobs:
         name: Rustfmt
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v6
+            - name: Print runner info
+              run: |
+                  echo "cores: $(nproc)"
+                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
             - run: rustup component add rustfmt
             - run: cargo fmt -- --check
 
@@ -23,8 +31,13 @@ jobs:
         name: Clippy
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
-            - uses: actions/cache@v4
+            - uses: actions/checkout@v6
+            - name: Print runner info
+              run: |
+                  echo "cores: $(nproc)"
+                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
+            - uses: actions/cache@v5
               with:
                   path: |
                       ~/.cargo/registry
@@ -41,8 +54,13 @@ jobs:
             matrix:
                 profile: [debug, release]
         steps:
-            - uses: actions/checkout@v4
-            - uses: actions/cache@v4
+            - uses: actions/checkout@v6
+            - name: Print runner info
+              run: |
+                  echo "cores: $(nproc)"
+                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
+            - uses: actions/cache@v5
               with:
                   path: |
                       ~/.cargo/registry
@@ -52,9 +70,9 @@ jobs:
             - name: Run tests
               run: |
                   if [ "${{ matrix.profile }}" = "release" ]; then
-                    cargo test --release
+                    cargo test --release -- --test-threads=1
                   else
-                    cargo test
+                    cargo test -- --test-threads=1
                   fi
             - name: Run examples
               run: |
@@ -63,7 +81,8 @@ jobs:
                   cargo run --example atomics
                   cargo run --example lists
                   cargo run --example typed
-                  cargo run --release --example perf
+            - name: Run perf
+              run: cargo run --release --example perf
 
     test-windows:
         name: Test (Windows, ${{ matrix.profile }})
@@ -72,8 +91,16 @@ jobs:
             matrix:
                 profile: [debug, release]
         steps:
-            - uses: actions/checkout@v4
-            - uses: actions/cache@v4
+            - uses: actions/checkout@v6
+            - name: Print runner info
+              shell: pwsh
+              run: |
+                  $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+                  $computer = Get-CimInstance Win32_ComputerSystem
+                  Write-Host "cores: $($cpu.NumberOfCores)"
+                  Write-Host "cpu model: $($cpu.Name.Trim())"
+                  Write-Host "ram: $([math]::Round($computer.TotalPhysicalMemory / 1GB, 2)) GB"
+            - uses: actions/cache@v5
               with:
                   path: |
                       ~/.cargo/registry
@@ -83,9 +110,9 @@ jobs:
             - name: Run tests
               run: |
                   if ("${{ matrix.profile }}" -eq "release") {
-                    cargo test --release
+                    cargo test --release -- --test-threads=1
                   } else {
-                    cargo test
+                    cargo test -- --test-threads=1
                   }
             - name: Run examples
               run: |
@@ -94,4 +121,5 @@ jobs:
                   cargo run --example atomics
                   cargo run --example lists
                   cargo run --example typed
-                  cargo run --release --example perf
+            - name: Run perf
+              run: cargo run --release --example perf

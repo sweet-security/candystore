@@ -149,25 +149,33 @@ fn test_background_compaction_after_reopen_without_writes() -> Result<(), Error>
 fn test_background_compaction_drains_large_backlog() -> Result<(), Error> {
     let dir = tempdir().unwrap();
 
-    let config = Config {
-        max_data_file_size: 256,
-        compaction_min_threshold: 128,
+    let write_config = Config {
+        // Keep one value per file while leaving each stale file below the setup-time
+        // compaction threshold so backlog creation does not race the background worker.
+        max_data_file_size: 200,
+        compaction_min_threshold: 160,
         ..Config::default()
     };
 
-    {
-        let db = CandyStore::open(dir.path(), config)?;
+    let compact_config = Config {
+        max_data_file_size: write_config.max_data_file_size,
+        compaction_min_threshold: 64,
+        ..Config::default()
+    };
 
-        for i in 0..180 {
+    const NUM_KEYS: usize = 64;
+
+    {
+        let db = CandyStore::open(dir.path(), write_config)?;
+
+        for i in 0..NUM_KEYS {
             db.set(format!("key{i:04}"), vec![b'a'; 96])?;
         }
 
-        for i in 0..180 {
+        for i in 0..NUM_KEYS {
             assert_eq!(db.remove(format!("key{i:04}"))?, Some(vec![b'a'; 96]));
         }
     }
-
-    let db = CandyStore::open(dir.path(), config)?;
 
     let count_data_files = || -> usize {
         std::fs::read_dir(dir.path())
@@ -181,26 +189,36 @@ fn test_background_compaction_drains_large_backlog() -> Result<(), Error> {
             .count()
     };
 
+    let setup_files = count_data_files();
+    assert!(
+        setup_files >= NUM_KEYS,
+        "expected backlog setup to create many stale files: {setup_files}"
+    );
+
+    let db = CandyStore::open(dir.path(), compact_config)?;
+
     let files_before = count_data_files();
     assert!(
-        files_before > 17,
-        "expected a large stale-file backlog before compaction starts: {files_before}"
+        files_before >= setup_files.saturating_sub(2),
+        "expected reopen to begin with nearly the full stale-file backlog: setup={setup_files}, before={files_before}"
     );
+
+    let min_expected_drained = (setup_files / 2).max(8);
 
     for _ in 0..300 {
         std::thread::sleep(std::time::Duration::from_millis(10));
-        if count_data_files() <= files_before.saturating_sub(17) {
+        if count_data_files() + min_expected_drained <= files_before {
             break;
         }
     }
 
     let files_after = count_data_files();
     assert!(
-        files_after <= files_before.saturating_sub(17),
-        "compaction worker should drain a large backlog after being woken: before={files_before}, after={files_after}"
+        files_after + min_expected_drained <= files_before,
+        "compaction worker should drain a large backlog after being woken: before={files_before}, after={files_after}, expected_drain={min_expected_drained}"
     );
 
-    for i in 0..180 {
+    for i in 0..NUM_KEYS {
         assert_eq!(
             db.get(format!("key{i:04}"))?,
             None,
