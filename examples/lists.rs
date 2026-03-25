@@ -1,11 +1,8 @@
 use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("/tmp/candy-dir");
     let db = CandyStore::open("/tmp/candy-dir", Config::default())?;
-
-    // clear the DB just in case we has something there before. in real-life scenarios you would probably
-    // not clear the DB every time
-    db.clear()?;
 
     db.set_in_list("asia", "iraq", "arabic")?;
     db.set_in_list("asia", "china", "chinese")?;

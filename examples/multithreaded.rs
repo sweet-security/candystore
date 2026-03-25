@@ -4,17 +4,14 @@ use std::{sync::Arc, time::Duration};
 use candystore::{CandyStore, Config, Result};
 
 fn main() -> Result<()> {
+    _ = std::fs::remove_dir_all("/tmp/candy-dir");
     let db = Arc::new(CandyStore::open("/tmp/candy-dir-mt", Config::default())?);
-
-    // clear the DB just in case we has something there before. in real-life scenarios you would probably
-    // not clear the DB every time
-    db.clear()?;
 
     // clone db and spawn thread 1
     let db1 = db.clone();
     let h1 = std::thread::spawn(move || -> Result<()> {
         for i in 0..100 {
-            db1.set(&format!("key{i}"), "thread 1")?;
+            db1.set(format!("key{i}"), "thread 1")?;
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -24,7 +21,7 @@ fn main() -> Result<()> {
     let db2 = db.clone();
     let h2 = std::thread::spawn(move || -> Result<()> {
         for i in 0..100 {
-            db2.set(&format!("key{i}"), "thread 2")?;
+            db2.set(format!("key{i}"), "thread 2")?;
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
@@ -33,7 +30,7 @@ fn main() -> Result<()> {
     h1.join().unwrap()?;
     h2.join().unwrap()?;
 
-    for res in db.iter() {
+    for res in db.iter_items() {
         let (k, v) = res?;
         println!(
             "{} = {}",
