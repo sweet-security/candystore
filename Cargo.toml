@@ -2,6 +2,10 @@
 name = "candystore"
 version = "0.6.0"
 edition = "2024"
+license = "Apache-2.0"
+keywords = ["key-value", "database", "persistent", "store", "rocksdb"]
+description = "A lean, efficient and fast peristent in-process key-value store"
+repository = "https://github.com/sweet-security/candystore"
 
 [dependencies]
 crc16-ibm3740-fast = "0.5.0"

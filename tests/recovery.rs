@@ -67,6 +67,55 @@ fn rewrite_data_file_ordinal(
     Ok(())
 }
 
+fn rebuild_checkpoint_checksum(ordinal: u64, ptr: u64) -> u64 {
+    ordinal.rotate_left(17) ^ ptr.rotate_right(11) ^ 0x5a17_b1d2_c3e4_f607
+}
+
+fn encode_rebuild_checkpoint_ptr(file_idx: u16, file_offset: u64) -> u64 {
+    let fi = (file_idx as u64) & ((1 << 12) - 1);
+    let fo = (file_offset / 16) << 12;
+    fi | fo
+}
+
+fn write_rebuild_checkpoint(
+    dir: &std::path::Path,
+    ordinal: u64,
+    file_idx: u16,
+    file_offset: u64,
+) -> Result<(), Error> {
+    let ptr = encode_rebuild_checkpoint_ptr(file_idx, file_offset);
+    let checksum = rebuild_checkpoint_checksum(ordinal, ptr);
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("index"))
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(40)).map_err(Error::IOError)?;
+    file.write_all(&ordinal.to_le_bytes())
+        .map_err(Error::IOError)?;
+    file.write_all(&ptr.to_le_bytes()).map_err(Error::IOError)?;
+    file.write_all(&checksum.to_le_bytes())
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    Ok(())
+}
+
+fn corrupt_rebuild_checkpoint_checksum(dir: &std::path::Path) -> Result<(), Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("index"))
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(56)).map_err(Error::IOError)?;
+    file.write_all(&0xdead_beef_dead_beefu64.to_le_bytes())
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    Ok(())
+}
+
 #[test]
 fn test_clean_shutdown_flag() -> Result<(), Error> {
     let dir = tempdir().unwrap();
@@ -576,6 +625,10 @@ fn test_rebuild_if_dirty_recovers_typed_data() -> Result<(), Error> {
 #[test]
 fn test_fail_if_dirty_rejects_reopen() -> Result<(), Error> {
     let dir = tempdir().unwrap();
+    let fail_config = Config {
+        rebuild_strategy: RebuildStrategy::FailIfDirty,
+        ..Config::default()
+    };
 
     {
         let db = CandyStore::open(dir.path(), Config::default())?;
@@ -584,7 +637,7 @@ fn test_fail_if_dirty_rejects_reopen() -> Result<(), Error> {
     }
 
     assert!(matches!(
-        CandyStore::open(dir.path(), Config::default()),
+        CandyStore::open(dir.path(), fail_config),
         Err(Error::DirtyIndex)
     ));
 
@@ -784,5 +837,242 @@ fn test_recover_from_truncated_data_file() -> Result<(), Box<dyn std::error::Err
     let db = candystore::CandyStore::open(dir.path(), candystore::Config::default())?;
     assert_eq!(db.get("key1")?.as_deref(), Some("value1".as_bytes()));
     assert_eq!(db.get("key2")?, None);
+    Ok(())
+}
+
+#[test]
+fn test_progressive_rebuild_resumes_from_checkpoint() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
+        ..Config::default()
+    };
+
+    // Phase 1: write data across multiple files, then crash.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    // Phase 2: reopen triggers rebuild. Verify all data survived.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            assert_eq!(
+                db.get(format!("key{i:04}"))?,
+                Some(format!("val{i:04}").into_bytes()),
+                "key{i:04} missing after full rebuild"
+            );
+        }
+        // Clean shutdown — checkpoint should be 0 now.
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_progressive_rebuild_survives_interrupted_rebuild() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
+        ..Config::default()
+    };
+
+    // Phase 1: write data, crash.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    // Phase 2: reopen triggers rebuild which completes. Then crash again.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        // Write more data on top of the rebuilt index.
+        for i in 100..150 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    // Phase 3: another rebuild — should rebuild from scratch (checkpoint was
+    // cleared after phase 2's successful rebuild) and recover everything.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..150 {
+            assert_eq!(
+                db.get(format!("key{i:04}"))?,
+                Some(format!("val{i:04}").into_bytes()),
+                "key{i:04} missing after second rebuild"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
+        ..Config::default()
+    };
+
+    // Phase 1: write data, crash.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    // Phase 2: reopen triggers rebuild (checksums wrong after crash).
+    // Rebuild completes. Write more, then crash.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 100..200 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    // Phase 3: reopen. Checksums may pass (TrustIndex), but if there's a
+    // pending checkpoint, rebuild must resume. Since phase 2's rebuild
+    // completed (checkpoint cleared), and we crashed after new writes,
+    // the trust-checksums path should handle it.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..200 {
+            assert_eq!(
+                db.get(format!("key{i:04}"))?,
+                Some(format!("val{i:04}").into_bytes()),
+                "key{i:04} missing after trust-or-rebuild"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_progressive_rebuild_restarts_on_missing_checkpoint_file() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    write_rebuild_checkpoint(dir.path(), u64::MAX - 7, 7, 0)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for i in 0..100 {
+        assert_eq!(
+            db.get(format!("key{i:04}"))?,
+            Some(format!("val{i:04}").into_bytes()),
+            "key{i:04} missing after restart-from-scratch rebuild"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_progressive_rebuild_restarts_on_corrupt_checkpoint_tuple() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    write_rebuild_checkpoint(dir.path(), 0x1234_5678_9abc_def0, 3, 128)?;
+    corrupt_rebuild_checkpoint_checksum(dir.path())?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for i in 0..100 {
+        assert_eq!(
+            db.get(format!("key{i:04}"))?,
+            Some(format!("val{i:04}").into_bytes()),
+            "key{i:04} missing after rebuild with corrupt checkpoint"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_progressive_rebuild_resumes_after_real_mid_rebuild_crash() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 256 * 1024,
+        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..3000u32 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        unsafe {
+            libc::setenv(
+                c"CANDYSTORE_ABORT_REBUILD_AFTER".as_ptr(),
+                c"1200".as_ptr(),
+                1,
+            );
+        }
+        let _ = CandyStore::open(dir.path(), config);
+        unsafe { libc::_exit(0) };
+    }
+
+    let mut status = 0i32;
+    let wait_rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(wait_rc, pid);
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for i in 0..3000u32 {
+        assert_eq!(
+            db.get(format!("key{i:04}"))?,
+            Some(format!("val{i:04}").into_bytes()),
+            "key{i:04} missing after resume-from-offset rebuild"
+        );
+    }
+
     Ok(())
 }

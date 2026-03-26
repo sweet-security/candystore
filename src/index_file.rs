@@ -27,28 +27,50 @@ use crate::types::{Config, Error, Result};
 pub(crate) struct IndexFileHeader {
     pub(crate) signature: [u8; 8],
     pub(crate) version: u32,
-    _padding0: u32,
+    _padding16: u32,
     pub(crate) hash_key_0: u64,
     pub(crate) hash_key_1: u64,
-    pub(crate) dirty: AtomicU64,
-    _padding1: [u8; 64 - 40],
+    _padding64: [u8; 64 - 4 * 8],
+
+    ///////////////////////////////////
+    // runtime state
+    ///////////////////////////////////
     pub(crate) global_split_level: AtomicU64,
-    _padding2: [u8; 128 - 72],
+    _padding128: [u8; 64 - 8],
+
+    ///////////////////////////////////
+    // rebuild state
+    ///////////////////////////////////
+    pub(crate) dirty: AtomicU64,
+    /// Ordinal of the checkpointed file during progressive rebuild, or 0 if no
+    /// rebuild checkpoint is active.
+    pub(crate) rebuild_checkpoint_ordinal: AtomicU64,
+    /// Packed `(file_idx, file_offset)` for the progressive rebuild checkpoint.
+    pub(crate) rebuild_checkpoint_ptr: AtomicU64,
+    /// Checksum covering `(rebuild_checkpoint_ordinal, rebuild_checkpoint_ptr)`.
+    pub(crate) rebuild_checkpoint_checksum: AtomicU64,
+    _padding1024: [u8; 896 - 4 * 8],
+
+    ///////////////////////////////////
+    // stats
+    ///////////////////////////////////
     pub(crate) num_created: AtomicU64,
     pub(crate) num_removed: AtomicU64,
     pub(crate) num_replaced: AtomicU64,
     pub(crate) written_bytes: AtomicU64,
     pub(crate) waste_bytes: AtomicU64,
     pub(crate) reclaimed_bytes: AtomicU64,
-    _padding3: [u8; 192 - 176],
+    _padding1088: [u8; 64 - 6 * 8],
     /// Histogram buckets: [<64, <256, <1K, <4K, <16K, >=16K]
     pub(crate) size_histogram: [AtomicU64; 6],
-    _trailer: [u8; PAGE_SIZE - 240],
+    _padding1152: [u8; 64 - 6 * 8],
+
+    _trailer: [u8; PAGE_SIZE - 1152],
 }
 
 const _: () = assert!(offset_of!(IndexFileHeader, global_split_level) == 64);
-const _: () = assert!(offset_of!(IndexFileHeader, num_created) == 128);
-const _: () = assert!(offset_of!(IndexFileHeader, size_histogram) == 192);
+const _: () = assert!(offset_of!(IndexFileHeader, num_created) == 1024);
+const _: () = assert!(offset_of!(IndexFileHeader, size_histogram) == 1088);
 const _: () = assert!(size_of::<IndexFileHeader>() == PAGE_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -443,6 +465,11 @@ impl IndexFile {
 
     pub(crate) fn flush_header(&self) -> Result<()> {
         self.header_mmap.flush().map_err(Error::IOError)
+    }
+
+    pub(crate) fn flush_rows(&self) -> Result<()> {
+        self.rows_mmap.write().flush().map_err(Error::IOError)?;
+        self.rows_file.sync_all().map_err(Error::IOError)
     }
 
     pub(crate) fn open(base_path: &Path, config: Arc<Config>) -> Result<Self> {

@@ -233,8 +233,28 @@ impl CandyStore {
         };
 
         if !was_clean_shutdown {
+            let header = store.inner.index_file.header_ref();
+            let has_pending_rebuild = header
+                .rebuild_checkpoint_ordinal
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+                || header
+                    .rebuild_checkpoint_ptr
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0
+                || header
+                    .rebuild_checkpoint_checksum
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 0;
+
             match dirty_open_action {
-                DirtyOpenAction::None | DirtyOpenAction::ResetDb | DirtyOpenAction::TrustIndex => {}
+                DirtyOpenAction::None | DirtyOpenAction::ResetDb => {}
+                // A pending checkpoint means rebuild was interrupted — resume it
+                // regardless of whether the strategy would trust the index.
+                DirtyOpenAction::TrustIndex if has_pending_rebuild => {
+                    store.recover_index()?;
+                }
+                DirtyOpenAction::TrustIndex => {}
                 DirtyOpenAction::RebuildIndex => store.recover_index()?,
             }
             store

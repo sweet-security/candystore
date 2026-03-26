@@ -77,7 +77,7 @@ impl Default for Config {
             max_concurrency: (2 * num_cpus::get()).clamp(16, 64),
             reset_on_invalid_data: false,
             compaction_throughput_bytes_per_sec: 4 * 1024 * 1024,
-            rebuild_strategy: RebuildStrategy::FailIfDirty,
+            rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
         }
     }
 }

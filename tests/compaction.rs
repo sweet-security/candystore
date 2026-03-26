@@ -78,9 +78,14 @@ fn test_background_compaction_after_reopen_without_writes() -> Result<(), Error>
         compaction_min_threshold: 256,
         ..Config::default()
     };
+    let write_config = Config {
+        compaction_throughput_bytes_per_sec: 0,
+        ..config
+    };
 
+    let files_before;
     {
-        let db = CandyStore::open(dir.path(), config)?;
+        let db = CandyStore::open(dir.path(), write_config)?;
 
         for i in 0..200 {
             db.set(format!("key{i:04}"), vec![b'a'; 64])?;
@@ -90,21 +95,20 @@ fn test_background_compaction_after_reopen_without_writes() -> Result<(), Error>
             assert_eq!(db.remove(format!("key{i:04}"))?, Some(vec![b'a'; 64]));
         }
 
-        assert!(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e
-                    .file_name()
+        files_before = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
                     .to_str()
-                    .is_some_and(|s| s.starts_with("data_")))
-                .count()
-                > 1,
-            "expected multiple data files before reopen"
+                    .is_some_and(|s| s.starts_with("data_"))
+            })
+            .count();
+        assert!(
+            files_before > 1,
+            "expected multiple data files before close"
         );
     }
-
-    let db = CandyStore::open(dir.path(), config)?;
 
     let count_data_files = || -> usize {
         std::fs::read_dir(dir.path())
@@ -118,8 +122,7 @@ fn test_background_compaction_after_reopen_without_writes() -> Result<(), Error>
             .count()
     };
 
-    let files_before = count_data_files();
-    assert!(files_before > 1, "expected compaction backlog after reopen");
+    let db = CandyStore::open(dir.path(), config)?;
 
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(10));
