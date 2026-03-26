@@ -227,6 +227,7 @@ impl HashCoord {
     }
 
     pub(crate) fn row_index(&self, split_level: u64) -> usize {
+        debug_assert!(split_level >= MIN_SPLIT_LEVEL as u64, "sl={split_level}");
         ((self.row_selector as u64) & ((1 << split_level) - 1)) as usize
     }
 }

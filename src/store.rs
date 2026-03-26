@@ -250,10 +250,10 @@ impl StoreInner {
         }
     }
 
-    fn next_compaction_candidate(&self) -> Option<(u16, u64)> {
+    fn next_compaction_candidates(&self, max_candidates: usize) -> Vec<(u16, u64)> {
         let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
         let files = self.data_files.read();
-        files
+        let mut candidates = files
             .iter()
             .filter_map(|(&file_idx, data_file)| {
                 if file_idx == active_file_idx
@@ -261,9 +261,25 @@ impl StoreInner {
                 {
                     return None;
                 }
-                Some((file_idx, data_file.file_ordinal))
+                Some((
+                    file_idx,
+                    data_file.file_ordinal,
+                    self.index_file.file_waste(file_idx),
+                ))
             })
-            .min_by_key(|(_, file_ordinal)| *file_ordinal)
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        candidates
+            .into_iter()
+            .take(max_candidates)
+            .map(|(file_idx, file_ordinal, _)| (file_idx, file_ordinal))
+            .collect()
     }
 
     fn logical_lock_index(&self, ns: KeyNamespace, key: &[u8]) -> usize {
@@ -306,18 +322,14 @@ impl StoreInner {
 
         let low_shard = rows_table.shard_id(low_row_idx);
         let high_shard = rows_table.shard_id(high_row_idx);
-
-        let _high_guard = if low_shard < high_shard {
-            None // low_row will automatically lock low_shard
-        } else if low_shard > high_shard {
-            Some(rows_table.lock_shard(high_shard))
-        } else {
-            None
-        };
+        debug_assert!(
+            low_shard <= high_shard,
+            "high_row_idx sets a higher bit, so high_shard >= low_shard"
+        );
 
         let mut low_row = rows_table.row_mut(low_row_idx);
 
-        let _high_guard_post = if low_shard < high_shard {
+        let _high_guard = if low_shard < high_shard {
             Some(rows_table.lock_shard(high_shard))
         } else {
             None
@@ -430,14 +442,15 @@ impl StoreInner {
                 let mut res = None;
 
                 loop {
-                    debug_assert!(sl >= MIN_SPLIT_LEVEL as u64, "sl={sl}");
                     let row = row_table.row_mut(hc.row_index(sl));
                     let row_sl = row.split_level.load(Ordering::Acquire);
                     if row_sl == 0 {
+                        // nonexistent row
                         sl -= 1;
                         continue;
                     }
                     if row_sl > sl {
+                        // split happened, retry
                         break;
                     }
 
@@ -460,6 +473,7 @@ impl StoreInner {
                         .header_ref()
                         .global_split_level
                         .load(Ordering::Acquire);
+                    // note: it is critical we do not hold the row's lock here
                     self._split_row(hc, sl, gsl)?;
                 }
                 Err(Error::RotateDataFile(active_idx)) => {
@@ -501,14 +515,15 @@ impl CandyStore {
                 .load(Ordering::Acquire);
             let mut sl = gsl;
             loop {
-                debug_assert!(sl >= MIN_SPLIT_LEVEL as u64, "sl={sl}");
                 let row = row_table.row(hc.row_index(sl));
                 let row_sl = row.split_level.load(Ordering::Acquire);
                 if row_sl == 0 {
+                    // nonexistent row
                     sl -= 1;
                     continue;
                 }
                 if row_sl > sl {
+                    // split happened, retry
                     break;
                 }
                 return op(hc, row, key);
@@ -658,6 +673,10 @@ impl CandyStore {
                 self.inner.record_read(entry.size_hint() as u64);
                 let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
                 if kv.key() == key {
+                    // optimization
+                    if kv.value() == val {
+                        return Ok(Some(kv.into_value()));
+                    }
                     let klen = kv.key().len();
                     let vlen = kv.value().len();
                     let old_val = kv.into_value();
@@ -736,6 +755,10 @@ impl CandyStore {
                         && kv.value() != expected
                     {
                         return Ok(ReplaceStatus::WrongValue(kv.into_value()));
+                    }
+                    // optimization
+                    if kv.value() == val {
+                        return Ok(ReplaceStatus::PrevValue(kv.into_value()));
                     }
 
                     let klen = kv.key().len();

@@ -25,6 +25,7 @@ fn get_config() -> Config {
         initial_capacity: 1024,
         max_concurrency: 64,
         rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrFail,
+        //rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Default::default()
     }
 }
