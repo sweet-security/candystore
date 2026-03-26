@@ -16,14 +16,16 @@ fn run_perf(
     let mut handles = Vec::new();
 
     let inserts_us = Arc::new(AtomicU64::new(0));
-    let gets_us = Arc::new(AtomicU64::new(0));
+    let pos_gets_us = Arc::new(AtomicU64::new(0));
+    let neg_gets_us = Arc::new(AtomicU64::new(0));
     let iter_us = Arc::new(AtomicU64::new(0));
     let removes_us = Arc::new(AtomicU64::new(0));
 
     for t in 0..n_threads {
         let store = store.clone();
         let inserts_us = inserts_us.clone();
-        let gets_us = gets_us.clone();
+        let pos_gets_us = pos_gets_us.clone();
+        let neg_gets_us = neg_gets_us.clone();
         let iter_us = iter_us.clone();
         let removes_us = removes_us.clone();
 
@@ -53,7 +55,21 @@ fn run_perf(
                     store.get(&key).unwrap();
                 }
                 let duration = t0.elapsed();
-                gets_us.fetch_add(
+                pos_gets_us.fetch_add(
+                    duration.as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+
+            {
+                let mut key = vec![b'Q'; key_size.max(4)];
+                let t0 = Instant::now();
+                for i in start_idx..end_idx {
+                    key[..4].copy_from_slice(&i.to_le_bytes());
+                    store.get(&key).unwrap();
+                }
+                let duration = t0.elapsed();
+                neg_gets_us.fetch_add(
                     duration.as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
@@ -100,8 +116,14 @@ fn run_perf(
             / (n_threads * n as usize) as f64
     );
     println!(
-        "    Gets: {} us/op",
-        gets_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / (n_threads * n as usize) as f64
+        "    Positive Lookups: {} us/op",
+        pos_gets_us.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / (n_threads * n as usize) as f64
+    );
+    println!(
+        "    Negative Lookups: {} us/op",
+        neg_gets_us.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / (n_threads * n as usize) as f64
     );
     println!(
         "    Removes: {} us/op\n",
