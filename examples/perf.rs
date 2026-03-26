@@ -52,7 +52,7 @@ fn run_perf(
                 let t0 = Instant::now();
                 for i in start_idx..end_idx {
                     key[..4].copy_from_slice(&i.to_le_bytes());
-                    store.get(&key).unwrap();
+                    store.get(&key).unwrap().unwrap();
                 }
                 let duration = t0.elapsed();
                 pos_gets_us.fetch_add(
@@ -66,7 +66,7 @@ fn run_perf(
                 let t0 = Instant::now();
                 for i in start_idx..end_idx {
                     key[..4].copy_from_slice(&i.to_le_bytes());
-                    store.get(&key).unwrap();
+                    assert!(store.get(&key).unwrap().is_none());
                 }
                 let duration = t0.elapsed();
                 neg_gets_us.fetch_add(
