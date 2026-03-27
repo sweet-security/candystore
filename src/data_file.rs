@@ -1,3 +1,4 @@
+use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -7,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -39,15 +40,37 @@ struct DataFileHeader {
 
 const _: () = assert!(size_of::<DataFileHeader>() == PAGE_SIZE);
 
+pub(crate) struct InflightGuard<'a> {
+    data_file: &'a DataFile,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.data_file.finish_inflight();
+    }
+}
+
+struct InflightWaiter {
+    mutex: Mutex<()>,
+    condvar: Condvar,
+}
+
 pub(crate) struct DataFile {
     pub(crate) file: File,
     file_offset: AtomicU64,
+    inflight_writes: AtomicU32,
+    sealed_for_rotation: AtomicBool,
+    inflight_waiter: InflightWaiter,
     config: Arc<Config>,
     pub(crate) file_idx: u16,
     pub(crate) file_ordinal: u64,
 }
 
 impl DataFile {
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.file_offset.load(Ordering::Acquire)
+    }
+
     fn parse_data_entry(buf: &[u8], offset: u64) -> Result<ParsedDataEntry> {
         if buf.len() < 8 {
             return Err(Error::IOError(std::io::Error::new(
@@ -87,7 +110,7 @@ impl DataFile {
 
         let ns = ((header >> 24) & ((1 << KEY_NAMESPACE_BITS) - 1)) as u8;
         let entry_type = (header >> 30) & 0b11;
-        if entry_type != EntryType::Data as u32 {
+        if entry_type != EntryType::Insert as u32 && entry_type != EntryType::Update as u32 {
             return Err(Error::IOError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid entry type",
@@ -139,6 +162,12 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(file_offset),
+            inflight_writes: AtomicU32::new(0),
+            sealed_for_rotation: AtomicBool::new(false),
+            inflight_waiter: InflightWaiter {
+                mutex: Mutex::new(()),
+                condvar: Condvar::new(),
+            },
             config,
             file_idx,
             file_ordinal: header.ordinal,
@@ -173,10 +202,37 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(0),
+            inflight_writes: AtomicU32::new(0),
+            sealed_for_rotation: AtomicBool::new(false),
+            inflight_waiter: InflightWaiter {
+                mutex: Mutex::new(()),
+                condvar: Condvar::new(),
+            },
             config,
             file_idx,
             file_ordinal: ordinal,
         })
+    }
+
+    fn start_inflight(&self) -> Result<InflightGuard<'_>> {
+        self.inflight_writes.fetch_add(1, Ordering::SeqCst);
+        if self.sealed_for_rotation.load(Ordering::SeqCst) {
+            self.finish_inflight();
+            return Err(Error::RotateDataFile(self.file_idx));
+        }
+
+        Ok(InflightGuard { data_file: self })
+    }
+
+    fn finish_inflight(&self) {
+        if self.inflight_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _guard = self.inflight_waiter.mutex.lock();
+            self.inflight_waiter.condvar.notify_all();
+        }
+    }
+
+    pub(crate) fn seal_for_rotation(&self) {
+        self.sealed_for_rotation.store(true, Ordering::SeqCst);
     }
 
     fn allocate(&self, len: u64) -> Result<u64> {
@@ -203,7 +259,7 @@ impl DataFile {
         ns: KeyNamespace,
         key: &[u8],
         val: Option<&[u8]>,
-    ) -> Result<(u64, usize)> {
+    ) -> Result<(u64, usize, InflightGuard<'_>)> {
         debug_assert!(key.len() <= MAX_USER_KEY_SIZE);
         debug_assert!(ns as u8 <= MAX_KEY_NAMESPACE);
 
@@ -214,6 +270,7 @@ impl DataFile {
 
         let entry_len = 4 + if val.is_some() { 4 } else { 2 } + val_len + key.len() + 2;
         let aligned_len = entry_len.next_multiple_of(FILE_OFFSET_ALIGNMENT as usize);
+        let inflight_guard = self.start_inflight()?;
         let file_offset = self.allocate(aligned_len as u64)?;
         debug_assert!(file_offset % FILE_OFFSET_ALIGNMENT == 0);
 
@@ -242,28 +299,47 @@ impl DataFile {
         let checksum = crc16_ibm3740_fast::hash(&buf[..entry_len - 2]) as u16;
         buf[entry_len - 2..entry_len].copy_from_slice(&checksum.to_le_bytes());
 
-        write_all_at(
+        let res = write_all_at(
             &self.file,
             buf,
             size_of::<DataFileHeader>() as u64 + file_offset,
         )
-        .map_err(Error::IOError)?;
+        .map_err(Error::IOError);
+        res?;
 
-        Ok((file_offset, aligned_len))
+        Ok((file_offset, aligned_len, inflight_guard))
+    }
+
+    /// Wait until all in-flight writes to this file have completed.
+    pub(crate) fn wait_inflight(&self) {
+        if self.inflight_writes.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+
+        let mut guard = self.inflight_waiter.mutex.lock();
+        while self.inflight_writes.load(Ordering::Acquire) > 0 {
+            self.inflight_waiter.condvar.wait(&mut guard);
+        }
     }
 
     pub(crate) fn append_kv(
         &self,
+        entry_type: EntryType,
         ns: KeyNamespace,
         key: &[u8],
         val: &[u8],
-    ) -> Result<(u64, usize)> {
-        self.append_entry(EntryType::Data, ns, key, Some(val))
+    ) -> Result<(u64, usize, InflightGuard<'_>)> {
+        debug_assert!(matches!(entry_type, EntryType::Insert | EntryType::Update));
+        self.append_entry(entry_type, ns, key, Some(val))
     }
 
-    pub(crate) fn append_tombstone(&self, ns: KeyNamespace, key: &[u8]) -> Result<usize> {
+    pub(crate) fn append_tombstone(
+        &self,
+        ns: KeyNamespace,
+        key: &[u8],
+    ) -> Result<(usize, InflightGuard<'_>)> {
         self.append_entry(EntryType::Tombstone, ns, key, None)
-            .map(|(_, len)| len)
+            .map(|(_, len, guard)| (len, guard))
     }
 
     pub(crate) fn read_kv_into<'a>(
@@ -287,7 +363,7 @@ impl DataFile {
             vlen: parsed.vlen,
             header_len: 8,
             ns: parsed.ns,
-            entry_type: EntryType::Data,
+            entry_type: EntryType::Insert,
         })
     }
 
@@ -306,7 +382,7 @@ impl DataFile {
             vlen: parsed.vlen,
             header_len: 8,
             ns: parsed.ns,
-            entry_type: EntryType::Data,
+            entry_type: EntryType::Insert,
         })
     }
 
@@ -391,7 +467,12 @@ impl DataFile {
             let entry_type = (header >> 30) & 0b11;
 
             match entry_type {
-                x if x == EntryType::Data as u32 => {
+                x if x == EntryType::Insert as u32 || x == EntryType::Update as u32 => {
+                    let resolved_type = if x == EntryType::Insert as u32 {
+                        EntryType::Insert
+                    } else {
+                        EntryType::Update
+                    };
                     let klen = u16::from_le_bytes(avail[4..6].try_into().unwrap());
                     let vlen = u16::from_le_bytes(avail[6..8].try_into().unwrap());
                     let entry_len = 4 + 4 + klen as usize + vlen as usize + 2;
@@ -415,7 +496,7 @@ impl DataFile {
                             vlen,
                             header_len: 8,
                             ns,
-                            entry_type: EntryType::Data,
+                            entry_type: resolved_type,
                         },
                         offset,
                         offset + entry_len as u64,

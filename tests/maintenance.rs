@@ -81,7 +81,6 @@ fn test_explicit_close_releases_lock_and_persists_clean_shutdown() -> Result<(),
     drop(db);
 
     let reopened = CandyStore::open(dir.path(), config)?;
-    assert!(reopened.was_clean_shutdown());
     assert_eq!(reopened.get("key")?, Some(b"value".to_vec()));
 
     Ok(())

@@ -1,175 +1,243 @@
-use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
+    crash_point,
     data_file::DataFile,
     index_file::EntryPointer,
     internal::{
-        EntryType, FILE_OFFSET_ALIGNMENT, HashCoord, KVRef, KeyNamespace, aligned_data_entry_size,
-        aligned_data_entry_waste, aligned_tombstone_entry_waste, invalid_data_error,
+        EntryType, FILE_OFFSET_ALIGNMENT, HashCoord, KVRef, KeyNamespace, ROW_WIDTH,
+        aligned_data_entry_size, aligned_tombstone_entry_waste, invalid_data_error,
     },
     types::{Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result},
 };
 
 use super::CandyStore;
 
-static RECOVERED_ENTRIES_FOR_ABORT_TEST: AtomicU64 = AtomicU64::new(0);
+enum RebuildMode {
+    TailFrom(u64),
+    FullActiveFile,
+}
 
 impl CandyStore {
-    /// How many entries to process before flushing a mid-file checkpoint.
-    const REBUILD_CHECKPOINT_INTERVAL: u64 = 1000;
-
-    fn rebuild_checkpoint_checksum(ordinal: u64, ptr: u64) -> u64 {
-        ordinal.rotate_left(17) ^ ptr.rotate_right(11) ^ 0x5a17_b1d2_c3e4_f607
-    }
-
-    fn encode_rebuild_checkpoint_ptr(file_idx: u16, file_offset: u64) -> u64 {
-        let fi = (file_idx as u64) & ((1 << 12) - 1);
-        let fo = (file_offset / FILE_OFFSET_ALIGNMENT) << 12;
-        fi | fo
-    }
-
-    fn decode_rebuild_checkpoint_ptr(ptr: u64) -> (u16, u64) {
-        let file_idx = (ptr & ((1 << 12) - 1)) as u16;
-        let file_offset = (ptr >> 12) * FILE_OFFSET_ALIGNMENT;
-        (file_idx, file_offset)
-    }
-
-    fn read_rebuild_checkpoint(&self) -> Option<(u64, u16, u64)> {
-        let header = self.inner.index_file.header_ref();
-        let ordinal = header.rebuild_checkpoint_ordinal.load(Ordering::Acquire);
-        let ptr = header.rebuild_checkpoint_ptr.load(Ordering::Acquire);
-        let checksum = header.rebuild_checkpoint_checksum.load(Ordering::Acquire);
-
-        if ordinal == 0 && ptr == 0 && checksum == 0 {
-            return None;
-        }
-
-        if checksum != Self::rebuild_checkpoint_checksum(ordinal, ptr) {
-            return None;
-        }
-
-        let (file_idx, file_offset) = Self::decode_rebuild_checkpoint_ptr(ptr);
-        Some((ordinal, file_idx, file_offset))
-    }
-
-    fn maybe_abort_rebuild_for_testing(&self) {
-        let Ok(after) = std::env::var("CANDYSTORE_ABORT_REBUILD_AFTER") else {
-            return;
-        };
-        let Ok(after) = after.parse::<u64>() else {
-            return;
-        };
-        if after == 0 {
-            return;
-        }
-
-        let recovered = RECOVERED_ENTRIES_FOR_ABORT_TEST.fetch_add(1, Ordering::Relaxed) + 1;
-        if recovered >= after {
-            std::process::abort();
-        }
-    }
+    /// How many bytes of replayed data between progressive checkpoints.
+    const REBUILD_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024;
 
     pub(super) fn recover_index(&self) -> Result<()> {
-        let mut sorted_files: Vec<Arc<DataFile>> =
-            self.inner.data_files.read().values().cloned().collect();
-        sorted_files.sort_by_key(|df| df.file_ordinal);
+        let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+        let active_file = self
+            .inner
+            .data_files
+            .read()
+            .get(&active_idx)
+            .cloned()
+            .ok_or(Error::MissingDataFile(active_idx))?;
 
-        let checkpoint =
-            self.read_rebuild_checkpoint()
-                .and_then(|(ordinal, file_idx, file_offset)| {
-                    sorted_files
-                        .iter()
-                        .find(|df| df.file_idx == file_idx && df.file_ordinal == ordinal)
-                        .map(|_| (ordinal, file_idx, file_offset))
-                });
+        let commit_file_ordinal = self
+            .inner
+            .index_file
+            .header_ref()
+            .commit_file_ordinal
+            .load(Ordering::Acquire);
+        let commit_offset = self
+            .inner
+            .index_file
+            .header_ref()
+            .commit_offset
+            .load(Ordering::Acquire);
 
-        if checkpoint.is_none() {
-            // No previous progress, checkpoint corruption, or the checkpointed
-            // file no longer matches the persisted stable identity — full rebuild.
-            let row_table = self.inner.index_file.rows_table_mut();
-            self.inner.index_file.reset(row_table)?;
+        let rebuild_mode = if active_file.file_ordinal == commit_file_ordinal {
+            self.validated_commit_offset(&active_file, commit_offset)?
+        } else {
+            RebuildMode::TailFrom(0)
+        };
+
+        let start_offset = match rebuild_mode {
+            RebuildMode::TailFrom(offset) => offset,
+            RebuildMode::FullActiveFile => 0,
+        };
+
+        // The committed cursor marks the active-file prefix already reflected
+        // in the index. We only need to rebuild the uncommitted entries delta,
+        // since data_bytes and waste_bytes are derived from file sizes and
+        // per-file waste levels at query time.
+        //
+        // The entries delta can be recomputed exactly from the on-disk entry
+        // types: InsertData → +1, UpdateData → 0, Tombstone → −1.
+        self.inner
+            .index_file
+            .header_ref()
+            .uncommitted_entries_delta
+            .store(0, Ordering::Relaxed);
+
+        // Pre-purge any index entries that point past the file's durable
+        // extent. This handles the case where the data file was truncated
+        // (e.g. disk-full or corruption) and ensures the replay loop won't
+        // encounter stale pointers when comparing existing entries.
+        let pre_purge_extent = active_file
+            .used_bytes()
+            .next_multiple_of(FILE_OFFSET_ALIGNMENT);
+        self.purge_uncommitted_file_entries(active_idx, pre_purge_extent)?;
+
+        if matches!(rebuild_mode, RebuildMode::FullActiveFile) {
+            // The saved active-file cursor is no longer trustworthy. Remove
+            // every active-file pointer from the index, then rebuild that
+            // file's contribution from offset 0 on top of the older files.
+            self.purge_uncommitted_file_entries(active_idx, 0)?;
+            self.inner
+                .index_file
+                .header_ref()
+                .committed_num_entries
+                .store(self.count_live_index_entries(), Ordering::Relaxed);
         }
 
-        for data_file in &sorted_files {
-            let start_offset = if checkpoint.is_some_and(|(ordinal, file_idx, _)| {
-                data_file.file_ordinal == ordinal && data_file.file_idx == file_idx
-            }) {
-                checkpoint.unwrap().2
-            } else if checkpoint.is_some_and(|(ordinal, _, _)| data_file.file_ordinal < ordinal) {
-                continue;
-            } else {
-                0
+        let mut offset = start_offset;
+        let mut read_buf = Vec::new();
+        let mut buf_file_offset = 0u64;
+        let mut match_scratch = Vec::new();
+        let mut bytes_since_checkpoint = 0u64;
+        loop {
+            let Some((kv, entry_offset, next_offset)) =
+                active_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
+            else {
+                break;
+            };
+            let entry_bytes = next_offset - offset;
+            offset = next_offset;
+
+            let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
+                return Err(invalid_data_error("unknown key namespace in data file"));
             };
 
-            let mut offset = start_offset;
-            let mut read_buf = Vec::new();
-            let mut buf_file_offset = 0u64;
-            let mut match_scratch = Vec::new();
-            let mut entries_since_checkpoint = 0u64;
-            loop {
-                let Some((kv, entry_offset, next_offset)) =
-                    data_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
-                else {
-                    break;
-                };
-                offset = next_offset;
-
-                let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
-                    return Err(invalid_data_error("unknown key namespace in data file"));
-                };
-
-                self.recover_entry(data_file, ns, kv, entry_offset, &mut match_scratch)?;
-                self.maybe_abort_rebuild_for_testing();
-
-                entries_since_checkpoint += 1;
-                if entries_since_checkpoint >= Self::REBUILD_CHECKPOINT_INTERVAL {
-                    self.flush_rebuild_checkpoint(
-                        data_file.file_ordinal,
-                        data_file.file_idx,
-                        offset,
-                    )?;
-                    entries_since_checkpoint = 0;
-                }
+            // Count the entry's contribution to the entries delta based on its
+            // on-disk type.  This is unconditional — it doesn't matter whether
+            // the index pointer was already applied or not.
+            match kv.entry_type {
+                EntryType::Insert => self.inner.add_uncommitted_num_entries(1),
+                EntryType::Tombstone => self.inner.add_uncommitted_num_entries(-1),
+                _ => {} // UpdateData and any future types don't change num_entries
             }
 
-            // File fully processed — keep progress at this file's final offset.
-            self.flush_rebuild_checkpoint(data_file.file_ordinal, data_file.file_idx, offset)?;
+            // Fix up the index pointers (no stats accounting).
+            self.recover_entry(&active_file, ns, kv, entry_offset, &mut match_scratch)?;
+            crash_point("rebuild_entry");
+
+            bytes_since_checkpoint += entry_bytes;
+            if bytes_since_checkpoint >= Self::REBUILD_CHECKPOINT_INTERVAL_BYTES {
+                self.flush_rebuild_checkpoint(active_file.file_ordinal, offset)?;
+                bytes_since_checkpoint = 0;
+            }
         }
 
-        // Rebuild complete — clear checkpoint.
-        self.clear_rebuild_checkpoint()?;
+        let durable_extent = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+
+        // Purge any phantom index entries that reference the active file
+        // beyond this point (OS flushed the index page but not the data).
+        self.purge_uncommitted_file_entries(active_idx, durable_extent)?;
+
+        // Advance the persisted replay cursor to the end of what recovery
+        // verified and applied to the index.
+        self.flush_rebuild_checkpoint(active_file.file_ordinal, durable_extent)?;
 
         Ok(())
     }
 
-    fn flush_rebuild_checkpoint(&self, ordinal: u64, file_idx: u16, offset: u64) -> Result<()> {
-        self.inner.index_file.flush_rows()?;
+    fn validated_commit_offset(
+        &self,
+        active_file: &Arc<DataFile>,
+        checkpoint_offset: u64,
+    ) -> Result<RebuildMode> {
+        if checkpoint_offset == 0 {
+            return Ok(RebuildMode::TailFrom(0));
+        }
 
-        let ptr = Self::encode_rebuild_checkpoint_ptr(file_idx, offset);
-        let checksum = Self::rebuild_checkpoint_checksum(ordinal, ptr);
-        let header = self.inner.index_file.header_ref();
-        header
-            .rebuild_checkpoint_ordinal
-            .store(ordinal, Ordering::Release);
-        header.rebuild_checkpoint_ptr.store(ptr, Ordering::Release);
-        header
-            .rebuild_checkpoint_checksum
-            .store(checksum, Ordering::Release);
-        self.inner.index_file.flush_header()
+        let used_bytes = active_file.used_bytes();
+        if checkpoint_offset > used_bytes {
+            return Ok(RebuildMode::FullActiveFile);
+        }
+        if checkpoint_offset == used_bytes {
+            return Ok(RebuildMode::TailFrom(checkpoint_offset));
+        }
+
+        let mut probe_buf = Vec::new();
+        let mut probe_file_offset = 0u64;
+        match active_file.read_next_entry_ref(
+            checkpoint_offset,
+            &mut probe_buf,
+            &mut probe_file_offset,
+        )? {
+            Some((_, entry_offset, _)) if entry_offset == checkpoint_offset => {
+                Ok(RebuildMode::TailFrom(checkpoint_offset))
+            }
+            _ => Ok(RebuildMode::FullActiveFile),
+        }
     }
 
-    fn clear_rebuild_checkpoint(&self) -> Result<()> {
-        self.inner.index_file.flush_rows()?;
+    fn flush_rebuild_checkpoint(&self, ordinal: u64, offset: u64) -> Result<()> {
+        let resume_offset = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
-        let header = self.inner.index_file.header_ref();
-        header
-            .rebuild_checkpoint_ordinal
-            .store(0, Ordering::Release);
-        header.rebuild_checkpoint_ptr.store(0, Ordering::Release);
-        header
-            .rebuild_checkpoint_checksum
-            .store(0, Ordering::Release);
-        self.inner.index_file.flush_header()
+        // Persist the same prefix in both index rows and committed counters
+        // before advancing the replay cursor. The cursor itself must hit disk
+        // after the rows it covers.
+        self.inner.index_file.rollover_uncommitted_counters();
+
+        self.inner
+            .index_file
+            .header_ref()
+            .commit_file_ordinal
+            .store(ordinal, Ordering::Release);
+        self.inner
+            .index_file
+            .header_ref()
+            .commit_offset
+            .store(resume_offset, Ordering::Release);
+
+        self.inner.index_file.sync_all()
+    }
+
+    /// Remove index entries pointing to the active file at or beyond `durable_extent`.
+    fn purge_uncommitted_file_entries(&self, file_idx: u16, min_offset: u64) -> Result<()> {
+        let row_table = self.inner.index_file.rows_table();
+        let num_rows = self.inner.index_file.num_rows();
+
+        for row_idx in 0..num_rows {
+            let mut row = row_table.row_mut(row_idx);
+            if row.split_level.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            for col in 0..ROW_WIDTH {
+                if row.signatures[col] == HashCoord::INVALID_SIG {
+                    continue;
+                }
+                let ptr = row.pointers[col];
+                if !ptr.is_valid() {
+                    continue;
+                }
+                if ptr.file_idx() == file_idx && ptr.file_offset() >= min_offset {
+                    row.remove(col);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn count_live_index_entries(&self) -> u64 {
+        let row_table = self.inner.index_file.rows_table();
+        let num_rows = self.inner.index_file.num_rows();
+        let mut total = 0u64;
+
+        for row_idx in 0..num_rows {
+            let row = row_table.row(row_idx);
+            if row.split_level.load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            for col in 0..ROW_WIDTH {
+                if row.signatures[col] != HashCoord::INVALID_SIG && row.pointers[col].is_valid() {
+                    total += 1;
+                }
+            }
+        }
+
+        total
     }
 
     fn recover_entry(
@@ -181,7 +249,7 @@ impl CandyStore {
         match_scratch: &mut Vec<u8>,
     ) -> Result<()> {
         match kv.entry_type {
-            EntryType::Data => {
+            EntryType::Insert | EntryType::Update => {
                 self.recover_data_entry(data_file, ns, kv, entry_offset, match_scratch)
             }
             EntryType::Tombstone => self.recover_tombstone_entry(data_file, ns, kv, match_scratch),
@@ -189,6 +257,8 @@ impl CandyStore {
         }
     }
 
+    /// Fix index pointers for a data/update entry. No stats accounting —
+    /// the entries delta is handled by the caller based on the on-disk entry type.
     fn recover_data_entry(
         &self,
         data_file: &Arc<DataFile>,
@@ -210,8 +280,6 @@ impl CandyStore {
             hc.masked_row_selector(),
         );
 
-        let entry_size = aligned_data_entry_size(key.len(), val.len());
-
         self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
             let files = self.inner.data_files.read();
             for (col, entry) in row.iter_matches(hc) {
@@ -222,33 +290,23 @@ impl CandyStore {
                     file.read_kv_into(entry.file_offset(), entry.size_hint(), match_scratch)?;
                 if existing_kv.key() == key {
                     if entry == ptr {
-                        // Resuming from a crash during rebuild may subject some already-processed
-                        // entries to multiple iterations. If the row pointer is already identical,
-                        // this entry was fully processed and we can skip it.
+                        // Already points at this entry — nothing to fix.
                         return Ok(());
                     }
-
-                    let old_size =
-                        aligned_data_entry_size(existing_kv.key().len(), existing_kv.value().len());
-                    self.record_recovered_waste(
-                        entry,
-                        existing_kv.key().len(),
-                        existing_kv.value().len(),
-                    )?;
+                    if entry.file_idx() == data_file.file_idx
+                        && entry.file_offset() > ptr.file_offset()
+                    {
+                        // A newer active-file entry already exists — skip.
+                        return Ok(());
+                    }
+                    // Older pointer — replace with this newer one.
                     row.replace_pointer(col, ptr);
-                    let h = self.inner.index_file.header_ref();
-                    h.num_replaced.fetch_add(1, Ordering::Relaxed);
-                    h.written_bytes.fetch_add(entry_size, Ordering::Relaxed);
-                    h.waste_bytes.fetch_add(old_size, Ordering::Relaxed);
                     return Ok(());
                 }
             }
+            // Key not in index — insert it.
             if let Some(col) = row.find_free_slot() {
                 row.insert(col, hc.sig, ptr);
-                let h = self.inner.index_file.header_ref();
-                h.num_created.fetch_add(1, Ordering::Relaxed);
-                h.written_bytes.fetch_add(entry_size, Ordering::Relaxed);
-                self.inner.bump_histogram(entry_size);
                 Ok(())
             } else {
                 Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
@@ -256,18 +314,16 @@ impl CandyStore {
         })
     }
 
+    /// Fix index pointers for a tombstone entry. No stats accounting.
     fn recover_tombstone_entry(
         &self,
-        data_file: &Arc<DataFile>,
+        _data_file: &Arc<DataFile>,
         ns: KeyNamespace,
         kv: KVRef<'_>,
         match_scratch: &mut Vec<u8>,
     ) -> Result<()> {
         let key = kv.key();
         self.validate_recovered_tombstone_entry(key)?;
-        self.inner
-            .index_file
-            .add_file_waste(data_file.file_idx, aligned_tombstone_entry_waste(key.len()));
 
         self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
             let files = self.inner.data_files.read();
@@ -278,30 +334,12 @@ impl CandyStore {
                 let existing_kv =
                     file.read_kv_into(entry.file_offset(), entry.size_hint(), match_scratch)?;
                 if existing_kv.key() == key {
-                    let old_size =
-                        aligned_data_entry_size(existing_kv.key().len(), existing_kv.value().len());
-                    self.record_recovered_waste(
-                        entry,
-                        existing_kv.key().len(),
-                        existing_kv.value().len(),
-                    )?;
                     row.remove(col);
-                    let h = self.inner.index_file.header_ref();
-                    h.num_removed.fetch_add(1, Ordering::Relaxed);
-                    h.waste_bytes.fetch_add(old_size, Ordering::Relaxed);
                     return Ok(());
                 }
             }
             Ok(())
         })
-    }
-
-    fn record_recovered_waste(&self, entry: EntryPointer, klen: usize, vlen: usize) -> Result<()> {
-        let old_aligned_len = aligned_data_entry_waste(klen, vlen);
-        self.inner
-            .index_file
-            .add_file_waste(entry.file_idx(), old_aligned_len);
-        Ok(())
     }
 
     fn validate_recovered_data_entry(&self, key: &[u8], val: &[u8]) -> Result<()> {

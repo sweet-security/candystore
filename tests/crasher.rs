@@ -4,7 +4,7 @@ use std::ptr::null_mut;
 use std::time::Duration;
 use std::{ops::Range, sync::atomic::AtomicU64, sync::atomic::Ordering::SeqCst};
 
-use candystore::{CandyStore, Config, RebuildStrategy, Result};
+use candystore::{CandyStore, Config, Result};
 use rand::RngExt;
 
 #[cfg(debug_assertions)]
@@ -24,8 +24,6 @@ fn get_config() -> Config {
         hash_key: (0xb047_a3ef_b334_9804, 0x807d_3135_878e_9b27),
         initial_capacity: 1024,
         max_concurrency: 64,
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrFail,
-        //rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Default::default()
     }
 }
