@@ -267,12 +267,12 @@ fn test_compaction_updates_reclaimed_bytes() -> Result<(), Error> {
         "compaction should have run at least once"
     );
     assert!(
-        stats.reclaimed_bytes > 0,
-        "reclaimed_bytes should be positive after compaction"
+        stats.last_compaction_reclaimed_bytes > 0,
+        "last_compaction_reclaimed_bytes should be positive after compaction"
     );
     assert!(
-        stats.waste_bytes > 0,
-        "waste_bytes must be positive (total waste ever generated)"
+        stats.waste_bytes < 200_000,
+        "waste_bytes should reflect current unreclaimed waste, not a lifetime total"
     );
 
     for i in 0..100 {
@@ -344,8 +344,8 @@ fn test_concurrent_updates_with_compaction() -> Result<(), Error> {
         "compaction should have run during concurrent updates"
     );
     assert!(
-        stats.reclaimed_bytes > 0,
-        "reclaimed_bytes should be positive after concurrent updates + compaction"
+        stats.last_compaction_reclaimed_bytes > 0,
+        "last_compaction_reclaimed_bytes should be positive after concurrent updates + compaction"
     );
 
     Ok(())

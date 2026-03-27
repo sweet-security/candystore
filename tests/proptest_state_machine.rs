@@ -1,4 +1,4 @@
-use candystore::{CandyStore, Config, RebuildStrategy};
+use candystore::{CandyStore, Config};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -39,7 +39,6 @@ proptest! {
         // Small file size so we generate many data files, rotations, and splits within 200 operations
         let config = Config {
             max_data_file_size: 1024 * 4, // 4KB boundaries
-            rebuild_strategy: RebuildStrategy::RebuildIfDirty,
             ..Default::default()
         };
 
@@ -74,13 +73,11 @@ proptest! {
                     // Close the current DB instance by dropping it, then reopen
                     drop(db_opt.take().unwrap());
                     db_opt = Some(CandyStore::open(dir.path(), config).unwrap());
-                    assert!(db_opt.as_ref().unwrap().was_clean_shutdown());
                 }
                 Op::SimulateCrash => {
                     // Force a rebuild
                     db_opt.take().unwrap()._abort_for_testing();
                     db_opt = Some(CandyStore::open(dir.path(), config).unwrap());
-                    assert!(!db_opt.as_ref().unwrap().was_clean_shutdown());
                 }
             }
         }

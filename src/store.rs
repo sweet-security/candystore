@@ -23,9 +23,9 @@ use crate::{
     data_file::DataFile,
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
-        HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH,
-        aligned_data_entry_size, aligned_data_entry_waste, aligned_tombstone_entry_waste,
-        index_file_path, index_rows_file_path, sync_dir,
+        EntryType, HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL,
+        ROW_WIDTH, aligned_data_entry_size, aligned_data_entry_waste,
+        aligned_tombstone_entry_waste, index_file_path, index_rows_file_path, sync_dir,
     },
     types::{
         Config, Error, GetOrCreateStatus, INITIAL_DATA_FILE_ORDINAL, ReplaceStatus, Result, Stats,
@@ -53,6 +53,11 @@ struct InnerStats {
     num_read_bytes: AtomicU64,
     num_write_ops: AtomicU64,
     num_write_bytes: AtomicU64,
+    num_created: AtomicU64,
+    num_removed: AtomicU64,
+    num_replaced: AtomicU64,
+    written_bytes: AtomicU64,
+    size_histogram: [AtomicU64; 6],
 }
 
 impl InnerStats {
@@ -72,6 +77,13 @@ impl InnerStats {
         self.num_read_bytes.store(0, Ordering::Relaxed);
         self.num_write_ops.store(0, Ordering::Relaxed);
         self.num_write_bytes.store(0, Ordering::Relaxed);
+        self.num_created.store(0, Ordering::Relaxed);
+        self.num_removed.store(0, Ordering::Relaxed);
+        self.num_replaced.store(0, Ordering::Relaxed);
+        self.written_bytes.store(0, Ordering::Relaxed);
+        for bucket in &self.size_histogram {
+            bucket.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -97,7 +109,6 @@ pub struct CandyStore {
     _lockfile: fslock::LockFile,
     compaction_thd: Mutex<Option<std::thread::JoinHandle<()>>>,
     allow_clean_shutdown: AtomicBool,
-    was_clean_shutdown: AtomicBool,
 }
 
 pub use list::{KVPair, ListIterator};
@@ -108,14 +119,6 @@ pub(super) struct OpenState {
     data_files: HashMap<u16, Arc<DataFile>>,
     active_file_idx: u16,
     active_file_ordinal: u64,
-    was_clean_shutdown: bool,
-}
-
-pub(super) enum DirtyOpenAction {
-    None,
-    RebuildIndex,
-    TrustIndex,
-    ResetDb,
 }
 
 impl StoreInner {
@@ -301,7 +304,14 @@ impl StoreInner {
         // Buckets: [<64, <256, <1K, <4K, <16K, >=16K]
         // Boundaries at ilog2 = 6, 8, 10, 12, 14 → bucket = ((ilog2 - 4) / 2).clamp(0, 5)
         let bucket = ((entry_size.max(1).ilog2() as usize).saturating_sub(4) / 2).min(5);
-        self.index_file.header_ref().size_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        self.stats.size_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_uncommitted_num_entries(&self, delta: i64) {
+        self.index_file
+            .header_ref()
+            .uncommitted_entries_delta
+            .fetch_add(delta, Ordering::Relaxed);
     }
 
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
@@ -373,12 +383,8 @@ impl StoreInner {
             return Ok(());
         }
 
-        let active_ordinal = if let Ok(active_file) = self.data_file(active_idx) {
-            let _ = active_file.file.sync_all();
-            active_file.file_ordinal
-        } else {
-            0
-        };
+        let active_file = self.data_file(active_idx)?;
+        let active_ordinal = active_file.file_ordinal;
 
         let mut next_idx = (self.active_file_idx.load(Ordering::Relaxed) + 1) & MAX_DATA_FILE_IDX;
         let mut attempts = 0;
@@ -400,6 +406,22 @@ impl StoreInner {
             next_idx,
             ordinal,
         )?);
+
+        active_file.seal_for_rotation();
+        active_file.wait_inflight();
+        let _ = active_file.file.sync_all();
+
+        self.index_file.rollover_uncommitted_counters();
+        self.index_file
+            .header_ref()
+            .commit_file_ordinal
+            .store(active_file.file_ordinal, Ordering::Release);
+        self.index_file
+            .header_ref()
+            .commit_offset
+            .store(active_file.used_bytes(), Ordering::Release);
+
+        let _ = self.index_file.sync_all();
 
         self.data_files.write().insert(next_idx, data_file);
         self.active_file_idx.store(next_idx, Ordering::Release);
@@ -599,7 +621,8 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    let (file_off, size, _inflight_guard) =
+                        active_file.append_kv(EntryType::Insert, ns, key, val)?;
                     self.inner.record_write(size as u64);
                     row.insert(
                         col,
@@ -635,32 +658,37 @@ impl CandyStore {
 
     fn record_write_stats(&self, klen: usize, vlen: usize) {
         let entry_size = aligned_data_entry_size(klen, vlen);
-        let h = self.inner.index_file.header_ref();
-        h.written_bytes.fetch_add(entry_size, Ordering::Relaxed);
-        h.num_created.fetch_add(1, Ordering::Relaxed);
+        self.inner.add_uncommitted_num_entries(1);
+        self.inner
+            .stats
+            .written_bytes
+            .fetch_add(entry_size, Ordering::Relaxed);
+        self.inner.stats.num_created.fetch_add(1, Ordering::Relaxed);
         self.inner.bump_histogram(entry_size);
     }
 
     fn record_replace_stats(
         &self,
-        old_klen: usize,
-        old_vlen: usize,
+        _old_klen: usize,
+        _old_vlen: usize,
         new_klen: usize,
         new_vlen: usize,
     ) {
-        let old_entry_size = aligned_data_entry_size(old_klen, old_vlen);
         let new_entry_size = aligned_data_entry_size(new_klen, new_vlen);
-        let h = self.inner.index_file.header_ref();
-        h.written_bytes.fetch_add(new_entry_size, Ordering::Relaxed);
-        h.waste_bytes.fetch_add(old_entry_size, Ordering::Relaxed);
-        h.num_replaced.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .stats
+            .written_bytes
+            .fetch_add(new_entry_size, Ordering::Relaxed);
+        self.inner
+            .stats
+            .num_replaced
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.bump_histogram(new_entry_size);
     }
 
-    fn record_remove_stats(&self, klen: usize, vlen: usize) {
-        let entry_size = aligned_data_entry_size(klen, vlen);
-        let h = self.inner.index_file.header_ref();
-        h.waste_bytes.fetch_add(entry_size, Ordering::Relaxed);
-        h.num_removed.fetch_add(1, Ordering::Relaxed);
+    fn record_remove_stats(&self, _klen: usize, _vlen: usize) {
+        self.inner.add_uncommitted_num_entries(-1);
+        self.inner.stats.num_removed.fetch_add(1, Ordering::Relaxed);
     }
 
     fn set_ns(&self, ns: KeyNamespace, key: &[u8], val: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -687,8 +715,10 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    let (file_off, size, _inflight_guard) =
+                        active_file.append_kv(EntryType::Update, ns, key, val)?;
                     self.inner.record_write(size as u64);
+                    crate::crash_point("set_after_write_before_update");
 
                     row.replace_pointer(
                         col,
@@ -710,8 +740,10 @@ impl CandyStore {
                 let active_file = files
                     .get(&active_idx)
                     .ok_or(Error::MissingDataFile(active_idx))?;
-                let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                let (file_off, size, _inflight_guard) =
+                    active_file.append_kv(EntryType::Insert, ns, key, val)?;
                 self.inner.record_write(size as u64);
+                crate::crash_point("set_after_write_before_insert");
                 row.insert(
                     col,
                     hc.sig,
@@ -771,7 +803,8 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size) = active_file.append_kv(ns, key, val)?;
+                    let (file_off, size, _inflight_guard) =
+                        active_file.append_kv(EntryType::Update, ns, key, val)?;
                     self.inner.record_write(size as u64);
                     row.replace_pointer(
                         col,
@@ -846,7 +879,8 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let tombstone_size = active_file.append_tombstone(ns, key)?;
+                    let (tombstone_size, _inflight_guard) =
+                        active_file.append_tombstone(ns, key)?;
                     self.inner.record_write(tombstone_size as u64);
 
                     row.remove(col);
@@ -960,11 +994,6 @@ impl CandyStore {
         sync_dir(&self.inner.base_path)
     }
 
-    /// Returns whether the store was opened from a clean shutdown state.
-    pub fn was_clean_shutdown(&self) -> bool {
-        self.was_clean_shutdown.load(Ordering::Relaxed)
-    }
-
     /// Returns the number of background compaction errors observed since open.
     pub fn compaction_errors(&self) -> u64 {
         self.inner.stats.compaction_errors.load(Ordering::Relaxed)
@@ -1017,10 +1046,24 @@ impl CandyStore {
         let h = self.inner.index_file.header_ref();
         let num_rows = self.inner.index_file.num_rows() as u64;
         let capacity = num_rows.saturating_mul(ROW_WIDTH as u64);
+
         let num_items = h
-            .num_created
+            .committed_num_entries
             .load(Ordering::Relaxed)
-            .saturating_sub(h.num_removed.load(Ordering::Relaxed));
+            .saturating_add_signed(h.uncommitted_entries_delta.load(Ordering::Relaxed));
+
+        // Derive data_bytes and waste_bytes from file sizes and per-file
+        // waste levels rather than maintaining them as persistent counters.
+        let total_used: u64 = self
+            .inner
+            .data_files
+            .read()
+            .values()
+            .map(|df| df.used_bytes())
+            .sum();
+        let waste = self.inner.index_file.total_waste();
+        let data_bytes = total_used.saturating_sub(waste);
+
         Stats {
             num_rows,
             capacity,
@@ -1063,18 +1106,18 @@ impl CandyStore {
             num_read_bytes: self.inner.stats.num_read_bytes.load(Ordering::Relaxed),
             num_write_ops: self.inner.stats.num_write_ops.load(Ordering::Relaxed),
             num_write_bytes: self.inner.stats.num_write_bytes.load(Ordering::Relaxed),
-            num_created: h.num_created.load(Ordering::Relaxed),
-            num_removed: h.num_removed.load(Ordering::Relaxed),
-            num_replaced: h.num_replaced.load(Ordering::Relaxed),
-            written_bytes: h.written_bytes.load(Ordering::Relaxed),
-            waste_bytes: h.waste_bytes.load(Ordering::Relaxed),
-            reclaimed_bytes: h.reclaimed_bytes.load(Ordering::Relaxed),
-            entries_under_64: h.size_histogram[0].load(Ordering::Relaxed),
-            entries_under_256: h.size_histogram[1].load(Ordering::Relaxed),
-            entries_under_1024: h.size_histogram[2].load(Ordering::Relaxed),
-            entries_under_4096: h.size_histogram[3].load(Ordering::Relaxed),
-            entries_under_16384: h.size_histogram[4].load(Ordering::Relaxed),
-            entries_over_16384: h.size_histogram[5].load(Ordering::Relaxed),
+            num_created: self.inner.stats.num_created.load(Ordering::Relaxed),
+            num_removed: self.inner.stats.num_removed.load(Ordering::Relaxed),
+            num_replaced: self.inner.stats.num_replaced.load(Ordering::Relaxed),
+            written_bytes: self.inner.stats.written_bytes.load(Ordering::Relaxed),
+            data_bytes,
+            waste_bytes: waste,
+            entries_under_64: self.inner.stats.size_histogram[0].load(Ordering::Relaxed),
+            entries_under_256: self.inner.stats.size_histogram[1].load(Ordering::Relaxed),
+            entries_under_1024: self.inner.stats.size_histogram[2].load(Ordering::Relaxed),
+            entries_under_4096: self.inner.stats.size_histogram[3].load(Ordering::Relaxed),
+            entries_under_16384: self.inner.stats.size_histogram[4].load(Ordering::Relaxed),
+            entries_over_16384: self.inner.stats.size_histogram[5].load(Ordering::Relaxed),
         }
     }
 

@@ -10,7 +10,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,36 +41,30 @@ pub(crate) struct IndexFileHeader {
     ///////////////////////////////////
     // rebuild state
     ///////////////////////////////////
-    pub(crate) dirty: AtomicU64,
-    /// Ordinal of the checkpointed file during progressive rebuild, or 0 if no
-    /// rebuild checkpoint is active.
-    pub(crate) rebuild_checkpoint_ordinal: AtomicU64,
-    /// Packed `(file_idx, file_offset)` for the progressive rebuild checkpoint.
-    pub(crate) rebuild_checkpoint_ptr: AtomicU64,
-    /// Checksum covering `(rebuild_checkpoint_ordinal, rebuild_checkpoint_ptr)`.
-    pub(crate) rebuild_checkpoint_checksum: AtomicU64,
-    _padding1024: [u8; 896 - 4 * 8],
+    /// Persisted replay cursor: the active-file position already reflected in the index.
+    pub(crate) commit_file_ordinal: AtomicU64,
+    /// Persisted replay cursor offset within `commit_file_ordinal`.
+    pub(crate) commit_offset: AtomicU64,
+    _padding1024: [u8; 896 - 2 * 8],
 
     ///////////////////////////////////
     // stats
     ///////////////////////////////////
-    pub(crate) num_created: AtomicU64,
-    pub(crate) num_removed: AtomicU64,
-    pub(crate) num_replaced: AtomicU64,
-    pub(crate) written_bytes: AtomicU64,
-    pub(crate) waste_bytes: AtomicU64,
-    pub(crate) reclaimed_bytes: AtomicU64,
-    _padding1088: [u8; 64 - 6 * 8],
-    /// Histogram buckets: [<64, <256, <1K, <4K, <16K, >=16K]
-    pub(crate) size_histogram: [AtomicU64; 6],
-    _padding1152: [u8; 64 - 6 * 8],
+    pub(crate) committed_num_entries: AtomicU64,
+    _reserved_data_bytes: AtomicU64,
+    _reserved_waste_bytes: AtomicU64,
 
-    _trailer: [u8; PAGE_SIZE - 1152],
+    pub(crate) uncommitted_entries_delta: AtomicI64,
+    _reserved_data_delta: AtomicI64,
+    _reserved_waste_delta: AtomicI64,
+
+    _trailer: [u8; PAGE_SIZE - 1072],
 }
 
 const _: () = assert!(offset_of!(IndexFileHeader, global_split_level) == 64);
-const _: () = assert!(offset_of!(IndexFileHeader, num_created) == 1024);
-const _: () = assert!(offset_of!(IndexFileHeader, size_histogram) == 1088);
+const _: () = assert!(offset_of!(IndexFileHeader, commit_file_ordinal) == 128);
+const _: () = assert!(offset_of!(IndexFileHeader, commit_offset) == 136);
+const _: () = assert!(offset_of!(IndexFileHeader, committed_num_entries) == 1024);
 const _: () = assert!(size_of::<IndexFileHeader>() == PAGE_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -120,8 +114,7 @@ impl EntryPointer {
 #[repr(C)]
 pub(crate) struct RowLayout {
     pub(crate) split_level: AtomicU64,
-    checksum: u64,
-    _padding: [u8; 48],
+    _padding: [u8; 56],
     pub(crate) signatures: [u32; ROW_WIDTH],
     pub(crate) pointers: [EntryPointer; ROW_WIDTH],
 }
@@ -131,18 +124,6 @@ const _: () = assert!(offset_of!(RowLayout, signatures) % 8 == 0);
 const _: () = assert!(offset_of!(RowLayout, pointers) % 8 == 0);
 
 impl RowLayout {
-    fn expected_checksum(&self) -> u64 {
-        let mut checksum = self.split_level.load(Ordering::Relaxed);
-        for idx in 0..ROW_WIDTH {
-            checksum ^= self.signatures[idx] as u64 ^ self.pointers[idx].0;
-        }
-        checksum
-    }
-
-    pub(crate) fn checksum_matches(&self) -> bool {
-        self.checksum == self.expected_checksum()
-    }
-
     pub(crate) fn iter_matches(&self, hash_coord: HashCoord) -> RowMatchIterator<'_> {
         RowMatchIterator {
             row: self,
@@ -160,27 +141,20 @@ impl RowLayout {
     pub(crate) fn insert(&mut self, idx: usize, sig: u32, ptr: EntryPointer) {
         debug_assert!(self.signatures[idx] == HashCoord::INVALID_SIG);
         self.signatures[idx] = sig;
+        crate::crash_point("insert_after_sig");
         self.pointers[idx] = ptr;
-        self.checksum ^= sig as u64 ^ ptr.0;
     }
 
     pub(crate) fn remove(&mut self, idx: usize) {
-        let sig = self.signatures[idx];
-        let ptr = self.pointers[idx];
-        self.checksum ^= sig as u64 ^ ptr.0;
         self.signatures[idx] = HashCoord::INVALID_SIG;
         self.pointers[idx] = EntryPointer::INVALID_POINTER;
     }
 
     pub(crate) fn replace_pointer(&mut self, idx: usize, new_ptr: EntryPointer) {
-        let old_ptr = self.pointers[idx];
-        self.checksum ^= old_ptr.0 ^ new_ptr.0;
         self.pointers[idx] = new_ptr;
     }
 
     pub(crate) fn set_split_level(&mut self, new_sl: u64) {
-        let old_sl = self.split_level.load(Ordering::Relaxed);
-        self.checksum ^= old_sl ^ new_sl;
         self.split_level.store(new_sl, Ordering::Release);
     }
 }
@@ -220,6 +194,8 @@ impl Iterator for RowMatchIterator<'_> {
 #[repr(C)]
 pub(crate) struct IndexFileLayout {
     pub(crate) header: IndexFileHeader,
+    // note: we don't keep committed and uncommitted waste_levels for space efficiency and because
+    // they only need be approximate
     pub(crate) waste_levels: [AtomicU32; MAX_DATA_FILES as usize],
 }
 
@@ -252,6 +228,18 @@ fn row_ref_bytes(bytes: &[u8], idx: usize) -> &RowLayout {
 fn row_mut_bytes(bytes: &mut [u8], idx: usize) -> &mut RowLayout {
     RowLayout::try_mut_from_bytes(row_bytes_mut(bytes, idx))
         .expect("row bytes should contain an aligned row")
+}
+
+fn apply_signed_counter_delta(counter: &AtomicU64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add_signed(delta))
+        })
+        .unwrap();
 }
 
 unsafe fn row_mut_ptr(base_ptr: *const u8, idx: usize) -> *mut RowLayout {
@@ -451,10 +439,10 @@ impl IndexFile {
             return Err(invalid_data_error("invalid index global split level"));
         }
 
-        let active_rows = 1usize
+        let uncommitted_rows = 1usize
             .checked_shl(gsl as u32)
             .ok_or_else(|| invalid_data_error("index global split level overflow"))?;
-        if active_rows > row_count {
+        if uncommitted_rows > row_count {
             return Err(invalid_data_error(
                 "index global split level exceeds file size",
             ));
@@ -465,11 +453,6 @@ impl IndexFile {
 
     pub(crate) fn flush_header(&self) -> Result<()> {
         self.header_mmap.flush().map_err(Error::IOError)
-    }
-
-    pub(crate) fn flush_rows(&self) -> Result<()> {
-        self.rows_mmap.write().flush().map_err(Error::IOError)?;
-        self.rows_file.sync_all().map_err(Error::IOError)
     }
 
     pub(crate) fn open(base_path: &Path, config: Arc<Config>) -> Result<Self> {
@@ -551,29 +534,20 @@ impl IndexFile {
 
         if new_file {
             let rows_table = inst.rows_table_mut();
-            inst.init_header_and_rows(rows_table, hash_key, false)?;
+            inst.init_header_and_rows(rows_table, hash_key)?;
         }
 
         Ok(inst)
     }
 
-    pub(crate) fn verify_row_checksums(&self) -> Result<()> {
-        let row_table = self.rows_table();
-        let row_count = row_count_for_len(row_table.row_guard.len());
-        for row_idx in 0..row_count {
-            if !row_table.row(row_idx).checksum_matches() {
-                return Err(invalid_data_error("index row checksum mismatch"));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn sync_all(&self) -> Result<()> {
-        self.header_mmap.flush().map_err(Error::IOError)?;
+        // Persist row updates before any header state that claims those rows are durable.
         self.rows_mmap.write().flush().map_err(Error::IOError)?;
+        self.rows_file.sync_all().map_err(Error::IOError)?;
+        self.header_mmap.flush().map_err(Error::IOError)?;
         #[cfg(windows)]
         self.header_file.sync_all().map_err(Error::IOError)?;
-        self.rows_file.sync_all().map_err(Error::IOError)
+        Ok(())
     }
 
     pub(crate) fn file_size_bytes(&self) -> u64 {
@@ -598,7 +572,7 @@ impl IndexFile {
     /// Returns a direct reference to the header without acquiring any lock.
     ///
     /// Safe because the header mmap is never remapped and the header fields
-    /// used for stats are all `AtomicU64`.
+    /// used for stats are all atomics.
     fn full_header_ref(&self) -> &IndexFileLayout {
         unsafe { &*(self.header_mmap.as_ptr() as *const IndexFileLayout) }
     }
@@ -616,8 +590,27 @@ impl IndexFile {
         self.full_header_ref().waste_levels[file_idx as usize].load(Ordering::Relaxed)
     }
 
+    /// Returns the combined waste across all file slots.
+    pub(crate) fn total_waste(&self) -> u64 {
+        let ref_full = self.full_header_ref();
+        let mut total = 0u64;
+        for waste in ref_full.waste_levels.iter() {
+            total += waste.load(Ordering::Relaxed) as u64;
+        }
+        total
+    }
+
+    /// Takes the combined waste and resets it
     pub(crate) fn take_file_waste(&self, file_idx: u16) -> u32 {
         self.full_header_ref().waste_levels[file_idx as usize].swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn rollover_uncommitted_counters(&self) {
+        let h = self.header_ref();
+        apply_signed_counter_delta(
+            &h.committed_num_entries,
+            h.uncommitted_entries_delta.swap(0, Ordering::Relaxed),
+        );
     }
 
     pub(crate) fn grow(&self, nsl: u64) -> Result<Option<Duration>> {
@@ -802,7 +795,6 @@ impl IndexFile {
         &self,
         mut rows_table: RowsTableWriteGuard,
         hash_key: (u64, u64),
-        dirty: bool,
     ) -> Result<()> {
         // Zero both mmaps first, then populate.
         rows_table.row_guard.fill(0);
@@ -822,10 +814,6 @@ impl IndexFile {
 
         layout.header.signature = *INDEX_FILE_SIGNATURE;
         layout.header.version = INDEX_FILE_VERSION;
-        layout
-            .header
-            .dirty
-            .store(if dirty { 1 } else { 0 }, Ordering::Release);
         layout.header.hash_key_0 = hash_key.0;
         layout.header.hash_key_1 = hash_key.1;
         layout
@@ -884,6 +872,6 @@ impl IndexFile {
 
         Self::maybe_lock_mmap(self.config.as_ref(), &row_table.row_guard);
 
-        self.init_header_and_rows(row_table, self.config.hash_key, true)
+        self.init_header_and_rows(row_table, self.config.hash_key)
     }
 }

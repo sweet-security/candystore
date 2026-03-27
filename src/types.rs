@@ -12,27 +12,6 @@ use crate::internal::MIN_INITIAL_ROWS;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
-/// How opening a store should handle a dirty index.
-pub enum RebuildStrategy {
-    /// Reject opening a store whose index is marked dirty.
-    FailIfDirty,
-    /// Rebuild the index from data files when the store is dirty.
-    RebuildIfDirty,
-    /// Reset the database when the store is dirty.
-    ///
-    /// This removes all directory contents before recreating the store state.
-    /// While the store is open, the active `.lockfile` is preserved so the
-    /// directory remains locked against concurrent opens.
-    ResetDBIfDirty,
-    /// Trust a dirty index only if row checksums still match; otherwise fail.
-    TrustDirtyIndexIfChecksumCorrectOrFail,
-    /// Trust a dirty index if row checksums match; otherwise rebuild.
-    TrustDirtyIndexIfChecksumCorrectOrRebuild,
-    /// Trust a dirty index if row checksums match; otherwise reset the database.
-    TrustDirtyIndexIfChecksumCorrectOrReset,
-}
-
-#[derive(Debug, Clone, Copy)]
 /// Runtime configuration for opening a store.
 pub struct Config {
     /// SipHash keys used for row selection and signatures.
@@ -51,18 +30,12 @@ pub struct Config {
     pub max_data_file_size: u32,
     /// Minimum per-file waste threshold before background compaction considers it.
     pub compaction_min_threshold: u32,
-    /// Maximum logical concurrency used to size internal lock tables.
+    /// Maximum logical concurrency used to size internal lock tables, defaults to num_cpus*2
     pub max_concurrency: usize,
     /// Reset the database if opening encounters invalid on-disk data.
-    ///
-    /// This removes all directory contents before recreating the store state.
-    /// While the store is open, the active `.lockfile` is preserved so the
-    /// directory remains locked against concurrent opens.
     pub reset_on_invalid_data: bool,
     /// Target background compaction throughput in bytes per second.
     pub compaction_throughput_bytes_per_sec: usize,
-    /// Dirty-index handling policy used during open.
-    pub rebuild_strategy: RebuildStrategy,
 }
 
 impl Default for Config {
@@ -77,7 +50,6 @@ impl Default for Config {
             max_concurrency: (2 * num_cpus::get()).clamp(16, 64),
             reset_on_invalid_data: false,
             compaction_throughput_bytes_per_sec: 4 * 1024 * 1024,
-            rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
         }
     }
 }
@@ -87,9 +59,6 @@ impl Default for Config {
 pub enum Error {
     #[error("IO error: {0}")]
     IOError(std::io::Error),
-
-    #[error("Index file is dirty")]
-    DirtyIndex,
 
     #[error("Missing data file: {0}")]
     MissingDataFile(u16),
@@ -252,29 +221,29 @@ pub struct Stats {
     pub num_write_ops: u64,
     /// Total bytes written to data files.
     pub num_write_bytes: u64,
-    /// Number of entry creations recorded.
+    /// Number of entry creations recorded since open.
     pub num_created: u64,
-    /// Number of entry removals recorded.
+    /// Number of entry removals recorded since open.
     pub num_removed: u64,
-    /// Number of entry replacements recorded.
+    /// Number of entry replacements recorded since open.
     pub num_replaced: u64,
-    /// Total logical bytes written as live entries.
+    /// Total logical entry bytes written since open.
     pub written_bytes: u64,
-    /// Total bytes currently accounted as waste before reclamation.
+    /// Total bytes currently occupied by live entries.
+    pub data_bytes: u64,
+    /// Total bytes currently accounted as unreclaimed waste.
     pub waste_bytes: u64,
-    /// Total bytes reclaimed by compaction.
-    pub reclaimed_bytes: u64,
-    /// Histogram bucket for entries under 64 bytes.
+    /// Approximate histogram bucket for entries under 64 bytes since open.
     pub entries_under_64: u64,
-    /// Histogram bucket for entries under 256 bytes.
+    /// Approximate histogram bucket for entries under 256 bytes since open.
     pub entries_under_256: u64,
-    /// Histogram bucket for entries under 1024 bytes.
+    /// Approximate histogram bucket for entries under 1024 bytes since open.
     pub entries_under_1024: u64,
-    /// Histogram bucket for entries under 4096 bytes.
+    /// Approximate histogram bucket for entries under 4096 bytes since open.
     pub entries_under_4096: u64,
-    /// Histogram bucket for entries under 16384 bytes.
+    /// Approximate histogram bucket for entries under 16384 bytes since open.
     pub entries_under_16384: u64,
-    /// Histogram bucket for entries of 16384 bytes or larger.
+    /// Approximate histogram bucket for entries of 16384 bytes or larger since open.
     pub entries_over_16384: u64,
 }
 
@@ -294,12 +263,12 @@ impl Stats {
 
     /// Returns the current unreclaimed waste in bytes.
     pub fn current_waste(&self) -> u64 {
-        self.waste_bytes.saturating_sub(self.reclaimed_bytes)
+        self.waste_bytes
     }
 
-    /// Returns live data bytes after subtracting current waste.
+    /// Returns bytes currently occupied by live data.
     pub fn data_bytes(&self) -> u64 {
-        self.written_bytes.saturating_sub(self.current_waste())
+        self.data_bytes
     }
 
     /// Returns bytes currently occupied by live data.

@@ -117,10 +117,10 @@ impl RangeMetadata {
 
 #[repr(u16)]
 pub(crate) enum EntryType {
-    Data = 0,
-    Tombstone = 1,
+    Insert = 0,
+    Update = 1,
     _Unused2 = 2,
-    _Unused3 = 3,
+    Tombstone = 3,
 }
 
 pub(crate) fn invalid_data_error(message: &'static str) -> Error {

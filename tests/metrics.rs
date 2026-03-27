@@ -33,6 +33,8 @@ fn test_metrics_updates() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.num_removed, 0);
     assert_eq!(stats.num_replaced, 0);
     assert_eq!(stats.written_bytes, 0);
+    assert_eq!(stats.data_bytes, 0);
+    assert_eq!(stats.waste_bytes, 0);
 
     db.set("key1", "val1")?;
 
@@ -46,6 +48,8 @@ fn test_metrics_updates() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.num_removed, 0);
     assert_eq!(stats.num_replaced, 0);
     assert!(stats.written_bytes > 0);
+    assert!(stats.data_bytes > 0);
+    assert_eq!(stats.waste_bytes, 0);
     assert_eq!(stats.num_write_ops, 1);
     assert!(stats.num_write_bytes > 0);
     assert!(stats.index_size_bytes > 0);
@@ -60,6 +64,8 @@ fn test_metrics_updates() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.num_created, 1);
     assert_eq!(stats.num_replaced, 1);
     assert_eq!(stats.num_removed, 0);
+    assert!(stats.data_bytes > 0);
+    assert!(stats.waste_bytes > 0);
     assert_eq!(stats.num_write_ops, 2);
 
     db.remove("key1")?;
@@ -72,6 +78,7 @@ fn test_metrics_updates() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.num_created, 1);
     assert_eq!(stats.num_replaced, 1);
     assert_eq!(stats.num_removed, 1);
+    assert_eq!(stats.data_bytes, 0);
 
     assert_eq!(db.get("missing")?, None);
     assert_eq!(db.get("key1")?, None);
@@ -111,6 +118,7 @@ fn test_metrics_compaction() -> Result<(), Box<dyn std::error::Error>> {
     let stats = db.stats();
     assert!(stats.written_bytes > 0);
     assert!(stats.num_replaced > 0);
+    assert!(stats.data_bytes > 0);
     assert!(stats.num_items > 0);
     assert!(stats.capacity >= stats.num_items);
     assert!(stats.fill_level() > 0.0);

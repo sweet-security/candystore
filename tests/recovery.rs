@@ -5,9 +5,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use candystore::{
-    CandyStore, CandyTypedDeque, CandyTypedList, CandyTypedStore, Config, Error, RebuildStrategy,
-};
+use candystore::{CandyStore, CandyTypedDeque, CandyTypedList, CandyTypedStore, Config, Error};
 use tempfile::tempdir;
 
 fn patterned_bytes_with_seed(len: usize, seed: usize) -> Vec<u8> {
@@ -67,100 +65,64 @@ fn rewrite_data_file_ordinal(
     Ok(())
 }
 
-fn rebuild_checkpoint_checksum(ordinal: u64, ptr: u64) -> u64 {
-    ordinal.rotate_left(17) ^ ptr.rotate_right(11) ^ 0x5a17_b1d2_c3e4_f607
+fn active_file_ordinal(dir: &std::path::Path) -> Result<u64, Error> {
+    let mut max_ordinal: Option<u64> = None;
+
+    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
+        let entry = entry.map_err(Error::IOError)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("data_") {
+            continue;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        let ordinal = u64::from_le_bytes(buf);
+        max_ordinal = Some(max_ordinal.map_or(ordinal, |current| current.max(ordinal)));
+    }
+
+    max_ordinal.ok_or_else(|| {
+        Error::IOError(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no data files found",
+        ))
+    })
 }
 
-fn encode_rebuild_checkpoint_ptr(file_idx: u16, file_offset: u64) -> u64 {
-    let fi = (file_idx as u64) & ((1 << 12) - 1);
-    let fo = (file_offset / 16) << 12;
-    fi | fo
-}
-
-fn write_rebuild_checkpoint(
-    dir: &std::path::Path,
-    ordinal: u64,
-    file_idx: u16,
-    file_offset: u64,
-) -> Result<(), Error> {
-    let ptr = encode_rebuild_checkpoint_ptr(file_idx, file_offset);
-    let checksum = rebuild_checkpoint_checksum(ordinal, ptr);
-
+fn write_commit_cursor(dir: &std::path::Path, offset: u64) -> Result<(), Error> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(dir.join("index"))
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(40)).map_err(Error::IOError)?;
+    let ordinal = active_file_ordinal(dir)?;
+
+    file.seek(SeekFrom::Start(128)).map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
-    file.write_all(&ptr.to_le_bytes()).map_err(Error::IOError)?;
-    file.write_all(&checksum.to_le_bytes())
+
+    file.seek(SeekFrom::Start(136)).map_err(Error::IOError)?;
+    file.write_all(&offset.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
-    Ok(())
-}
-
-fn corrupt_rebuild_checkpoint_checksum(dir: &std::path::Path) -> Result<(), Error> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("index"))
-        .map_err(Error::IOError)?;
-
-    file.seek(SeekFrom::Start(56)).map_err(Error::IOError)?;
-    file.write_all(&0xdead_beef_dead_beefu64.to_le_bytes())
-        .map_err(Error::IOError)?;
-    file.sync_all().map_err(Error::IOError)?;
-    Ok(())
-}
-
-#[test]
-fn test_clean_shutdown_flag() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-
-    {
-        let db = CandyStore::open(dir.path(), Config::default())?;
-        assert!(db.was_clean_shutdown());
-        db.set("hello", "world")?;
-    }
-
-    {
-        let db = CandyStore::open(dir.path(), Config::default())?;
-        assert!(db.was_clean_shutdown());
-        assert_eq!(db.get("hello")?, Some("world".into()));
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_dirty_shutdown_detected() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("hello", "world")?;
-        db._abort_for_testing();
-    }
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
-    }
-
     Ok(())
 }
 
 #[test]
 fn test_recovery_after_dirty_shutdown() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
 
     {
-        let db = CandyStore::open(dir.path(), config)?;
+        let db = CandyStore::open(dir.path(), Config::default())?;
         db.set("key1", "val1")?;
         db.set("key2", "val2")?;
         db.set("key3", "val3")?;
@@ -170,8 +132,7 @@ fn test_recovery_after_dirty_shutdown() -> Result<(), Error> {
     }
 
     {
-        let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
+        let db = CandyStore::open(dir.path(), Config::default())?;
         assert_eq!(db.get("key1")?, Some(b"val1".to_vec()));
         assert_eq!(db.get("key2")?, Some(b"val2_updated".to_vec()));
         assert!(db.get("key3")?.is_none());
@@ -185,7 +146,6 @@ fn test_recovery_uses_persisted_hash_key_on_reopen() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let original_config = Config {
         hash_key: (1, 2),
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Config::default()
     };
     let different_config = Config {
@@ -202,7 +162,6 @@ fn test_recovery_uses_persisted_hash_key_on_reopen() -> Result<(), Error> {
 
     {
         let db = CandyStore::open(dir.path(), different_config)?;
-        assert!(!db.was_clean_shutdown());
         assert_eq!(db.get("key1")?, Some(b"val1".to_vec()));
         assert_eq!(db.get("key2")?, Some(b"val2".to_vec()));
         db.set("key3", "val3")?;
@@ -219,35 +178,9 @@ fn test_recovery_uses_persisted_hash_key_on_reopen() -> Result<(), Error> {
 }
 
 #[test]
-fn test_recovery_rebuilds_waste_stats() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key1", "val1")?;
-        db.set("key2", "val2")?;
-        db.set("key3", "val3")?;
-        db.set("key2", "val2_updated")?;
-        db.remove("key3")?;
-        db._abort_for_testing();
-    }
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
-        let stats = db.stats();
-        assert_eq!(stats.waste_bytes, 64);
-    }
-
-    Ok(())
-}
-
-#[test]
 fn test_recovery_with_many_keys_and_splits() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let mut config = common::small_file_config();
-    config.rebuild_strategy = RebuildStrategy::RebuildIfDirty;
+    let config = common::small_file_config();
 
     {
         let db = CandyStore::open(dir.path(), config)?;
@@ -265,7 +198,6 @@ fn test_recovery_with_many_keys_and_splits() -> Result<(), Error> {
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
 
         for i in 0..500 {
             let key = format!("k{i:04}");
@@ -296,7 +228,6 @@ fn test_rebuild_if_dirty_recovers_large_dataset_across_multiple_data_files() -> 
     let config = Config {
         max_data_file_size: 64 * 1024 * 1024,
         compaction_throughput_bytes_per_sec: 1024,
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Config::default()
     };
     const TARGET_NUM_DATA_FILES: u64 = 5;
@@ -338,7 +269,6 @@ fn test_rebuild_if_dirty_recovers_large_dataset_across_multiple_data_files() -> 
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
         assert!(
             db.stats().num_data_files >= TARGET_NUM_DATA_FILES,
             "rebuild should preserve the multi-file dataset"
@@ -368,7 +298,7 @@ fn test_rebuild_if_dirty_recovers_large_dataset_across_multiple_data_files() -> 
 #[test]
 fn test_rebuild_if_dirty_recovers_with_corrupted_rows_checksum() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
 
     {
         let db = CandyStore::open(dir.path(), config)?;
@@ -379,18 +309,14 @@ fn test_rebuild_if_dirty_recovers_with_corrupted_rows_checksum() -> Result<(), E
         db._abort_for_testing();
     }
 
-    common::corrupt_first_row_checksum(dir.path());
-
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
         assert!(db.get("key1")?.is_none());
         assert_eq!(db.get("key2")?, Some(b"val2_updated".to_vec()));
     }
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(db.was_clean_shutdown());
         assert!(db.get("key1")?.is_none());
         assert_eq!(db.get("key2")?, Some(b"val2_updated".to_vec()));
     }
@@ -401,7 +327,7 @@ fn test_rebuild_if_dirty_recovers_with_corrupted_rows_checksum() -> Result<(), E
 #[test]
 fn test_rebuild_if_dirty_rejects_unknown_data_entry_type() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
 
     {
         let db = CandyStore::open(dir.path(), config)?;
@@ -421,7 +347,7 @@ fn test_rebuild_if_dirty_rejects_unknown_data_entry_type() -> Result<(), Error> 
 #[test]
 fn test_rebuild_if_dirty_rejects_unknown_data_namespace() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
 
     {
         let db = CandyStore::open(dir.path(), config)?;
@@ -472,7 +398,7 @@ fn test_open_rejects_duplicate_data_file_ordinals() -> Result<(), Error> {
 #[test]
 fn test_rebuild_if_dirty_recovers_lists() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
     let list = b"rebuild-list";
 
     {
@@ -487,7 +413,6 @@ fn test_rebuild_if_dirty_recovers_lists() -> Result<(), Error> {
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
         assert_eq!(db.list_len(list)?, 2);
         assert_eq!(db.get_from_list(list, b"a")?, None);
         assert_eq!(db.get_from_list(list, b"b")?, Some(b"2b".to_vec()));
@@ -509,7 +434,7 @@ fn test_rebuild_if_dirty_recovers_lists() -> Result<(), Error> {
 #[test]
 fn test_rebuild_if_dirty_recovers_queues() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
     let queue = b"rebuild-queue";
 
     let first_idx;
@@ -533,7 +458,6 @@ fn test_rebuild_if_dirty_recovers_queues() -> Result<(), Error> {
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
         assert_eq!(db.queue_len(queue)?, 2);
         assert_eq!(db.peek_queue_head(queue)?, Some(b"tail-1".to_vec()));
         assert_eq!(db.peek_queue_tail(queue)?, Some(b"tail-2".to_vec()));
@@ -555,7 +479,7 @@ fn test_rebuild_if_dirty_recovers_queues() -> Result<(), Error> {
 #[test]
 fn test_rebuild_if_dirty_recovers_typed_data() -> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = common::rebuild_if_dirty_config();
+    let config = Config::default();
     let list_key = 7u32;
     let queue_key = 9u32;
 
@@ -592,8 +516,6 @@ fn test_rebuild_if_dirty_recovers_typed_data() -> Result<(), Error> {
         let typed_list = CandyTypedList::<u32, u32, String>::new(Arc::clone(&store));
         let typed_queue = CandyTypedDeque::<u32, u32>::new(Arc::clone(&store));
 
-        assert!(!store.was_clean_shutdown());
-
         assert_eq!(typed_kv.get(&1u32)?, Some("uno".to_string()));
         assert_eq!(typed_kv.get(&2u32)?, None);
 
@@ -623,169 +545,9 @@ fn test_rebuild_if_dirty_recovers_typed_data() -> Result<(), Error> {
 }
 
 #[test]
-fn test_fail_if_dirty_rejects_reopen() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let fail_config = Config {
-        rebuild_strategy: RebuildStrategy::FailIfDirty,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), Config::default())?;
-        db.set("key", "value")?;
-        db._abort_for_testing();
-    }
-
-    assert!(matches!(
-        CandyStore::open(dir.path(), fail_config),
-        Err(Error::DirtyIndex)
-    ));
-
-    Ok(())
-}
-
-#[test]
-fn test_trust_dirty_index_if_checksum_correct_or_fail() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrFail,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key1", "val1")?;
-        db.set("key2", "val2")?;
-        db.set("key2", "val2_updated")?;
-        db._abort_for_testing();
-    }
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        assert!(!db.was_clean_shutdown());
-        assert_eq!(db.get("key1")?, Some(b"val1".to_vec()));
-        assert_eq!(db.get("key2")?, Some(b"val2_updated".to_vec()));
-        let waste_after_trust = db.stats().waste_bytes;
-        drop(db);
-
-        let waste_after_clean = CandyStore::open(dir.path(), config)?.stats().waste_bytes;
-        assert_eq!(waste_after_clean, waste_after_trust);
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_trust_dirty_index_fails_on_checksum_mismatch() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrFail,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key", "value")?;
-        db._abort_for_testing();
-    }
-
-    common::corrupt_first_row_checksum(dir.path());
-
-    assert!(matches!(
-        CandyStore::open(dir.path(), config),
-        Err(Error::IOError(io_err)) if io_err.kind() == std::io::ErrorKind::InvalidData
-    ));
-
-    Ok(())
-}
-
-#[test]
-fn test_trust_dirty_index_rebuilds_on_checksum_mismatch() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key1", "val1")?;
-        db.set("key2", "val2")?;
-        db.set("key2", "val2_updated")?;
-        db._abort_for_testing();
-    }
-
-    common::corrupt_first_row_checksum(dir.path());
-
-    let db = CandyStore::open(dir.path(), config)?;
-    assert!(!db.was_clean_shutdown());
-    assert_eq!(db.get("key1")?, Some(b"val1".to_vec()));
-    assert_eq!(db.get("key2")?, Some(b"val2_updated".to_vec()));
-
-    Ok(())
-}
-
-#[test]
-fn test_trust_dirty_index_resets_on_checksum_mismatch() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrReset,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key", "value")?;
-        db._abort_for_testing();
-    }
-
-    fs::write(dir.path().join("extra.txt"), b"junk").map_err(Error::IOError)?;
-    fs::create_dir(dir.path().join("extra_dir")).map_err(Error::IOError)?;
-    fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
-
-    common::corrupt_first_row_checksum(dir.path());
-
-    let db = CandyStore::open(dir.path(), config)?;
-    assert!(!db.was_clean_shutdown());
-    assert!(db.get("key")?.is_none());
-    assert!(!dir.path().join("extra.txt").exists());
-    assert!(!dir.path().join("extra_dir").exists());
-
-    Ok(())
-}
-
-#[test]
-fn test_reset_db_if_dirty_clears_state() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        rebuild_strategy: RebuildStrategy::ResetDBIfDirty,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        db.set("key", "value")?;
-        db._abort_for_testing();
-    }
-
-    fs::write(dir.path().join("extra.txt"), b"junk").map_err(Error::IOError)?;
-    fs::create_dir(dir.path().join("extra_dir")).map_err(Error::IOError)?;
-    fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
-
-    let db = CandyStore::open(dir.path(), config)?;
-    assert!(!db.was_clean_shutdown());
-    assert!(db.get("key")?.is_none());
-    assert!(!dir.path().join("extra.txt").exists());
-    assert!(!dir.path().join("extra_dir").exists());
-
-    Ok(())
-}
-
-#[test]
 fn test_reset_on_invalid_data_clears_corrupt_store() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let config = Config {
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         reset_on_invalid_data: true,
         ..Config::default()
     };
@@ -802,7 +564,36 @@ fn test_reset_on_invalid_data_clears_corrupt_store() -> Result<(), Error> {
     fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
 
     let db = CandyStore::open(dir.path(), config)?;
-    assert!(!db.was_clean_shutdown());
+    assert!(db.get("key")?.is_none());
+    assert!(!dir.path().join("extra.txt").exists());
+    assert!(!dir.path().join("extra_dir").exists());
+
+    db.set("fresh", "value")?;
+    assert_eq!(db.get("fresh")?, Some(b"value".to_vec()));
+
+    Ok(())
+}
+
+#[test]
+fn test_reset_on_invalid_data_clears_recovery_time_corruption() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        reset_on_invalid_data: true,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("key", "value")?;
+        db._abort_for_testing();
+    }
+
+    rewrite_first_data_entry_header(dir.path(), |header| (header & !(0b11 << 30)) | (0b10 << 30))?;
+    fs::write(dir.path().join("extra.txt"), b"junk").map_err(Error::IOError)?;
+    fs::create_dir(dir.path().join("extra_dir")).map_err(Error::IOError)?;
+    fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
     assert!(db.get("key")?.is_none());
     assert!(!dir.path().join("extra.txt").exists());
     assert!(!dir.path().join("extra_dir").exists());
@@ -837,6 +628,33 @@ fn test_recover_from_truncated_data_file() -> Result<(), Box<dyn std::error::Err
     let db = candystore::CandyStore::open(dir.path(), candystore::Config::default())?;
     assert_eq!(db.get("key1")?.as_deref(), Some("value1".as_bytes()));
     assert_eq!(db.get("key2")?, None);
+    assert_eq!(db.num_items(), 1);
+    assert_eq!(db.stats().num_entries(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_rebuild_if_dirty_recovers_from_invalid_commit_offset_without_double_counting()
+-> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("key1", "value1")?;
+        db.set("key2", "value2")?;
+        db.set("key2", "value2_updated")?;
+        db.set("key3", "value3")?;
+    }
+
+    write_commit_cursor(dir.path(), 5)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key1")?, Some(b"value1".to_vec()));
+    assert_eq!(db.get("key2")?, Some(b"value2_updated".to_vec()));
+    assert_eq!(db.get("key3")?, Some(b"value3".to_vec()));
+    assert_eq!(db.num_items(), 3);
+    assert_eq!(db.stats().num_entries(), 3);
     Ok(())
 }
 
@@ -845,7 +663,6 @@ fn test_progressive_rebuild_resumes_from_checkpoint() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let config = Config {
         max_data_file_size: 1024,
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Config::default()
     };
 
@@ -868,7 +685,7 @@ fn test_progressive_rebuild_resumes_from_checkpoint() -> Result<(), Error> {
                 "key{i:04} missing after full rebuild"
             );
         }
-        // Clean shutdown — checkpoint should be 0 now.
+        // Clean shutdown after rebuild should preserve all recovered data.
     }
 
     Ok(())
@@ -879,7 +696,6 @@ fn test_progressive_rebuild_survives_interrupted_rebuild() -> Result<(), Error> 
     let dir = tempdir().unwrap();
     let config = Config {
         max_data_file_size: 1024,
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Config::default()
     };
 
@@ -902,8 +718,8 @@ fn test_progressive_rebuild_survives_interrupted_rebuild() -> Result<(), Error> 
         db._abort_for_testing();
     }
 
-    // Phase 3: another rebuild — should rebuild from scratch (checkpoint was
-    // cleared after phase 2's successful rebuild) and recover everything.
+    // Phase 3: another rebuild should start from the persisted replay cursor
+    // and recover everything written before the second crash.
     {
         let db = CandyStore::open(dir.path(), config)?;
         for i in 0..150 {
@@ -923,7 +739,6 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
     let dir = tempdir().unwrap();
     let config = Config {
         max_data_file_size: 1024,
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
         ..Config::default()
     };
 
@@ -936,8 +751,7 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
         db._abort_for_testing();
     }
 
-    // Phase 2: reopen triggers rebuild (checksums wrong after crash).
-    // Rebuild completes. Write more, then crash.
+    // Phase 2: reopen and write more, then crash.
     {
         let db = CandyStore::open(dir.path(), config)?;
         for i in 100..200 {
@@ -946,10 +760,8 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
         db._abort_for_testing();
     }
 
-    // Phase 3: reopen. Checksums may pass (TrustIndex), but if there's a
-    // pending checkpoint, rebuild must resume. Since phase 2's rebuild
-    // completed (checkpoint cleared), and we crashed after new writes,
-    // the trust-checksums path should handle it.
+    // Phase 3: reopen — recovery replays from the commit cursor, so all
+    // data from phases 1+2 should be accessible.
     {
         let db = CandyStore::open(dir.path(), config)?;
         for i in 0..200 {
@@ -965,11 +777,10 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
 }
 
 #[test]
-fn test_progressive_rebuild_restarts_on_missing_checkpoint_file() -> Result<(), Error> {
+fn test_progressive_rebuild_ignores_bogus_checkpoint_offset() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let config = Config {
         max_data_file_size: 1024,
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
         ..Config::default()
     };
 
@@ -981,7 +792,9 @@ fn test_progressive_rebuild_restarts_on_missing_checkpoint_file() -> Result<(), 
         db._abort_for_testing();
     }
 
-    write_rebuild_checkpoint(dir.path(), u64::MAX - 7, 7, 0)?;
+    // Write a bogus commit cursor offset beyond any data — rebuild should
+    // fall back to replaying from offset 0.
+    write_commit_cursor(dir.path(), 0xFFFF_FFFF)?;
 
     let db = CandyStore::open(dir.path(), config)?;
     for i in 0..100 {
@@ -996,83 +809,46 @@ fn test_progressive_rebuild_restarts_on_missing_checkpoint_file() -> Result<(), 
 }
 
 #[test]
-fn test_progressive_rebuild_restarts_on_corrupt_checkpoint_tuple() -> Result<(), Error> {
+fn test_clean_reopen_rebuilds_invalid_active_checkpoint_across_multiple_data_files()
+-> Result<(), Error> {
     let dir = tempdir().unwrap();
-    let config = Config {
-        max_data_file_size: 1024,
-        rebuild_strategy: RebuildStrategy::TrustDirtyIndexIfChecksumCorrectOrRebuild,
-        ..Config::default()
-    };
+    let config = common::small_file_config();
+
+    let total_base_keys;
 
     {
         let db = CandyStore::open(dir.path(), config)?;
-        for i in 0..100 {
-            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        let mut next_idx = 0usize;
+        while db.stats().num_data_files < 3 {
+            let key = format!("multifile-base-{next_idx:04}");
+            let value = patterned_bytes_with_seed(512, next_idx);
+            db.set(&key, &value)?;
+            next_idx += 1;
         }
-        db._abort_for_testing();
+        total_base_keys = next_idx;
+
+        assert!(
+            db.stats().num_data_files >= 3,
+            "expected multiple data files before corrupting checkpoint"
+        );
+        assert_eq!(db.num_items(), total_base_keys);
     }
 
-    write_rebuild_checkpoint(dir.path(), 0x1234_5678_9abc_def0, 3, 128)?;
-    corrupt_rebuild_checkpoint_checksum(dir.path())?;
+    write_commit_cursor(dir.path(), 0xFFFF_FFFF)?;
 
     let db = CandyStore::open(dir.path(), config)?;
-    for i in 0..100 {
-        assert_eq!(
-            db.get(format!("key{i:04}"))?,
-            Some(format!("val{i:04}").into_bytes()),
-            "key{i:04} missing after rebuild with corrupt checkpoint"
-        );
+    assert!(
+        db.stats().num_data_files >= 3,
+        "expected the multi-file layout to survive recovery"
+    );
+
+    for idx in 0..total_base_keys {
+        let key = format!("multifile-base-{idx:04}");
+        assert_eq!(db.get(&key)?, Some(patterned_bytes_with_seed(512, idx)));
     }
 
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn test_progressive_rebuild_resumes_after_real_mid_rebuild_crash() -> Result<(), Error> {
-    let dir = tempdir().unwrap();
-    let config = Config {
-        max_data_file_size: 256 * 1024,
-        rebuild_strategy: RebuildStrategy::RebuildIfDirty,
-        ..Config::default()
-    };
-
-    {
-        let db = CandyStore::open(dir.path(), config)?;
-        for i in 0..3000u32 {
-            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
-        }
-        db._abort_for_testing();
-    }
-
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0);
-    if pid == 0 {
-        unsafe {
-            libc::setenv(
-                c"CANDYSTORE_ABORT_REBUILD_AFTER".as_ptr(),
-                c"1200".as_ptr(),
-                1,
-            );
-        }
-        let _ = CandyStore::open(dir.path(), config);
-        unsafe { libc::_exit(0) };
-    }
-
-    let mut status = 0i32;
-    let wait_rc = unsafe { libc::waitpid(pid, &mut status, 0) };
-    assert_eq!(wait_rc, pid);
-    assert!(libc::WIFSIGNALED(status));
-    assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
-
-    let db = CandyStore::open(dir.path(), config)?;
-    for i in 0..3000u32 {
-        assert_eq!(
-            db.get(format!("key{i:04}"))?,
-            Some(format!("val{i:04}").into_bytes()),
-            "key{i:04} missing after resume-from-offset rebuild"
-        );
-    }
+    assert_eq!(db.num_items(), total_base_keys);
+    assert_eq!(db.stats().num_entries(), total_base_keys as u64);
 
     Ok(())
 }

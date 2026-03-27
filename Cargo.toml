@@ -26,3 +26,6 @@ proptest = "1.10.0"
 tempfile = "3"
 rand = "0.10.0"
 libc = "0.2.183"
+
+[features]
+whitebox-testing = []

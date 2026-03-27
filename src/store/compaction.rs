@@ -129,14 +129,20 @@ impl StoreInner {
                     }
 
                     let active_idx = self.active_file_idx.load(Ordering::Acquire);
-                    let files = self.data_files.read();
-                    let active_file = files
+                    let active_file = self
+                        .data_files
+                        .read()
                         .get(&active_idx)
+                        .cloned()
                         .ok_or(Error::MissingDataFile(active_idx))?;
 
-                    match active_file.append_kv(ns, kv.key(), kv.value()) {
-                        Ok((file_off, size)) => {
-                            drop(files);
+                    match active_file.append_kv(
+                        crate::internal::EntryType::Update,
+                        ns,
+                        kv.key(),
+                        kv.value(),
+                    ) {
+                        Ok((file_off, size, _inflight_guard)) => {
                             self.record_write(size as u64);
                             moved_bytes = moved_bytes.saturating_add(size as u64);
                             row.replace_pointer(
@@ -151,12 +157,10 @@ impl StoreInner {
                             break;
                         }
                         Err(Error::RotateDataFile(rotate_idx)) => {
-                            drop(files);
                             drop(row);
                             rotate_idx_req = Some(rotate_idx);
                         }
                         Err(err) => {
-                            drop(files);
                             return Err(err);
                         }
                     }
@@ -180,6 +184,18 @@ impl StoreInner {
         let compacted_files = removed.len() as u64;
         drop(sources);
 
+        // Durability barrier: ensure all moved entries are durable in the active
+        // file and the updated index pointers are persisted before we delete the
+        // source files.  Without this, a crash after deletion could leave the
+        // persisted index pointing at files that no longer exist.
+        if !removed.is_empty() {
+            let active_idx = self.active_file_idx.load(Ordering::Acquire);
+            if let Some(active_file) = self.data_files.read().get(&active_idx).cloned() {
+                let _ = active_file.file.sync_all();
+            }
+            let _ = self.index_file.sync_all();
+        }
+
         let mut reclaimed_bytes = 0u64;
         for (file_idx, data_file) in removed {
             drop(data_file);
@@ -197,10 +213,7 @@ impl StoreInner {
             }
         }
 
-        self.index_file
-            .header_ref()
-            .reclaimed_bytes
-            .fetch_add(reclaimed_bytes, Ordering::Relaxed);
+        let _ = self.index_file.flush_header();
 
         Ok(CompactionOutcome {
             compacted_files,
@@ -342,18 +355,24 @@ impl Drop for CandyStore {
         if !data_files_synced {
             return;
         }
-        self.inner
-            .index_file
-            .header_ref()
-            .dirty
-            .store(0, Ordering::Release);
-        if self.inner.index_file.flush_header().is_err() {
+
+        // Advance the commit cursor so the next open can skip replay entirely.
+        let active_idx = self.inner.active_file_idx.load(Ordering::Relaxed);
+        if let Some(active_file) = self.inner.data_files.read().get(&active_idx).cloned() {
+            self.inner.index_file.rollover_uncommitted_counters();
             self.inner
                 .index_file
                 .header_ref()
-                .dirty
-                .store(1, Ordering::Release);
+                .commit_file_ordinal
+                .store(active_file.file_ordinal, Ordering::Release);
+            self.inner
+                .index_file
+                .header_ref()
+                .commit_offset
+                .store(active_file.used_bytes(), Ordering::Release);
         }
+
+        let _ = self.inner.index_file.sync_all();
     }
 }
 
