@@ -16,6 +16,7 @@ fn run_perf(
     let mut handles = Vec::new();
 
     let inserts_us = Arc::new(AtomicU64::new(0));
+    let updates_us = Arc::new(AtomicU64::new(0));
     let pos_gets_us = Arc::new(AtomicU64::new(0));
     let neg_gets_us = Arc::new(AtomicU64::new(0));
     let iter_us = Arc::new(AtomicU64::new(0));
@@ -24,6 +25,7 @@ fn run_perf(
     for t in 0..n_threads {
         let store = store.clone();
         let inserts_us = inserts_us.clone();
+        let updates_us = updates_us.clone();
         let pos_gets_us = pos_gets_us.clone();
         let neg_gets_us = neg_gets_us.clone();
         let iter_us = iter_us.clone();
@@ -31,7 +33,8 @@ fn run_perf(
 
         let handle = thread::spawn(move || {
             let mut key = vec![b'k'; key_size.max(4)];
-            let value = vec![b'v'; val_size];
+            let value1 = vec![b'v'; val_size];
+            let value2 = vec![b'V'; val_size];
             let start_idx = t as u32 * n;
             let end_idx = start_idx + n;
 
@@ -39,10 +42,23 @@ fn run_perf(
                 let t0 = Instant::now();
                 for i in start_idx..end_idx {
                     key[..4].copy_from_slice(&i.to_le_bytes());
-                    store.set(&key, &value).unwrap();
+                    store.set(&key, &value1).unwrap();
                 }
                 let duration = t0.elapsed();
                 inserts_us.fetch_add(
+                    duration.as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+
+            {
+                let t0 = Instant::now();
+                for i in start_idx..end_idx {
+                    key[..4].copy_from_slice(&i.to_le_bytes());
+                    store.set(&key, &value2).unwrap();
+                }
+                let duration = t0.elapsed();
+                updates_us.fetch_add(
                     duration.as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
@@ -116,6 +132,11 @@ fn run_perf(
             / (n_threads * n as usize) as f64
     );
     println!(
+        "    Updates: {} us/op",
+        updates_us.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / (n_threads * n as usize) as f64
+    );
+    println!(
         "    Positive Lookups: {} us/op",
         pos_gets_us.load(std::sync::atomic::Ordering::Relaxed) as f64
             / (n_threads * n as usize) as f64
@@ -124,6 +145,10 @@ fn run_perf(
         "    Negative Lookups: {} us/op",
         neg_gets_us.load(std::sync::atomic::Ordering::Relaxed) as f64
             / (n_threads * n as usize) as f64
+    );
+    println!(
+        "    Iter all: {} us/op",
+        iter_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / (n_threads * n as usize) as f64
     );
     println!(
         "    Removes: {} us/op\n",
