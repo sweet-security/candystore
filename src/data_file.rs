@@ -1,14 +1,15 @@
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::{
+    collections::VecDeque,
     fs::File,
     mem::size_of,
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -40,27 +41,163 @@ struct DataFileHeader {
 
 const _: () = assert!(size_of::<DataFileHeader>() == PAGE_SIZE);
 
+struct InflightSlot {
+    seq: AtomicU64,
+    ordinal: AtomicU64,
+    offset: AtomicU64,
+}
+
+pub(crate) struct InflightTracker {
+    snapshot_barrier: RwLock<()>,
+    next_seq: AtomicU64,
+    slots: Vec<InflightSlot>,
+    completed_deltas: Vec<Mutex<VecDeque<(u64, i64)>>>,
+}
+
+impl InflightTracker {
+    pub(crate) fn new(num_shards: usize) -> Self {
+        Self {
+            snapshot_barrier: RwLock::new(()),
+            next_seq: AtomicU64::new(1),
+            slots: (0..num_shards)
+                .map(|_| InflightSlot {
+                    seq: AtomicU64::new(0),
+                    ordinal: AtomicU64::new(0),
+                    offset: AtomicU64::new(0),
+                })
+                .collect(),
+            completed_deltas: (0..num_shards)
+                .map(|_| Mutex::new(VecDeque::new()))
+                .collect(),
+        }
+    }
+
+    fn reserve<'a>(
+        &'a self,
+        data_file: &DataFile,
+        shard_idx: usize,
+        len: u64,
+        delta: i8,
+    ) -> Result<(u64, InflightGuard<'a>)> {
+        let _barrier = self.snapshot_barrier.read();
+        let offset = data_file.allocate(len)?;
+        let ordinal = data_file.file_ordinal;
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[shard_idx];
+        slot.ordinal.store(ordinal, Ordering::Relaxed);
+        slot.offset.store(offset, Ordering::Relaxed);
+        slot.seq.store(seq, Ordering::Release);
+
+        Ok((
+            offset,
+            InflightGuard {
+                tracker: self,
+                shard_idx,
+                seq,
+                delta,
+                armed: true,
+            },
+        ))
+    }
+
+    pub(crate) fn checkpoint_progress(&self, active_file: &DataFile) -> (u64, u64, i64) {
+        let _barrier = self.snapshot_barrier.write();
+
+        let mut min_slot: Option<(u64, u64, u64)> = None;
+        for slot in &self.slots {
+            let seq = slot.seq.load(Ordering::Acquire);
+            if seq == 0 {
+                continue;
+            }
+            let ordinal = slot.ordinal.load(Ordering::Relaxed);
+            let offset = slot.offset.load(Ordering::Relaxed);
+            let current = (seq, ordinal, offset);
+            min_slot = Some(min_slot.map_or(current, |min_current| min_current.min(current)));
+        }
+
+        let checkpoint = min_slot
+            .map(|(_, ordinal, offset)| (ordinal, offset))
+            .unwrap_or_else(|| (active_file.file_ordinal, active_file.used_bytes()));
+        let completed_before_seq = min_slot.map_or(u64::MAX, |(seq, _, _)| seq);
+        let mut committed_delta = 0i64;
+        for queue in &self.completed_deltas {
+            let mut queue = queue.lock();
+            while let Some(&(seq, delta)) = queue.front() {
+                if seq >= completed_before_seq {
+                    break;
+                }
+                queue.pop_front();
+                committed_delta += delta;
+            }
+        }
+
+        (checkpoint.0, checkpoint.1, committed_delta)
+    }
+
+    pub(crate) fn clear_all(&self) {
+        let _barrier = self.snapshot_barrier.write();
+        for slot in &self.slots {
+            slot.seq.store(0, Ordering::Release);
+            slot.ordinal.store(0, Ordering::Relaxed);
+            slot.offset.store(0, Ordering::Relaxed);
+        }
+        for queue in &self.completed_deltas {
+            queue.lock().clear();
+        }
+    }
+
+    fn clear_matching(&self, shard_idx: usize, expected_seq: u64) {
+        let _barrier = self.snapshot_barrier.read();
+        let slot = &self.slots[shard_idx];
+        if slot.seq.load(Ordering::Acquire) == expected_seq {
+            slot.seq.store(0, Ordering::Release);
+        }
+    }
+
+    fn complete_matching(&self, shard_idx: usize, expected_seq: u64, delta: i8) {
+        let _barrier = self.snapshot_barrier.read();
+        let slot = &self.slots[shard_idx];
+        if slot.seq.load(Ordering::Acquire) == expected_seq {
+            slot.seq.store(0, Ordering::Release);
+            if delta != 0 {
+                self.completed_deltas[shard_idx]
+                    .lock()
+                    .push_back((expected_seq, i64::from(delta)));
+            }
+        }
+    }
+}
+
 pub(crate) struct InflightGuard<'a> {
-    data_file: &'a DataFile,
+    tracker: &'a InflightTracker,
+    shard_idx: usize,
+    seq: u64,
+    delta: i8,
+    armed: bool,
+}
+
+impl InflightGuard<'_> {
+    pub(crate) fn complete(mut self) {
+        if self.armed {
+            self.tracker
+                .complete_matching(self.shard_idx, self.seq, self.delta);
+            self.armed = false;
+        }
+    }
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.data_file.finish_inflight();
+        if self.armed {
+            self.tracker.clear_matching(self.shard_idx, self.seq);
+        }
     }
-}
-
-struct InflightWaiter {
-    mutex: Mutex<()>,
-    condvar: Condvar,
 }
 
 pub(crate) struct DataFile {
     pub(crate) file: File,
     file_offset: AtomicU64,
-    inflight_writes: AtomicU32,
     sealed_for_rotation: AtomicBool,
-    inflight_waiter: InflightWaiter,
     config: Arc<Config>,
     pub(crate) file_idx: u16,
     pub(crate) file_ordinal: u64,
@@ -171,12 +308,7 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(file_offset),
-            inflight_writes: AtomicU32::new(0),
             sealed_for_rotation: AtomicBool::new(false),
-            inflight_waiter: InflightWaiter {
-                mutex: Mutex::new(()),
-                condvar: Condvar::new(),
-            },
             config,
             file_idx,
             file_ordinal: header.ordinal,
@@ -211,33 +343,11 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(0),
-            inflight_writes: AtomicU32::new(0),
             sealed_for_rotation: AtomicBool::new(false),
-            inflight_waiter: InflightWaiter {
-                mutex: Mutex::new(()),
-                condvar: Condvar::new(),
-            },
             config,
             file_idx,
             file_ordinal: ordinal,
         })
-    }
-
-    fn start_inflight(&self) -> Result<InflightGuard<'_>> {
-        self.inflight_writes.fetch_add(1, Ordering::SeqCst);
-        if self.sealed_for_rotation.load(Ordering::SeqCst) {
-            self.finish_inflight();
-            return Err(Error::RotateDataFile(self.file_idx));
-        }
-
-        Ok(InflightGuard { data_file: self })
-    }
-
-    fn finish_inflight(&self) {
-        if self.inflight_writes.fetch_sub(1, Ordering::SeqCst) == 1 {
-            let _guard = self.inflight_waiter.mutex.lock();
-            self.inflight_waiter.condvar.notify_all();
-        }
     }
 
     pub(crate) fn seal_for_rotation(&self) {
@@ -245,6 +355,9 @@ impl DataFile {
     }
 
     fn allocate(&self, len: u64) -> Result<u64> {
+        if self.sealed_for_rotation.load(Ordering::SeqCst) {
+            return Err(Error::RotateDataFile(self.file_idx));
+        }
         let mut file_offset = self.file_offset.load(Ordering::Relaxed);
         loop {
             if file_offset + len > self.config.max_data_file_size as u64 {
@@ -262,13 +375,15 @@ impl DataFile {
         }
     }
 
-    fn append_entry(
+    fn append_entry<'a>(
         &self,
         entry_type: EntryType,
         ns: KeyNamespace,
         key: &[u8],
         val: Option<&[u8]>,
-    ) -> Result<(u64, usize, InflightGuard<'_>)> {
+        shard_idx: usize,
+        inflight_tracker: &'a InflightTracker,
+    ) -> Result<(u64, usize, InflightGuard<'a>)> {
         debug_assert!(key.len() <= MAX_USER_KEY_SIZE);
         debug_assert!(ns as u8 <= MAX_KEY_NAMESPACE);
 
@@ -279,8 +394,13 @@ impl DataFile {
 
         let entry_len = 4 + if val.is_some() { 4 } else { 2 } + val_len + key.len() + 2;
         let aligned_len = entry_len.next_multiple_of(FILE_OFFSET_ALIGNMENT as usize);
-        let inflight_guard = self.start_inflight()?;
-        let file_offset = self.allocate(aligned_len as u64)?;
+        let delta = match entry_type {
+            EntryType::Insert => 1,
+            EntryType::Tombstone => -1,
+            _ => 0,
+        };
+        let (file_offset, inflight_guard) =
+            inflight_tracker.reserve(self, shard_idx, aligned_len as u64, delta)?;
         debug_assert!(file_offset % FILE_OFFSET_ALIGNMENT == 0);
 
         let mut buf = SmallVec::<[u8; INLINE_SCRATCH_BUFFER_SIZE]>::with_capacity(aligned_len);
@@ -319,36 +439,35 @@ impl DataFile {
         Ok((file_offset, aligned_len, inflight_guard))
     }
 
-    /// Wait until all in-flight writes to this file have completed.
-    pub(crate) fn wait_inflight(&self) {
-        if self.inflight_writes.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-
-        let mut guard = self.inflight_waiter.mutex.lock();
-        while self.inflight_writes.load(Ordering::Acquire) > 0 {
-            self.inflight_waiter.condvar.wait(&mut guard);
-        }
-    }
-
-    pub(crate) fn append_kv(
+    pub(crate) fn append_kv<'a>(
         &self,
         entry_type: EntryType,
         ns: KeyNamespace,
         key: &[u8],
         val: &[u8],
-    ) -> Result<(u64, usize, InflightGuard<'_>)> {
+        shard_idx: usize,
+        inflight_tracker: &'a InflightTracker,
+    ) -> Result<(u64, usize, InflightGuard<'a>)> {
         debug_assert!(matches!(entry_type, EntryType::Insert | EntryType::Update));
-        self.append_entry(entry_type, ns, key, Some(val))
+        self.append_entry(entry_type, ns, key, Some(val), shard_idx, inflight_tracker)
     }
 
-    pub(crate) fn append_tombstone(
+    pub(crate) fn append_tombstone<'a>(
         &self,
         ns: KeyNamespace,
         key: &[u8],
-    ) -> Result<(usize, InflightGuard<'_>)> {
-        self.append_entry(EntryType::Tombstone, ns, key, None)
-            .map(|(_, len, guard)| (len, guard))
+        shard_idx: usize,
+        inflight_tracker: &'a InflightTracker,
+    ) -> Result<(usize, InflightGuard<'a>)> {
+        self.append_entry(
+            EntryType::Tombstone,
+            ns,
+            key,
+            None,
+            shard_idx,
+            inflight_tracker,
+        )
+        .map(|(_, len, guard)| (len, guard))
     }
 
     pub(crate) fn read_kv_into<'a>(

@@ -5,6 +5,7 @@
 #![cfg(feature = "whitebox-testing")]
 
 mod common;
+use crate::common::checkpoint_slot_checksum;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -23,10 +24,12 @@ const PTRS_OFFSET: usize = SIGS_OFFSET + ROW_WIDTH * 4;
 /// FILE_OFFSET_ALIGNMENT used in EntryPointer encoding.
 const FILE_OFFSET_ALIGNMENT: u64 = 16;
 
-/// Offset of `commit_file_ordinal` in the index header.
-const COMMIT_FILE_ORDINAL_OFFSET: u64 = 128;
-/// Offset of `commit_offset` in the index header.
-const COMMIT_OFFSET: u64 = 136;
+/// Offset of checkpoint slot 0 within the index header.
+const CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
+const CHECKPOINT_SLOT_GENERATION_OFFSET: u64 = 0;
+const CHECKPOINT_SLOT_ORDINAL_OFFSET: u64 = 8;
+const CHECKPOINT_SLOT_FILE_OFFSET: u64 = 16;
+const CHECKPOINT_SLOT_CHECKSUM_OFFSET: u64 = 24;
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -121,15 +124,35 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
         .map_err(Error::IOError)?;
 
     let ordinal = active_file_ordinal(dir)?;
+    let generation = 1u64;
+    let checksum = checkpoint_slot_checksum(generation, ordinal, offset);
 
-    file.seek(SeekFrom::Start(COMMIT_FILE_ORDINAL_OFFSET))
+    file.seek(SeekFrom::Start(
+        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_GENERATION_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
+    file.write_all(&generation.to_le_bytes())
         .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(
+        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_ORDINAL_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(COMMIT_OFFSET))
-        .map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(
+        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_FILE_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
     file.write_all(&offset.to_le_bytes())
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(
+        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_CHECKSUM_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
+    file.write_all(&checksum.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
     Ok(())

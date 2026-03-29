@@ -8,6 +8,12 @@ use std::sync::Arc;
 use candystore::{CandyStore, CandyTypedDeque, CandyTypedList, CandyTypedStore, Config, Error};
 use tempfile::tempdir;
 
+use crate::common::checkpoint_slot_checksum;
+
+const CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
+const CHECKPOINT_SLOT_STRIDE: u64 = 32;
+const CHECKPOINT_SLOT_CHECKSUM_OFFSET: u64 = 24;
+
 fn patterned_bytes_with_seed(len: usize, seed: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| (((idx * 31) + (seed * 17)) % 251) as u8)
@@ -97,21 +103,164 @@ fn active_file_ordinal(dir: &std::path::Path) -> Result<u64, Error> {
     })
 }
 
+fn data_files_by_ordinal(dir: &std::path::Path) -> Result<Vec<(u64, u64)>, Error> {
+    let mut files = Vec::new();
+
+    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
+        let entry = entry.map_err(Error::IOError)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("data_") {
+            continue;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        let ordinal = u64::from_le_bytes(buf);
+        let used_bytes = file
+            .metadata()
+            .map_err(Error::IOError)?
+            .len()
+            .saturating_sub(4096);
+        files.push((ordinal, used_bytes));
+    }
+
+    files.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(files)
+}
+
+fn data_file_records_by_ordinal(
+    dir: &std::path::Path,
+) -> Result<Vec<(u16, u64, u64, std::path::PathBuf)>, Error> {
+    let mut files = Vec::new();
+
+    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
+        let entry = entry.map_err(Error::IOError)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(file_idx) = name
+            .strip_prefix("data_")
+            .and_then(|suffix| suffix.parse::<u16>().ok())
+        else {
+            continue;
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        let ordinal = u64::from_le_bytes(buf);
+        let used_bytes = file
+            .metadata()
+            .map_err(Error::IOError)?
+            .len()
+            .saturating_sub(4096);
+        files.push((file_idx, ordinal, used_bytes, path));
+    }
+
+    files.sort_by_key(|(_, ordinal, _, _)| *ordinal);
+    Ok(files)
+}
+
 fn write_commit_cursor(dir: &std::path::Path, offset: u64) -> Result<(), Error> {
+    let ordinal = active_file_ordinal(dir)?;
+    write_commit_cursor_for_ordinal(dir, ordinal, offset)
+}
+
+fn write_commit_cursor_for_ordinal(
+    dir: &std::path::Path,
+    ordinal: u64,
+    offset: u64,
+) -> Result<(), Error> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(dir.join("index"))
         .map_err(Error::IOError)?;
 
-    let ordinal = active_file_ordinal(dir)?;
+    let generation = next_checkpoint_generation(&mut file)?;
+    let checksum = checkpoint_slot_checksum(generation, ordinal, offset);
+    let slot_offset = 128 + (generation as u64 % 2) * 32;
 
-    file.seek(SeekFrom::Start(128)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(slot_offset))
+        .map_err(Error::IOError)?;
+    file.write_all(&generation.to_le_bytes())
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(slot_offset + 8))
+        .map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(136)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(slot_offset + 16))
+        .map_err(Error::IOError)?;
     file.write_all(&offset.to_le_bytes())
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(slot_offset + 24))
+        .map_err(Error::IOError)?;
+    file.write_all(&checksum.to_le_bytes())
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    Ok(())
+}
+
+fn next_checkpoint_generation(file: &mut std::fs::File) -> Result<u64, Error> {
+    use std::io::Read;
+
+    let mut max_generation = 0u64;
+    for slot_offset in [128u64, 160u64] {
+        file.seek(SeekFrom::Start(slot_offset))
+            .map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        max_generation = max_generation.max(u64::from_le_bytes(buf));
+    }
+
+    Ok(max_generation + 1)
+}
+
+fn corrupt_latest_checkpoint_slot_checksum(dir: &std::path::Path) -> Result<(), Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("index"))
+        .map_err(Error::IOError)?;
+
+    let mut latest_generation = 0u64;
+    let mut latest_slot_offset = CHECKPOINT_SLOT_0_OFFSET;
+    for slot_offset in [
+        CHECKPOINT_SLOT_0_OFFSET,
+        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_STRIDE,
+    ] {
+        file.seek(SeekFrom::Start(slot_offset))
+            .map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        let generation = u64::from_le_bytes(buf);
+        if generation >= latest_generation {
+            latest_generation = generation;
+            latest_slot_offset = slot_offset;
+        }
+    }
+
+    file.seek(SeekFrom::Start(
+        latest_slot_offset + CHECKPOINT_SLOT_CHECKSUM_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
+    file.write_all(&0u32.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
     Ok(())
@@ -901,6 +1050,38 @@ fn test_progressive_rebuild_ignores_bogus_checkpoint_offset() -> Result<(), Erro
 }
 
 #[test]
+fn test_progressive_rebuild_falls_back_to_older_valid_checkpoint_slot() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db._abort_for_testing();
+    }
+
+    write_commit_cursor(dir.path(), 0)?;
+    write_commit_cursor(dir.path(), 0xFFFF_FFFF)?;
+    corrupt_latest_checkpoint_slot_checksum(dir.path())?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for i in 0..100 {
+        assert_eq!(
+            db.get(format!("key{i:04}"))?,
+            Some(format!("val{i:04}").into_bytes()),
+            "key{i:04} missing after fallback to older valid checkpoint slot"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_clean_reopen_rebuilds_invalid_active_checkpoint_across_multiple_data_files()
 -> Result<(), Error> {
     let dir = tempdir().unwrap();
@@ -940,6 +1121,164 @@ fn test_clean_reopen_rebuilds_invalid_active_checkpoint_across_multiple_data_fil
     }
 
     assert_eq!(db.num_items(), total_base_keys);
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_replays_later_files_after_checkpointing_an_older_file() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = common::small_file_config();
+
+    let total_keys;
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut next_idx = 0usize;
+        while db.stats().num_data_files < 3 {
+            let key = format!("older-cursor-{next_idx:04}");
+            let value = patterned_bytes_with_seed(512, next_idx);
+            db.set(&key, &value)?;
+            next_idx += 1;
+        }
+        total_keys = next_idx;
+    }
+
+    let files = data_files_by_ordinal(dir.path())?;
+    assert!(
+        files.len() >= 3,
+        "expected multiple data files for replay test"
+    );
+    let (older_ordinal, older_used_bytes) = files[0];
+    write_commit_cursor_for_ordinal(dir.path(), older_ordinal, older_used_bytes)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert!(
+        db.stats().num_rebuilt_entries > 0,
+        "expected recovery to replay later files after rewinding commit cursor"
+    );
+    for idx in 0..total_keys {
+        let key = format!("older-cursor-{idx:04}");
+        assert_eq!(db.get(&key)?, Some(patterned_bytes_with_seed(512, idx)));
+    }
+    assert_eq!(db.num_items(), total_keys);
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_replays_later_files_when_checkpoint_file_is_missing() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 16 * 1024,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+
+    let mut expected = Vec::new();
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut update_idx = 0usize;
+        let final_hot = loop {
+            let value = patterned_bytes_with_seed(6 * 1024, update_idx);
+            db.set("hot", &value)?;
+            update_idx += 1;
+            if db.stats().num_data_files >= 5 {
+                break value;
+            }
+        };
+        expected.push(("hot".to_owned(), final_hot));
+
+        for idx in 0..4usize {
+            let key = format!("tail-live-{idx:02}");
+            let value = patterned_bytes_with_seed(2048, 10_000 + idx);
+            db.set(&key, &value)?;
+            expected.push((key, value));
+        }
+    }
+
+    let files = data_file_records_by_ordinal(dir.path())?;
+    assert!(
+        files.len() >= 4,
+        "expected enough rotated files to simulate a missing checkpoint file"
+    );
+
+    let (_, missing_ordinal, missing_used_bytes, missing_path) = &files[1];
+    write_commit_cursor_for_ordinal(dir.path(), *missing_ordinal, *missing_used_bytes)?;
+    fs::remove_file(missing_path).map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert!(
+        db.stats().num_rebuilt_entries > 0,
+        "expected recovery to replay entries after a missing checkpoint file"
+    );
+    for (key, value) in expected {
+        assert_eq!(
+            db.get(&key)?,
+            Some(value),
+            "{key} missing after replaying past a missing checkpoint file"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_ignores_missing_compacted_files_before_checkpoint_cursor() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 16 * 1024,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+
+    let mut expected = Vec::new();
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut update_idx = 0usize;
+        let final_hot = loop {
+            let value = patterned_bytes_with_seed(6 * 1024, 20_000 + update_idx);
+            db.set("hot", &value)?;
+            update_idx += 1;
+            if db.stats().num_data_files >= 5 {
+                break value;
+            }
+        };
+        expected.push(("hot".to_owned(), final_hot));
+
+        for idx in 0..6usize {
+            let key = format!("post-cursor-live-{idx:02}");
+            let value = patterned_bytes_with_seed(1536, 30_000 + idx);
+            db.set(&key, &value)?;
+            expected.push((key, value));
+        }
+    }
+
+    let files = data_file_records_by_ordinal(dir.path())?;
+    assert!(
+        files.len() >= 5,
+        "expected enough files to simulate compacted files before the checkpoint cursor"
+    );
+
+    let (_, checkpoint_ordinal, checkpoint_used_bytes, _) = &files[2];
+    let (_, _, _, missing_path) = &files[0];
+    write_commit_cursor_for_ordinal(dir.path(), *checkpoint_ordinal, *checkpoint_used_bytes)?;
+    fs::remove_file(missing_path).map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert!(
+        db.stats().num_rebuilt_entries > 0,
+        "expected recovery to replay entries after skipping compacted files before the cursor"
+    );
+    for (key, value) in expected {
+        assert_eq!(
+            db.get(&key)?,
+            Some(value),
+            "{key} missing after skipping compacted files before the checkpoint cursor"
+        );
+    }
 
     Ok(())
 }
