@@ -51,19 +51,13 @@ pub(crate) struct IndexFileHeader {
     // stats
     ///////////////////////////////////
     pub(crate) committed_num_entries: AtomicU64,
-    _reserved_data_bytes: AtomicU64,
-    _reserved_waste_bytes: AtomicU64,
-
     pub(crate) uncommitted_entries_delta: AtomicI64,
-    _reserved_data_delta: AtomicI64,
-    _reserved_waste_delta: AtomicI64,
 
-    _trailer: [u8; PAGE_SIZE - 1072],
+    _trailer: [u8; PAGE_SIZE - 1024 - 2 * 8],
 }
 
 const _: () = assert!(offset_of!(IndexFileHeader, global_split_level) == 64);
 const _: () = assert!(offset_of!(IndexFileHeader, commit_file_ordinal) == 128);
-const _: () = assert!(offset_of!(IndexFileHeader, commit_offset) == 136);
 const _: () = assert!(offset_of!(IndexFileHeader, committed_num_entries) == 1024);
 const _: () = assert!(size_of::<IndexFileHeader>() == PAGE_SIZE);
 
