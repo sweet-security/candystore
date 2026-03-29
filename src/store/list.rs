@@ -47,7 +47,7 @@ impl ListIterator<'_> {
     }
 
     fn try_heal_head(&self, new_head: u64) -> Result<()> {
-        let _lock = self.store.logical_write_guard(self.ns.meta, &self.list);
+        let _lock = self.store.list_write_guard(self.ns.meta, &self.list);
         let mut meta = get_list_meta(self.store, self.ns, &self.list)?;
         if meta.head >= self.initial_next_idx && meta.head < new_head {
             meta.head = new_head;
@@ -61,7 +61,7 @@ impl ListIterator<'_> {
     }
 
     fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
-        let _lock = self.store.logical_write_guard(self.ns.meta, &self.list);
+        let _lock = self.store.list_write_guard(self.ns.meta, &self.list);
         let mut meta = get_list_meta(self.store, self.ns, &self.list)?;
         if meta.tail <= self.initial_end_idx && meta.tail > new_tail {
             meta.tail = new_tail;
@@ -302,7 +302,7 @@ impl CandyStore {
         list_key: &[u8],
         mut func: impl FnMut(&[u8], &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        let _lock = self.logical_write_guard(ns.meta, list_key);
+        let _lock = self.list_write_guard(ns.meta, list_key);
         let mut meta = get_list_meta(self, ns, list_key)?;
         if meta.count == 0 {
             return Ok(());
@@ -365,7 +365,7 @@ impl CandyStore {
         value: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         self.validate_list_item_sizes(list, key, value)?;
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
 
         let mut meta = get_list_meta(self, ns, list)?;
         let data_key = make_list_data_key(list, key);
@@ -421,7 +421,7 @@ impl CandyStore {
         expected: Option<&[u8]>,
     ) -> Result<ReplaceStatus> {
         self.validate_list_item_sizes(list, key, value)?;
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
 
         let data_key = make_list_data_key(list, key);
         let Some(existing_value) = self.get_ns(ns.data, &data_key)? else {
@@ -449,7 +449,7 @@ impl CandyStore {
         value: &[u8],
     ) -> Result<GetOrCreateStatus> {
         self.validate_list_item_sizes(list, key, value)?;
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
 
         let data_key = make_list_data_key(list, key);
         if let Some(existing) = self.get_ns(ns.data, &data_key)? {
@@ -482,7 +482,7 @@ impl CandyStore {
         value: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         self.validate_list_item_sizes(list, key, value)?;
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
         let mut meta = get_list_meta(self, ns, list)?;
         let data_key = make_list_data_key(list, key);
 
@@ -522,7 +522,7 @@ impl CandyStore {
         list: &[u8],
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let _lock = self.logical_read_guard(ns.meta, list);
+        let _lock = self.list_read_guard(ns.meta, list);
         let data_key = make_list_data_key(list, key);
         Ok(self.get_ns(ns.data, &data_key)?.map(strip_idx_suffix))
     }
@@ -533,7 +533,7 @@ impl CandyStore {
         list: &[u8],
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
         self._list_remove_with_ns(ns, list, key)
     }
 
@@ -631,7 +631,7 @@ impl CandyStore {
     }
 
     pub(super) fn list_discard_with_ns(&self, ns: ListNamespaces, list: &[u8]) -> Result<bool> {
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
         let meta = get_list_meta(self, ns, list)?;
         if meta.count == 0 {
             return Ok(false);
@@ -655,7 +655,7 @@ impl CandyStore {
         list: &[u8],
         params: ListCompactionParams,
     ) -> Result<bool> {
-        let _lock = self.logical_write_guard(ns.meta, list);
+        let _lock = self.list_write_guard(ns.meta, list);
         let mut meta = get_list_meta(self, ns, list)?;
         if meta.count == 0 {
             return Ok(false);
@@ -725,7 +725,7 @@ impl CandyStore {
         ns: ListNamespaces,
         list_key: &[u8],
     ) -> Result<Option<KVPair>> {
-        let _lock = self.logical_write_guard(ns.meta, list_key);
+        let _lock = self.list_write_guard(ns.meta, list_key);
         let head = self.peek_list_head_with_ns(ns, list_key)?;
         if let Some((key, _)) = head
             && let Some(value) = self._list_remove_with_ns(ns, list_key, &key)?
@@ -740,7 +740,7 @@ impl CandyStore {
         ns: ListNamespaces,
         list_key: &[u8],
     ) -> Result<Option<KVPair>> {
-        let _lock = self.logical_write_guard(ns.meta, list_key);
+        let _lock = self.list_write_guard(ns.meta, list_key);
         let tail = self.peek_list_tail_with_ns(ns, list_key)?;
         if let Some((key, _)) = tail
             && let Some(value) = self._list_remove_with_ns(ns, list_key, &key)?

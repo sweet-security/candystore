@@ -117,6 +117,62 @@ fn write_commit_cursor(dir: &std::path::Path, offset: u64) -> Result<(), Error> 
     Ok(())
 }
 
+fn active_data_file_path(dir: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+    let active_ordinal = active_file_ordinal(dir)?;
+
+    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
+        let entry = entry.map_err(Error::IOError)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("data_") {
+            continue;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf).map_err(Error::IOError)?;
+        if u64::from_le_bytes(buf) == active_ordinal {
+            return Ok(path);
+        }
+    }
+
+    Err(Error::IOError(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "active data file not found",
+    )))
+}
+
+fn append_aligned_tail_garbage(dir: &std::path::Path, len: usize) -> Result<(), Error> {
+    debug_assert_eq!(len % 16, 0);
+
+    let path = active_data_file_path(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(Error::IOError)?;
+    file.write_all(&vec![0xA5; len]).map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    Ok(())
+}
+
+fn assert_rebuild_stats_non_zero(db: &CandyStore) {
+    let stats = db.stats();
+    assert!(
+        stats.num_rebuilt_entries > 0,
+        "expected rebuild to replay at least one entry"
+    );
+    assert!(
+        stats.num_rebuild_purged_bytes > 0,
+        "expected rebuild to trim a dirty file tail"
+    );
+}
+
 #[test]
 fn test_recovery_after_dirty_shutdown() -> Result<(), Error> {
     let dir = tempdir().unwrap();
@@ -629,7 +685,6 @@ fn test_recover_from_truncated_data_file() -> Result<(), Box<dyn std::error::Err
     assert_eq!(db.get("key1")?.as_deref(), Some("value1".as_bytes()));
     assert_eq!(db.get("key2")?, None);
     assert_eq!(db.num_items(), 1);
-    assert_eq!(db.stats().num_entries(), 1);
     Ok(())
 }
 
@@ -654,7 +709,6 @@ fn test_rebuild_if_dirty_recovers_from_invalid_commit_offset_without_double_coun
     assert_eq!(db.get("key2")?, Some(b"value2_updated".to_vec()));
     assert_eq!(db.get("key3")?, Some(b"value3".to_vec()));
     assert_eq!(db.num_items(), 3);
-    assert_eq!(db.stats().num_entries(), 3);
     Ok(())
 }
 
@@ -674,10 +728,12 @@ fn test_progressive_rebuild_resumes_from_checkpoint() -> Result<(), Error> {
         }
         db._abort_for_testing();
     }
+    append_aligned_tail_garbage(dir.path(), 64)?;
 
     // Phase 2: reopen triggers rebuild. Verify all data survived.
     {
         let db = CandyStore::open(dir.path(), config)?;
+        assert_rebuild_stats_non_zero(&db);
         for i in 0..100 {
             assert_eq!(
                 db.get(format!("key{i:04}"))?,
@@ -717,11 +773,13 @@ fn test_progressive_rebuild_survives_interrupted_rebuild() -> Result<(), Error> 
         }
         db._abort_for_testing();
     }
+    append_aligned_tail_garbage(dir.path(), 64)?;
 
     // Phase 3: another rebuild should start from the persisted replay cursor
     // and recover everything written before the second crash.
     {
         let db = CandyStore::open(dir.path(), config)?;
+        assert_rebuild_stats_non_zero(&db);
         for i in 0..150 {
             assert_eq!(
                 db.get(format!("key{i:04}"))?,
@@ -759,11 +817,13 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
         }
         db._abort_for_testing();
     }
+    append_aligned_tail_garbage(dir.path(), 64)?;
 
     // Phase 3: reopen — recovery replays from the commit cursor, so all
     // data from phases 1+2 should be accessible.
     {
         let db = CandyStore::open(dir.path(), config)?;
+        assert_rebuild_stats_non_zero(&db);
         for i in 0..200 {
             assert_eq!(
                 db.get(format!("key{i:04}"))?,
@@ -771,6 +831,38 @@ fn test_progressive_rebuild_with_trust_strategy_resumes_pending() -> Result<(), 
                 "key{i:04} missing after trust-or-rebuild"
             );
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_checkpoint_advances_recovery_cursor() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), format!("val{i:04}"))?;
+        }
+        db.checkpoint()?;
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    let stats = db.stats();
+    assert_eq!(stats.num_rebuilt_entries, 0);
+    assert_eq!(stats.num_rebuild_purged_bytes, 0);
+    for i in 0..100 {
+        assert_eq!(
+            db.get(format!("key{i:04}"))?,
+            Some(format!("val{i:04}").into_bytes()),
+            "key{i:04} missing after checkpointed reopen"
+        );
     }
 
     Ok(())
@@ -848,7 +940,6 @@ fn test_clean_reopen_rebuilds_invalid_active_checkpoint_across_multiple_data_fil
     }
 
     assert_eq!(db.num_items(), total_base_keys);
-    assert_eq!(db.stats().num_entries(), total_base_keys as u64);
 
     Ok(())
 }

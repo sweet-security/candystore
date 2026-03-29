@@ -187,32 +187,38 @@ impl Default for ListCompactionParams {
 pub struct Stats {
     /// Number of allocated index rows.
     pub num_rows: u64,
-    /// Theoretical maximum number of entries at the current row count.
-    pub capacity: u64,
     /// Number of currently live entries.
     pub num_items: u64,
-    /// Total bytes occupied by index metadata files.
-    pub index_size_bytes: u64,
-    /// Number of completed background compactions.
-    pub num_compactions: u64,
-    /// Total time spent in compaction, in milliseconds.
-    pub compaction_time_ms: u64,
     /// Number of data files currently present.
     pub num_data_files: u64,
-    /// Number of successful key lookups.
-    pub num_positive_lookups: u64,
-    /// Number of failed key lookups.
-    pub num_negative_lookups: u64,
-    /// Number of probes that had to inspect a second matching index entry.
-    pub num_collisions: u64,
+
+    /// Total bytes occupied by index metadata files.
+    pub index_size_bytes: u64,
+
     /// Time spent in the most recent grow remap operation.
     pub last_remap_dur: Duration,
+    /// Number of completed background compactions.
+    pub num_compactions: u64,
     /// Time spent in the most recent successful file compaction.
     pub last_compaction_dur: Duration,
     /// Bytes reclaimed by the most recent successful file compaction.
     pub last_compaction_reclaimed_bytes: u32,
     /// Bytes rewritten by the most recent successful file compaction.
     pub last_compaction_moved_bytes: u32,
+
+    /// Number of entry creations recorded since open.
+    pub num_inserted: u64,
+    /// Number of entry removals recorded since open.
+    pub num_removed: u64,
+    /// Number of entry replacements recorded since open.
+    pub num_updated: u64,
+    /// Number of successful key lookups.
+    pub num_positive_lookups: u64,
+    /// Number of failed key lookups.
+    pub num_negative_lookups: u64,
+    /// Number of probes that had to inspect a second matching index entry.
+    pub num_collisions: u64,
+
     /// Number of read operations performed against data files.
     pub num_read_ops: u64,
     /// Total bytes read from data files.
@@ -221,18 +227,17 @@ pub struct Stats {
     pub num_write_ops: u64,
     /// Total bytes written to data files.
     pub num_write_bytes: u64,
-    /// Number of entry creations recorded since open.
-    pub num_created: u64,
-    /// Number of entry removals recorded since open.
-    pub num_removed: u64,
-    /// Number of entry replacements recorded since open.
-    pub num_replaced: u64,
-    /// Total logical entry bytes written since open.
-    pub written_bytes: u64,
-    /// Total bytes currently occupied by live entries.
-    pub data_bytes: u64,
+
+    /// Number of entries replayed during the most recent recovery rebuild.
+    pub num_rebuilt_entries: u64,
+    /// Number of trailing data-file bytes discarded during the most recent recovery rebuild.
+    pub num_rebuild_purged_bytes: u64,
+
+    /// Total bytes currently occupied by the data files (including waste)
+    pub total_bytes: u64,
     /// Total bytes currently accounted as unreclaimed waste.
     pub waste_bytes: u64,
+
     /// Approximate histogram bucket for entries under 64 bytes since open.
     pub entries_under_64: u64,
     /// Approximate histogram bucket for entries under 256 bytes since open.
@@ -248,51 +253,13 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// Returns the fraction of the current index capacity occupied by live entries.
-    pub fn fill_level(&self) -> f64 {
-        if self.capacity == 0 {
-            return 0.0;
-        }
-        self.num_items as f64 / self.capacity as f64
+    /// Theoretical maximum number of entries at the current row count.
+    pub fn index_capacity(&self) -> u64 {
+        self.num_rows.saturating_mul(ROW_WIDTH as u64)
     }
 
-    /// Returns the number of live entries.
-    pub fn num_entries(&self) -> u64 {
-        self.num_items
-    }
-
-    /// Returns the current unreclaimed waste in bytes.
-    pub fn current_waste(&self) -> u64 {
-        self.waste_bytes
-    }
-
-    /// Returns bytes currently occupied by live data.
+    /// bytes used for live data entries
     pub fn data_bytes(&self) -> u64 {
-        self.data_bytes
-    }
-
-    /// Returns bytes currently occupied by live data.
-    pub fn occupied_bytes(&self) -> u64 {
-        self.data_bytes()
-    }
-
-    /// Returns current unreclaimed waste in bytes.
-    pub fn wasted_bytes(&self) -> u64 {
-        self.current_waste()
-    }
-
-    /// Returns the number of inserted entries.
-    pub fn num_inserts(&self) -> u64 {
-        self.num_created
-    }
-
-    /// Returns the number of updated entries.
-    pub fn num_updates(&self) -> u64 {
-        self.num_replaced
-    }
-
-    /// Returns the number of removed entries.
-    pub fn num_removals(&self) -> u64 {
-        self.num_removed
+        self.total_bytes.saturating_sub(self.waste_bytes)
     }
 }

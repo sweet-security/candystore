@@ -22,9 +22,9 @@ pub(crate) const MAX_DATA_FILES: u16 = 1 << 12;
 pub(crate) const MAX_DATA_FILE_IDX: u16 = MAX_DATA_FILES - 1;
 
 pub(crate) const INDEX_FILE_SIGNATURE: &[u8; 8] = b"CandyStr";
-pub(crate) const INDEX_FILE_VERSION: u32 = 0x0002_0002;
+pub(crate) const INDEX_FILE_VERSION: u32 = 0x0002_0007;
 pub(crate) const DATA_FILE_SIGNATURE: &[u8; 8] = b"CandyDat";
-pub(crate) const DATA_FILE_VERSION: u32 = 0x0002_0001;
+pub(crate) const DATA_FILE_VERSION: u32 = 0x0002_0002;
 pub(crate) const FILE_OFFSET_ALIGNMENT: u64 = 16;
 pub(crate) const SIZE_HINT_UNIT: usize = 512;
 pub(crate) const DATA_ENTRY_OFFSET_MAGIC: u32 = 0x91c8_d7cd;

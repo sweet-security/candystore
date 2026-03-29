@@ -40,7 +40,6 @@ struct CompactionState {
 #[derive(Default)]
 struct InnerStats {
     num_compactions: AtomicU64,
-    compaction_time_ms: AtomicU64,
     compaction_errors: AtomicU64,
     num_positive_lookups: AtomicU64,
     num_negative_lookups: AtomicU64,
@@ -53,17 +52,17 @@ struct InnerStats {
     num_read_bytes: AtomicU64,
     num_write_ops: AtomicU64,
     num_write_bytes: AtomicU64,
-    num_created: AtomicU64,
+    num_inserted: AtomicU64,
+    num_updated: AtomicU64,
     num_removed: AtomicU64,
-    num_replaced: AtomicU64,
-    written_bytes: AtomicU64,
+    num_rebuilt_entries: AtomicU64,
+    num_rebuild_purged_bytes: AtomicU64,
     size_histogram: [AtomicU64; 6],
 }
 
 impl InnerStats {
     fn reset(&self) {
         self.num_compactions.store(0, Ordering::Relaxed);
-        self.compaction_time_ms.store(0, Ordering::Relaxed);
         self.compaction_errors.store(0, Ordering::Relaxed);
         self.num_positive_lookups.store(0, Ordering::Relaxed);
         self.num_negative_lookups.store(0, Ordering::Relaxed);
@@ -77,10 +76,11 @@ impl InnerStats {
         self.num_read_bytes.store(0, Ordering::Relaxed);
         self.num_write_ops.store(0, Ordering::Relaxed);
         self.num_write_bytes.store(0, Ordering::Relaxed);
-        self.num_created.store(0, Ordering::Relaxed);
+        self.num_inserted.store(0, Ordering::Relaxed);
         self.num_removed.store(0, Ordering::Relaxed);
-        self.num_replaced.store(0, Ordering::Relaxed);
-        self.written_bytes.store(0, Ordering::Relaxed);
+        self.num_updated.store(0, Ordering::Relaxed);
+        self.num_rebuilt_entries.store(0, Ordering::Relaxed);
+        self.num_rebuild_purged_bytes.store(0, Ordering::Relaxed);
         for bucket in &self.size_histogram {
             bucket.store(0, Ordering::Relaxed);
         }
@@ -91,8 +91,8 @@ struct StoreInner {
     base_path: PathBuf,
     config: Arc<Config>,
     index_file: IndexFile,
-    logical_locks: Vec<RwLock<()>>,
-    logical_locks_mask: usize,
+    list_meta_locks: Vec<RwLock<()>>,
+    list_meta_locks_mask: usize,
     data_files: RwLock<HashMap<u16, Arc<DataFile>>>,
     active_file_idx: AtomicU16,
     active_file_ordinal: AtomicU64,
@@ -132,8 +132,8 @@ impl StoreInner {
             base_path,
             config,
             index_file: state.index_file,
-            logical_locks: (0..num_logical_locks).map(|_| RwLock::new(())).collect(),
-            logical_locks_mask: num_logical_locks - 1,
+            list_meta_locks: (0..num_logical_locks).map(|_| RwLock::new(())).collect(),
+            list_meta_locks_mask: num_logical_locks - 1,
             data_files: RwLock::new(state.data_files),
             active_file_idx: AtomicU16::new(state.active_file_idx),
             active_file_ordinal: AtomicU64::new(state.active_file_ordinal),
@@ -146,13 +146,13 @@ impl StoreInner {
     }
 
     fn reset(&self) -> Result<()> {
-        let _rotation_lock = self.rotation_lock.lock();
         let _logical_guards = self
-            .logical_locks
+            .list_meta_locks
             .iter()
             .map(|lock| lock.write())
             .collect::<Vec<_>>();
         let row_table = self.index_file.rows_table_mut();
+        let _rotation_lock = self.rotation_lock.lock();
         let mut data_files = self.data_files.write();
 
         data_files.clear();
@@ -289,7 +289,7 @@ impl StoreInner {
         let mut hasher = SipHasher13::new_with_keys(0x1701_0a66_2024_6b90, 0x284f_fa2e_3e02_3e2a);
         hasher.write_u8(ns as u8);
         hasher.write(key);
-        (hasher.finish() as usize) & self.logical_locks_mask
+        (hasher.finish() as usize) & self.list_meta_locks_mask
     }
 
     fn data_file(&self, file_idx: u16) -> Result<Arc<DataFile>> {
@@ -312,6 +312,18 @@ impl StoreInner {
             .header_ref()
             .uncommitted_entries_delta
             .fetch_add(delta, Ordering::Relaxed);
+    }
+
+    fn persist_active_file_checkpoint(&self, active_file: &Arc<DataFile>) {
+        self.index_file.rollover_uncommitted_counters();
+        self.index_file
+            .header_ref()
+            .commit_file_ordinal
+            .store(active_file.file_ordinal, Ordering::Release);
+        self.index_file
+            .header_ref()
+            .commit_offset
+            .store(active_file.used_bytes(), Ordering::Release);
     }
 
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
@@ -377,6 +389,7 @@ impl StoreInner {
     /// `compact_file` also writes to `data_files` (removing files) but only
     /// touches non-active indices, so there is no conflict.
     fn _rotate_data_file(&self, active_idx: u16) -> Result<()> {
+        let mut rows_table = self.index_file.rows_table_mut();
         let _rot_lock = self.rotation_lock.lock();
 
         if self.active_file_idx.load(Ordering::Acquire) != active_idx {
@@ -411,17 +424,8 @@ impl StoreInner {
         active_file.wait_inflight();
         let _ = active_file.file.sync_all();
 
-        self.index_file.rollover_uncommitted_counters();
-        self.index_file
-            .header_ref()
-            .commit_file_ordinal
-            .store(active_file.file_ordinal, Ordering::Release);
-        self.index_file
-            .header_ref()
-            .commit_offset
-            .store(active_file.used_bytes(), Ordering::Release);
-
-        let _ = self.index_file.sync_all();
+        self.persist_active_file_checkpoint(&active_file);
+        let _ = self.index_file.sync_all_with_rows_guard(&mut rows_table);
 
         self.data_files.write().insert(next_idx, data_file);
         self.active_file_idx.store(next_idx, Ordering::Release);
@@ -512,12 +516,44 @@ impl CandyStore {
         &self.inner.base_path
     }
 
-    fn logical_read_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockReadGuard<'_, ()> {
-        self.inner.logical_locks[self.inner.logical_lock_index(ns, key)].read()
+    pub(super) fn checkpoint_locked(&self) -> Result<()> {
+        let _logical_guards = self
+            .inner
+            .list_meta_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+        let mut rows_table = self.inner.index_file.rows_table_mut();
+        let _rotation_lock = self.inner.rotation_lock.lock();
+
+        let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+        let active_file = self
+            .inner
+            .data_files
+            .read()
+            .get(&active_idx)
+            .cloned()
+            .ok_or(Error::MissingDataFile(active_idx))?;
+
+        let files = self.inner.data_files.read();
+        for data_file in files.values() {
+            data_file.file.sync_all().map_err(Error::IOError)?;
+        }
+        drop(files);
+
+        self.inner.persist_active_file_checkpoint(&active_file);
+        self.inner
+            .index_file
+            .sync_all_with_rows_guard(&mut rows_table)?;
+        sync_dir(&self.inner.base_path)
     }
 
-    fn logical_write_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockWriteGuard<'_, ()> {
-        self.inner.logical_locks[self.inner.logical_lock_index(ns, key)].write()
+    fn list_read_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockReadGuard<'_, ()> {
+        self.inner.list_meta_locks[self.inner.logical_lock_index(ns, key)].read()
+    }
+
+    fn list_write_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockWriteGuard<'_, ()> {
+        self.inner.list_meta_locks[self.inner.logical_lock_index(ns, key)].write()
     }
 
     fn _immut_op<T>(
@@ -661,9 +697,8 @@ impl CandyStore {
         self.inner.add_uncommitted_num_entries(1);
         self.inner
             .stats
-            .written_bytes
-            .fetch_add(entry_size, Ordering::Relaxed);
-        self.inner.stats.num_created.fetch_add(1, Ordering::Relaxed);
+            .num_inserted
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.bump_histogram(entry_size);
     }
 
@@ -675,14 +710,7 @@ impl CandyStore {
         new_vlen: usize,
     ) {
         let new_entry_size = aligned_data_entry_size(new_klen, new_vlen);
-        self.inner
-            .stats
-            .written_bytes
-            .fetch_add(new_entry_size, Ordering::Relaxed);
-        self.inner
-            .stats
-            .num_replaced
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.stats.num_updated.fetch_add(1, Ordering::Relaxed);
         self.inner.bump_histogram(new_entry_size);
     }
 
@@ -994,6 +1022,18 @@ impl CandyStore {
         sync_dir(&self.inner.base_path)
     }
 
+    /// Establishes a durable recovery checkpoint at the current end of the active file.
+    ///
+    /// This stops background compaction, blocks concurrent writers, syncs the
+    /// data and index files, and advances the persisted replay cursor so the
+    /// next open can resume from this point without replaying earlier writes.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.stop_compaction();
+        let res = self.checkpoint_locked();
+        self.start_compaction();
+        res
+    }
+
     /// Returns the number of background compaction errors observed since open.
     pub fn compaction_errors(&self) -> u64 {
         self.inner.stats.compaction_errors.load(Ordering::Relaxed)
@@ -1001,7 +1041,11 @@ impl CandyStore {
 
     /// Returns the number of currently live entries.
     pub fn num_items(&self) -> usize {
-        self.stats().num_entries() as usize
+        let h = self.inner.index_file.header_ref();
+        h.committed_num_entries
+            .load(Ordering::Relaxed)
+            .saturating_add_signed(h.uncommitted_entries_delta.load(Ordering::Relaxed))
+            as usize
     }
 
     /// Returns the current index capacity in entries.
@@ -1013,15 +1057,16 @@ impl CandyStore {
 
     /// Shrinks the index when the reclaimable row ratio is at least `min_wasted_ratio`.
     pub fn shrink_to_fit_blocking(&self, min_wasted_ratio: f64) -> Result<usize> {
-        let _key_guards = self
+        let _logical_guards = self
             .inner
-            .logical_locks
+            .list_meta_locks
             .iter()
             .map(|lock| lock.write())
             .collect::<Vec<_>>();
+        let row_table = self.inner.index_file.rows_table_mut();
 
         let min_wasted_ratio = min_wasted_ratio.clamp(0.0, 1.0);
-        let current_rows = self.inner.index_file.num_rows();
+        let current_rows = row_table.row_guard.len() / std::mem::size_of::<RowLayout>();
         if current_rows == 0 {
             return Ok(0);
         }
@@ -1038,86 +1083,69 @@ impl CandyStore {
             return Ok(current_rows);
         }
 
-        self.inner.index_file.shrink(min_rows_cfg)
+        self.inner
+            .index_file
+            .shrink_with_rows_guard(min_rows_cfg, row_table)
     }
 
     /// Returns a snapshot of store statistics and accounting counters.
     pub fn stats(&self) -> Stats {
-        let h = self.inner.index_file.header_ref();
         let num_rows = self.inner.index_file.num_rows() as u64;
-        let capacity = num_rows.saturating_mul(ROW_WIDTH as u64);
-
-        let num_items = h
-            .committed_num_entries
-            .load(Ordering::Relaxed)
-            .saturating_add_signed(h.uncommitted_entries_delta.load(Ordering::Relaxed));
 
         // Derive data_bytes and waste_bytes from file sizes and per-file
         // waste levels rather than maintaining them as persistent counters.
-        let total_used: u64 = self
-            .inner
-            .data_files
-            .read()
-            .values()
-            .map(|df| df.used_bytes())
-            .sum();
-        let waste = self.inner.index_file.total_waste();
-        let data_bytes = total_used.saturating_sub(waste);
+        let (total_bytes, num_data_files) = {
+            let data_files = self.inner.data_files.read();
+
+            (
+                data_files.values().map(|df| df.used_bytes()).sum(),
+                data_files.len() as u64,
+            )
+        };
+        let waste_bytes = self.inner.index_file.total_waste();
+        let s = &self.inner.stats;
 
         Stats {
             num_rows,
-            capacity,
-            num_items,
+            num_items: self.num_items() as u64,
             index_size_bytes: self.inner.index_file.file_size_bytes(),
-            num_compactions: self.inner.stats.num_compactions.load(Ordering::Relaxed),
-            compaction_time_ms: self.inner.stats.compaction_time_ms.load(Ordering::Relaxed),
-            num_data_files: self.inner.data_files.read().len() as u64,
-            num_positive_lookups: self
-                .inner
-                .stats
-                .num_positive_lookups
-                .load(Ordering::Relaxed),
-            num_negative_lookups: self
-                .inner
-                .stats
-                .num_negative_lookups
-                .load(Ordering::Relaxed),
-            num_collisions: self.inner.stats.num_collisions.load(Ordering::Relaxed),
-            last_remap_dur: Duration::from_millis(
-                self.inner.stats.last_remap_dur_ms.load(Ordering::Relaxed),
-            ),
+            num_data_files,
+
+            total_bytes,
+            waste_bytes,
+
+            num_compactions: s.num_compactions.load(Ordering::Relaxed),
+
+            last_remap_dur: Duration::from_millis(s.last_remap_dur_ms.load(Ordering::Relaxed)),
             last_compaction_dur: Duration::from_millis(
-                self.inner
-                    .stats
-                    .last_compaction_dur_ms
-                    .load(Ordering::Relaxed),
+                s.last_compaction_dur_ms.load(Ordering::Relaxed),
             ),
-            last_compaction_reclaimed_bytes: self
-                .inner
-                .stats
+            last_compaction_reclaimed_bytes: s
                 .last_compaction_reclaimed_bytes
                 .load(Ordering::Relaxed),
-            last_compaction_moved_bytes: self
-                .inner
-                .stats
-                .last_compaction_moved_bytes
-                .load(Ordering::Relaxed),
-            num_read_ops: self.inner.stats.num_read_ops.load(Ordering::Relaxed),
-            num_read_bytes: self.inner.stats.num_read_bytes.load(Ordering::Relaxed),
-            num_write_ops: self.inner.stats.num_write_ops.load(Ordering::Relaxed),
-            num_write_bytes: self.inner.stats.num_write_bytes.load(Ordering::Relaxed),
-            num_created: self.inner.stats.num_created.load(Ordering::Relaxed),
-            num_removed: self.inner.stats.num_removed.load(Ordering::Relaxed),
-            num_replaced: self.inner.stats.num_replaced.load(Ordering::Relaxed),
-            written_bytes: self.inner.stats.written_bytes.load(Ordering::Relaxed),
-            data_bytes,
-            waste_bytes: waste,
-            entries_under_64: self.inner.stats.size_histogram[0].load(Ordering::Relaxed),
-            entries_under_256: self.inner.stats.size_histogram[1].load(Ordering::Relaxed),
-            entries_under_1024: self.inner.stats.size_histogram[2].load(Ordering::Relaxed),
-            entries_under_4096: self.inner.stats.size_histogram[3].load(Ordering::Relaxed),
-            entries_under_16384: self.inner.stats.size_histogram[4].load(Ordering::Relaxed),
-            entries_over_16384: self.inner.stats.size_histogram[5].load(Ordering::Relaxed),
+            last_compaction_moved_bytes: s.last_compaction_moved_bytes.load(Ordering::Relaxed),
+
+            num_read_ops: s.num_read_ops.load(Ordering::Relaxed),
+            num_read_bytes: s.num_read_bytes.load(Ordering::Relaxed),
+            num_write_ops: s.num_write_ops.load(Ordering::Relaxed),
+            num_write_bytes: s.num_write_bytes.load(Ordering::Relaxed),
+
+            num_inserted: s.num_inserted.load(Ordering::Relaxed),
+            num_updated: s.num_updated.load(Ordering::Relaxed),
+            num_removed: s.num_removed.load(Ordering::Relaxed),
+            num_positive_lookups: s.num_positive_lookups.load(Ordering::Relaxed),
+            num_negative_lookups: s.num_negative_lookups.load(Ordering::Relaxed),
+            num_collisions: s.num_collisions.load(Ordering::Relaxed),
+
+            num_rebuilt_entries: s.num_rebuilt_entries.load(Ordering::Relaxed),
+            num_rebuild_purged_bytes: s.num_rebuild_purged_bytes.load(Ordering::Relaxed),
+
+            entries_under_64: s.size_histogram[0].load(Ordering::Relaxed),
+            entries_under_256: s.size_histogram[1].load(Ordering::Relaxed),
+            entries_under_1024: s.size_histogram[2].load(Ordering::Relaxed),
+            entries_under_4096: s.size_histogram[3].load(Ordering::Relaxed),
+            entries_under_16384: s.size_histogram[4].load(Ordering::Relaxed),
+            entries_over_16384: s.size_histogram[5].load(Ordering::Relaxed),
         }
     }
 
@@ -1197,6 +1225,27 @@ mod tests {
         assert_eq!(stats.last_compaction_dur, Duration::from_millis(23));
         assert_eq!(stats.last_compaction_reclaimed_bytes, 1234);
         assert_eq!(stats.last_compaction_moved_bytes, 5678);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stats_reports_rebuild_counters() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.inner
+            .stats
+            .num_rebuilt_entries
+            .store(11, Ordering::Relaxed);
+        db.inner
+            .stats
+            .num_rebuild_purged_bytes
+            .store(96, Ordering::Relaxed);
+
+        let stats = db.stats();
+        assert_eq!(stats.num_rebuilt_entries, 11);
+        assert_eq!(stats.num_rebuild_purged_bytes, 96);
 
         Ok(())
     }

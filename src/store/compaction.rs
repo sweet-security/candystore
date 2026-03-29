@@ -306,9 +306,6 @@ impl CandyStore {
                     );
                     let compaction_millis =
                         u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    ctx.stats
-                        .compaction_time_ms
-                        .fetch_add(compaction_millis, Ordering::Relaxed);
                     match res {
                         Ok(outcome) => {
                             ctx.stats
@@ -346,33 +343,7 @@ impl Drop for CandyStore {
         if !self.allow_clean_shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let data_files_synced = self
-            .inner
-            .data_files
-            .read()
-            .values()
-            .all(|df| df.file.sync_all().is_ok());
-        if !data_files_synced {
-            return;
-        }
-
-        // Advance the commit cursor so the next open can skip replay entirely.
-        let active_idx = self.inner.active_file_idx.load(Ordering::Relaxed);
-        if let Some(active_file) = self.inner.data_files.read().get(&active_idx).cloned() {
-            self.inner.index_file.rollover_uncommitted_counters();
-            self.inner
-                .index_file
-                .header_ref()
-                .commit_file_ordinal
-                .store(active_file.file_ordinal, Ordering::Release);
-            self.inner
-                .index_file
-                .header_ref()
-                .commit_offset
-                .store(active_file.used_bytes(), Ordering::Release);
-        }
-
-        let _ = self.inner.index_file.sync_all();
+        let _ = self.checkpoint_locked();
     }
 }
 
