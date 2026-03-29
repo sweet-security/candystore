@@ -43,13 +43,14 @@ impl<'a> QueueIterator<'a> {
     }
 
     fn try_heal_head(&self, new_head: u64) -> Result<()> {
-        let _lock = self.store.list_write_guard(self.ns.meta, &self.queue);
-        let mut meta = get_queue_meta(self.store, self.ns, &self.queue)?;
-        if meta.head >= self.initial_next_idx && meta.head < new_head {
-            meta.head = new_head;
-            set_queue_meta(self.store, self.ns, &self.queue, meta)?;
-        }
-        Ok(())
+        self.store.try_heal_range_head(
+            self.ns.meta,
+            &self.queue,
+            self.initial_next_idx,
+            new_head,
+            |store, queue| get_queue_meta(store, self.ns, queue),
+            |store, queue, meta| set_queue_meta(store, self.ns, queue, meta),
+        )
     }
 
     fn heal_tail(&self, new_tail: u64) {
@@ -57,13 +58,14 @@ impl<'a> QueueIterator<'a> {
     }
 
     fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
-        let _lock = self.store.list_write_guard(self.ns.meta, &self.queue);
-        let mut meta = get_queue_meta(self.store, self.ns, &self.queue)?;
-        if meta.tail <= self.initial_end_idx && meta.tail > new_tail {
-            meta.tail = new_tail;
-            set_queue_meta(self.store, self.ns, &self.queue, meta)?;
-        }
-        Ok(())
+        self.store.try_heal_range_tail(
+            self.ns.meta,
+            &self.queue,
+            self.initial_end_idx,
+            new_tail,
+            |store, queue| get_queue_meta(store, self.ns, queue),
+            |store, queue, meta| set_queue_meta(store, self.ns, queue, meta),
+        )
     }
 }
 

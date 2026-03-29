@@ -24,7 +24,7 @@ use crate::{
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
         EntryType, HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL,
-        ROW_WIDTH, aligned_data_entry_size, aligned_data_entry_waste,
+        ROW_WIDTH, RangeMetadata, aligned_data_entry_size, aligned_data_entry_waste,
         aligned_tombstone_entry_waste, index_file_path, index_rows_file_path, sync_dir,
     },
     types::{
@@ -101,6 +101,19 @@ struct StoreInner {
     compaction_condvar: Condvar,
     shutting_down: AtomicBool,
     stats: InnerStats,
+}
+
+struct ExistingEntryUpdate<'a> {
+    files: &'a HashMap<u16, Arc<DataFile>>,
+    ns: KeyNamespace,
+    key: &'a [u8],
+    val: &'a [u8],
+    hc: HashCoord,
+    col: usize,
+    src_file_idx: u16,
+    old_klen: usize,
+    old_vlen: usize,
+    crash_point_name: Option<&'a str>,
 }
 
 /// A persistent key-value store backed by append-only data files and a mutable index.
@@ -556,6 +569,50 @@ impl CandyStore {
         self.inner.list_meta_locks[self.inner.logical_lock_index(ns, key)].write()
     }
 
+    fn try_heal_range_head<GetMeta, SetMeta>(
+        &self,
+        meta_ns: KeyNamespace,
+        range_key: &[u8],
+        initial_next_idx: u64,
+        new_head: u64,
+        mut get_meta: GetMeta,
+        mut set_meta: SetMeta,
+    ) -> Result<()>
+    where
+        GetMeta: FnMut(&CandyStore, &[u8]) -> Result<RangeMetadata>,
+        SetMeta: FnMut(&CandyStore, &[u8], RangeMetadata) -> Result<()>,
+    {
+        let _lock = self.list_write_guard(meta_ns, range_key);
+        let mut meta = get_meta(self, range_key)?;
+        if meta.head >= initial_next_idx && meta.head < new_head {
+            meta.head = new_head;
+            set_meta(self, range_key, meta)?;
+        }
+        Ok(())
+    }
+
+    fn try_heal_range_tail<GetMeta, SetMeta>(
+        &self,
+        meta_ns: KeyNamespace,
+        range_key: &[u8],
+        initial_end_idx: u64,
+        new_tail: u64,
+        mut get_meta: GetMeta,
+        mut set_meta: SetMeta,
+    ) -> Result<()>
+    where
+        GetMeta: FnMut(&CandyStore, &[u8]) -> Result<RangeMetadata>,
+        SetMeta: FnMut(&CandyStore, &[u8], RangeMetadata) -> Result<()>,
+    {
+        let _lock = self.list_write_guard(meta_ns, range_key);
+        let mut meta = get_meta(self, range_key)?;
+        if meta.tail <= initial_end_idx && meta.tail > new_tail {
+            meta.tail = new_tail;
+            set_meta(self, range_key, meta)?;
+        }
+        Ok(())
+    }
+
     fn _immut_op<T>(
         &self,
         ns: KeyNamespace,
@@ -682,7 +739,7 @@ impl CandyStore {
         self.get_or_create_ns(KeyNamespace::User, key.as_ref(), default_val.as_ref())
     }
 
-    fn track_update_waste(&self, file_idx: u16, _file_ordinal: u64, klen: usize, vlen: usize) {
+    fn track_update_waste(&self, file_idx: u16, klen: usize, vlen: usize) {
         let added_waste = aligned_data_entry_waste(klen, vlen);
         let new_waste = self.inner.index_file.add_file_waste(file_idx, added_waste);
         self.inner.maybe_signal_compaction_threshold_crossing(
@@ -702,21 +759,41 @@ impl CandyStore {
         self.inner.bump_histogram(entry_size);
     }
 
-    fn record_replace_stats(
-        &self,
-        _old_klen: usize,
-        _old_vlen: usize,
-        new_klen: usize,
-        new_vlen: usize,
-    ) {
+    fn record_replace_stats(&self, new_klen: usize, new_vlen: usize) {
         let new_entry_size = aligned_data_entry_size(new_klen, new_vlen);
         self.inner.stats.num_updated.fetch_add(1, Ordering::Relaxed);
         self.inner.bump_histogram(new_entry_size);
     }
 
-    fn record_remove_stats(&self, _klen: usize, _vlen: usize) {
+    fn record_remove_stats(&self) {
         self.inner.add_uncommitted_num_entries(-1);
         self.inner.stats.num_removed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn apply_update_to_existing_entry(
+        &self,
+        row: &mut RowWriteGuard<'_>,
+        update: ExistingEntryUpdate<'_>,
+    ) -> Result<()> {
+        let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+        let active_file = update
+            .files
+            .get(&active_idx)
+            .ok_or(Error::MissingDataFile(active_idx))?;
+        let (file_off, size, _inflight_guard) =
+            active_file.append_kv(EntryType::Update, update.ns, update.key, update.val)?;
+        self.inner.record_write(size as u64);
+        if let Some(name) = update.crash_point_name {
+            crate::crash_point(name);
+        }
+
+        row.replace_pointer(
+            update.col,
+            EntryPointer::new(active_idx, file_off, size, update.hc.masked_row_selector()),
+        );
+        self.track_update_waste(update.src_file_idx, update.old_klen, update.old_vlen);
+        self.record_replace_stats(update.key.len(), update.val.len());
+        Ok(())
     }
 
     fn set_ns(&self, ns: KeyNamespace, key: &[u8], val: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -737,23 +814,22 @@ impl CandyStore {
                     let vlen = kv.value().len();
                     let old_val = kv.into_value();
                     let src_file_idx = file.file_idx;
-                    let src_file_ordinal = file.file_ordinal;
 
-                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
-                    let active_file = files
-                        .get(&active_idx)
-                        .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size, _inflight_guard) =
-                        active_file.append_kv(EntryType::Update, ns, key, val)?;
-                    self.inner.record_write(size as u64);
-                    crate::crash_point("set_after_write_before_update");
-
-                    row.replace_pointer(
-                        col,
-                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
-                    );
-                    self.track_update_waste(src_file_idx, src_file_ordinal, klen, vlen);
-                    self.record_replace_stats(klen, vlen, key.len(), val.len());
+                    self.apply_update_to_existing_entry(
+                        &mut row,
+                        ExistingEntryUpdate {
+                            files: &files,
+                            ns,
+                            key,
+                            val,
+                            hc,
+                            col,
+                            src_file_idx,
+                            old_klen: klen,
+                            old_vlen: vlen,
+                            crash_point_name: Some("set_after_write_before_update"),
+                        },
+                    )?;
                     return Ok(Some(old_val));
                 } else {
                     self.inner
@@ -825,21 +901,22 @@ impl CandyStore {
                     let vlen = kv.value().len();
                     let old_val = kv.into_value();
                     let src_file_idx = file.file_idx;
-                    let src_file_ordinal = file.file_ordinal;
 
-                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
-                    let active_file = files
-                        .get(&active_idx)
-                        .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size, _inflight_guard) =
-                        active_file.append_kv(EntryType::Update, ns, key, val)?;
-                    self.inner.record_write(size as u64);
-                    row.replace_pointer(
-                        col,
-                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
-                    );
-                    self.track_update_waste(src_file_idx, src_file_ordinal, klen, vlen);
-                    self.record_replace_stats(klen, vlen, key.len(), val.len());
+                    self.apply_update_to_existing_entry(
+                        &mut row,
+                        ExistingEntryUpdate {
+                            files: &files,
+                            ns,
+                            key,
+                            val,
+                            hc,
+                            col,
+                            src_file_idx,
+                            old_klen: klen,
+                            old_vlen: vlen,
+                            crash_point_name: None,
+                        },
+                    )?;
                     return Ok(ReplaceStatus::PrevValue(old_val));
                 }
             }
@@ -862,7 +939,7 @@ impl CandyStore {
         )
     }
 
-    fn track_tombstone_waste(&self, file_idx: u16, _file_ordinal: u64, klen: usize, vlen: usize) {
+    fn track_tombstone_waste(&self, file_idx: u16, klen: usize, vlen: usize) {
         let active_idx = self.inner.active_file_idx.load(Ordering::Relaxed);
         if file_idx == active_idx {
             self.inner.index_file.add_file_waste(
@@ -901,7 +978,6 @@ impl CandyStore {
                     let vlen = kv.value().len();
                     let old_val = kv.into_value();
                     let src_file_idx = file.file_idx;
-                    let src_file_ordinal = file.file_ordinal;
 
                     let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
                     let active_file = files
@@ -912,8 +988,8 @@ impl CandyStore {
                     self.inner.record_write(tombstone_size as u64);
 
                     row.remove(col);
-                    self.track_tombstone_waste(src_file_idx, src_file_ordinal, klen, vlen);
-                    self.record_remove_stats(klen, vlen);
+                    self.track_tombstone_waste(src_file_idx, klen, vlen);
+                    self.record_remove_stats();
                     return Ok(Some(old_val));
                 }
             }
@@ -1085,7 +1161,7 @@ impl CandyStore {
 
         self.inner
             .index_file
-            .shrink_with_rows_guard(min_rows_cfg, row_table)
+            .shrink_with_rows_guard(min_rows, row_table)
     }
 
     /// Returns a snapshot of store statistics and accounting counters.
