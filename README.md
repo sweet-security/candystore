@@ -1,8 +1,10 @@
-<div>
-<img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=v7">
-<div align="left">😸 v0.7 brings true crash-consistency, improved compaction and an overall simpler design. 
-We're also close to a stable file format!</div>
-</div>
+<div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=v7"></div>
+
+> [!NOTE]
+> 😸 v0.7 brings true crash-consistency, improved compaction and an overall simpler design. 
+> We're also close to a stable file format!
+>
+> However, the file format is not compatible with older versions of Candy.
 
 # CandyStore
 
