@@ -56,15 +56,15 @@ fn main() -> Result<()> {
     assert_eq!(val, Some(b"world".to_vec()));
     db.remove("hello")?;
 
-    db.set_in_list("cities", "barcelona", "")?;
-    db.set_in_list("cities", "chicago", "")?;
-    db.set_in_list("cities", "caracas", "")?;
+    db.set_in_list("cities", "Barcelona", "Spain")?;
+    db.set_in_list("cities", "Chicago", "USA")?;
+    db.set_in_list("cities", "Caracas", "Venezuela")?;
 
     let cities: Vec<String> = db.iter_list("cities")
         .map(|res| String::from_utf8(res.unwrap().0).unwrap())
         .collect();
 
-    assert_eq!(cities, vec!["barcelona", "chicago", "caracas"]);
+    assert_eq!(cities, vec!["Barcelona", "Chicago", "Caracas"]);
 
     Ok(())
 }
