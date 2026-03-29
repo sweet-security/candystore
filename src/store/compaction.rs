@@ -253,83 +253,87 @@ impl CandyStore {
 
         self.inner.shutting_down.store(false, Ordering::Release);
         let ctx = Arc::clone(&self.inner);
-        let thd = std::thread::spawn(move || {
-            if ctx.config.compaction_throughput_bytes_per_sec == 0 {
-                // Compaction disabled — park until shutdown.
-                let mut state = ctx.compaction_state.lock();
-                while !ctx.shutting_down.load(Ordering::Acquire) {
-                    ctx.compaction_condvar.wait(&mut state);
-                }
-                return;
-            }
-
-            let throughput_bytes_per_sec = ctx.config.compaction_throughput_bytes_per_sec as u64;
-            let tokens_per_unit = (throughput_bytes_per_sec / 10).max(1);
-            let burst_size = tokens_per_unit.saturating_mul(2);
-            let mut pacer = Pacer::new(
-                tokens_per_unit,
-                std::time::Duration::from_millis(100),
-                burst_size,
-            );
-
-            #[cfg(windows)]
-            let mut pending_deletions = Vec::<std::path::PathBuf>::new();
-            loop {
-                {
+        let thd = std::thread::Builder::new()
+            .name("candy_compact".into())
+            .spawn(move || {
+                if ctx.config.compaction_throughput_bytes_per_sec == 0 {
+                    // Compaction disabled — park until shutdown.
                     let mut state = ctx.compaction_state.lock();
-                    while !state.wake_requested && !ctx.shutting_down.load(Ordering::Acquire) {
+                    while !ctx.shutting_down.load(Ordering::Acquire) {
                         ctx.compaction_condvar.wait(&mut state);
                     }
-
-                    if ctx.shutting_down.load(Ordering::Acquire) {
-                        break;
-                    }
-
-                    state.wake_requested = false;
+                    return;
                 }
+
+                let throughput_bytes_per_sec =
+                    ctx.config.compaction_throughput_bytes_per_sec as u64;
+                let tokens_per_unit = (throughput_bytes_per_sec / 10).max(1);
+                let burst_size = tokens_per_unit.saturating_mul(2);
+                let mut pacer = Pacer::new(
+                    tokens_per_unit,
+                    std::time::Duration::from_millis(100),
+                    burst_size,
+                );
+
+                #[cfg(windows)]
+                let mut pending_deletions = Vec::<std::path::PathBuf>::new();
                 loop {
-                    let candidates = ctx.next_compaction_candidates(4);
-                    if candidates.is_empty() {
-                        break;
+                    {
+                        let mut state = ctx.compaction_state.lock();
+                        while !state.wake_requested && !ctx.shutting_down.load(Ordering::Acquire) {
+                            ctx.compaction_condvar.wait(&mut state);
+                        }
+
+                        if ctx.shutting_down.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        state.wake_requested = false;
                     }
-                    if ctx.shutting_down.load(Ordering::Acquire) {
-                        return;
+                    loop {
+                        let candidates = ctx.next_compaction_candidates(4);
+                        if candidates.is_empty() {
+                            break;
+                        }
+                        if ctx.shutting_down.load(Ordering::Acquire) {
+                            return;
+                        }
+                        #[cfg(windows)]
+                        Self::retry_pending_deletions(&ctx, &mut pending_deletions);
+                        let t0 = std::time::Instant::now();
+                        let res = ctx.compact_files(
+                            &candidates,
+                            &mut pacer,
+                            #[cfg(windows)]
+                            &mut pending_deletions,
+                        );
+                        let compaction_millis =
+                            u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        match res {
+                            Ok(outcome) => {
+                                ctx.stats
+                                    .num_compactions
+                                    .fetch_add(outcome.compacted_files, Ordering::Relaxed);
+                                ctx.stats
+                                    .last_compaction_dur_ms
+                                    .store(compaction_millis, Ordering::Relaxed);
+                                ctx.stats
+                                    .last_compaction_reclaimed_bytes
+                                    .store(outcome.reclaimed_bytes, Ordering::Relaxed);
+                                ctx.stats
+                                    .last_compaction_moved_bytes
+                                    .store(outcome.moved_bytes, Ordering::Relaxed);
+                            }
+                            Err(_e) => {
+                                ctx.stats.compaction_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                     #[cfg(windows)]
                     Self::retry_pending_deletions(&ctx, &mut pending_deletions);
-                    let t0 = std::time::Instant::now();
-                    let res = ctx.compact_files(
-                        &candidates,
-                        &mut pacer,
-                        #[cfg(windows)]
-                        &mut pending_deletions,
-                    );
-                    let compaction_millis =
-                        u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    match res {
-                        Ok(outcome) => {
-                            ctx.stats
-                                .num_compactions
-                                .fetch_add(outcome.compacted_files, Ordering::Relaxed);
-                            ctx.stats
-                                .last_compaction_dur_ms
-                                .store(compaction_millis, Ordering::Relaxed);
-                            ctx.stats
-                                .last_compaction_reclaimed_bytes
-                                .store(outcome.reclaimed_bytes, Ordering::Relaxed);
-                            ctx.stats
-                                .last_compaction_moved_bytes
-                                .store(outcome.moved_bytes, Ordering::Relaxed);
-                        }
-                        Err(_e) => {
-                            ctx.stats.compaction_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
                 }
-                #[cfg(windows)]
-                Self::retry_pending_deletions(&ctx, &mut pending_deletions);
-            }
-        });
+            })
+            .unwrap();
 
         *compaction_thd = Some(thd);
         self.inner.signal_compaction_scan();
