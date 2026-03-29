@@ -30,10 +30,21 @@ fn get_config() -> Config {
 
 const DB_DIR: &str = "/tmp/dbdir_crash";
 
-fn child_inserts() -> Result<()> {
+fn record_rebuild_stats(shared_stuff: &SharedStuff, store: &CandyStore) {
+    let stats = store.stats();
+    shared_stuff
+        .total_num_rebuilt_entries
+        .fetch_add(stats.num_rebuilt_entries, SeqCst);
+    shared_stuff
+        .total_num_dropped_bytes_on_rebuild
+        .fetch_add(stats.num_rebuild_purged_bytes, SeqCst);
+}
+
+fn child_inserts(shared_stuff: &SharedStuff) -> Result<()> {
     // our job is to create 1M entries while being killed by our evil parent
 
     let store = CandyStore::open(DB_DIR, get_config())?;
+    record_rebuild_stats(shared_stuff, &store);
     let highest_bytes = store.get("highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes(highest_bytes.try_into().unwrap());
 
@@ -53,10 +64,11 @@ fn child_inserts() -> Result<()> {
     Ok(())
 }
 
-fn child_removals() -> Result<()> {
+fn child_removals(shared_stuff: &SharedStuff) -> Result<()> {
     // our job is to remove 1M entries while being killed by our evil parent
 
     let store = CandyStore::open(DB_DIR, get_config())?;
+    record_rebuild_stats(shared_stuff, &store);
     let lowest_bytes = store.get("lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes(lowest_bytes.try_into().unwrap());
 
@@ -78,10 +90,11 @@ fn child_removals() -> Result<()> {
     Ok(())
 }
 
-fn child_list_inserts() -> Result<()> {
+fn child_list_inserts(shared_stuff: &SharedStuff) -> Result<()> {
     // our job is to insert 1M entries to a list while being killed by our evil parent
 
     let store = CandyStore::open(DB_DIR, get_config())?;
+    record_rebuild_stats(shared_stuff, &store);
 
     let highest_bytes = store.get("list_highest")?.unwrap_or(vec![0, 0, 0, 0]);
     let highest = u32::from_le_bytes(highest_bytes.try_into().unwrap());
@@ -102,10 +115,11 @@ fn child_list_inserts() -> Result<()> {
     Ok(())
 }
 
-fn child_list_removals() -> Result<()> {
+fn child_list_removals(shared_stuff: &SharedStuff) -> Result<()> {
     // our job is to remove 1M entries to a list while being killed by our evil parent
 
     let store = CandyStore::open(DB_DIR, get_config())?;
+    record_rebuild_stats(shared_stuff, &store);
 
     let lowest_bytes = store.get("list_lowest")?.unwrap_or(vec![0, 0, 0, 0]);
     let lowest = u32::from_le_bytes(lowest_bytes.try_into().unwrap());
@@ -146,8 +160,9 @@ fn child_list_removals() -> Result<()> {
     Ok(())
 }
 
-fn child_list_iterator_removals() -> Result<()> {
+fn child_list_iterator_removals(shared_stuff: &SharedStuff) -> Result<()> {
     let store = CandyStore::open(DB_DIR, get_config())?;
+    record_rebuild_stats(shared_stuff, &store);
 
     if rand::random() {
         //println!("FWD");
@@ -179,14 +194,14 @@ fn child_list_iterator_removals() -> Result<()> {
 fn parent_run(
     shared_stuff: &SharedStuff,
     child_name: &str,
-    mut child_func: impl FnMut() -> Result<()>,
+    mut child_func: impl FnMut(&SharedStuff) -> Result<()>,
 ) -> Result<()> {
     println!("======== Parent starts {child_name} ========");
     for i in 0.. {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
-            let res = child_func();
+            let res = child_func(shared_stuff);
             if let Err(e) = res {
                 eprintln!("Child failed: {}", e);
                 shared_stuff.failed.store(1, SeqCst);
@@ -230,6 +245,8 @@ fn parent_run(
 
 struct SharedStuff {
     failed: AtomicU64,
+    total_num_rebuilt_entries: AtomicU64,
+    total_num_dropped_bytes_on_rebuild: AtomicU64,
 }
 
 #[test]
@@ -255,6 +272,10 @@ fn test_crash_recovery() -> Result<()> {
 
     let shared_stuff = unsafe { &*(map_addr as *const SharedStuff) };
     shared_stuff.failed.store(0, SeqCst);
+    shared_stuff.total_num_rebuilt_entries.store(0, SeqCst);
+    shared_stuff
+        .total_num_dropped_bytes_on_rebuild
+        .store(0, SeqCst);
 
     parent_run(shared_stuff, "child_inserts", child_inserts)?;
 
@@ -370,6 +391,12 @@ fn test_crash_recovery() -> Result<()> {
 
         println!("DB validated successfully");
     }
+
+    println!(
+        "rebuilt_entries_total={} dropped_bytes_on_rebuild_total={}",
+        shared_stuff.total_num_rebuilt_entries.load(SeqCst),
+        shared_stuff.total_num_dropped_bytes_on_rebuild.load(SeqCst)
+    );
 
     _ = std::fs::remove_dir_all(DB_DIR);
     Ok(())

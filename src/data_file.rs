@@ -71,6 +71,15 @@ impl DataFile {
         self.file_offset.load(Ordering::Acquire)
     }
 
+    pub(crate) fn truncate_to_offset(&self, file_offset: u64) -> Result<()> {
+        debug_assert_eq!(file_offset % FILE_OFFSET_ALIGNMENT, 0);
+        self.file
+            .set_len(size_of::<DataFileHeader>() as u64 + file_offset)
+            .map_err(Error::IOError)?;
+        self.file_offset.store(file_offset, Ordering::Release);
+        self.file.sync_all().map_err(Error::IOError)
+    }
+
     fn parse_data_entry(buf: &[u8], offset: u64) -> Result<ParsedDataEntry> {
         if buf.len() < 8 {
             return Err(Error::IOError(std::io::Error::new(

@@ -7,7 +7,8 @@ insert, and removal — are O(1).
 | Operation | Time*  |
 |-----------|--------|
 | Lookup    | < 1us  |
-| Insert    | < 2us  |
+| Insert    | < 1us  |
+| Update    | < 2us  |
 | Removal   | < 2us  |
 
 On my laptop (32 core AMD RYZEN AI MAX+ 395 with 64GB RAM, running Ubuntu 25.10 kernel `6.17.0-19-generic`) I'm getting
@@ -16,10 +17,13 @@ On my laptop (32 core AMD RYZEN AI MAX+ 395 with 64GB RAM, running Ubuntu 25.10 
 $ cargo run --release --example perf
 
 Testing key-value using 1 threads, each with 1000000 items (key size: 16, value size: 16)
-    Inserts: 0.539149 us/op
-    Positive Lookups: 0.298013 us/op
-    Negative Lookups: 0.044203 us/op
-    Removes: 0.573369 us/op
+    Inserts: 0.499239 us/op
+    Updates: 0.611424 us/op
+    Positive Lookups: 0.316884 us/op
+    Negative Lookups: 0.045079 us/op
+    Iter all: 0.373904 us/op
+    Removes: 0.588206 us/op
+
 ```
 
 See [how to interpret the results\*](#how-to-interpret-the-performance-results).
@@ -81,8 +85,8 @@ columns, from which we extract another 18 bits of entropy. If both match, we fet
 from the relevant file (the pointer stores a file index and a file offset). 
 
 Note: the chances of a collision (meaning we fetch a wrong entry from the file) are 
-virtually zero, about 10^-10 according to the birthday paradox (a collision in 336 uniformly-distributed 
-50-bits numbers). 
+virtually zero, about 1 in 20 billion according to the birthday paradox (a collision in 336 
+uniformly-distributed 50-bits numbers). 
 
 Candy supports up to 4096 files, each up to 1GB in size (a span of 4TB). In terms of key-space,
 Candy allows 2^21 rows, each with 336 keys, so a total of 704M keys. The maximum size of a key
@@ -127,9 +131,9 @@ You can configure the throughput (bytes per second) of compaction.
 We trust the operating system to flush the data files and mmap'ed rows table to storage,
 which means that even if your process crashes, your data will be fully consistent. However,
 this is not true on a power failure or a kernel panic -- in which case the state of the
-index file is completely unknown. In such cases Candy has a rebuild mechanism that essentially
-wipes the rows table clean and reads all the data files in order, replaying every set/remove
-as it happened, and achieves a consistent state.
+index file is unknown. In such cases Candy has an efficient rebuild mechanism (based on checkpointing)
+that essentially replays recent mutating operations in order and rebuilds the correct state from
+the data files.
 
 ## Design Goals
 

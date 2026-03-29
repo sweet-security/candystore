@@ -73,9 +73,8 @@ impl CandyStore {
         // extent. This handles the case where the data file was truncated
         // (e.g. disk-full or corruption) and ensures the replay loop won't
         // encounter stale pointers when comparing existing entries.
-        let pre_purge_extent = active_file
-            .used_bytes()
-            .next_multiple_of(FILE_OFFSET_ALIGNMENT);
+        let pre_rebuild_used_bytes = active_file.used_bytes();
+        let pre_purge_extent = pre_rebuild_used_bytes.next_multiple_of(FILE_OFFSET_ALIGNMENT);
         self.purge_uncommitted_file_entries(active_idx, pre_purge_extent)?;
 
         if matches!(rebuild_mode, RebuildMode::FullActiveFile) {
@@ -95,6 +94,7 @@ impl CandyStore {
         let mut buf_file_offset = 0u64;
         let mut match_scratch = Vec::new();
         let mut bytes_since_checkpoint = 0u64;
+        let mut last_durable_offset = start_offset;
         loop {
             let Some((kv, entry_offset, next_offset)) =
                 active_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
@@ -114,11 +114,16 @@ impl CandyStore {
             match kv.entry_type {
                 EntryType::Insert => self.inner.add_uncommitted_num_entries(1),
                 EntryType::Tombstone => self.inner.add_uncommitted_num_entries(-1),
-                _ => {} // UpdateData and any future types don't change num_entries
+                _ => {} // UpdateData and any future types don't change num_items
             }
 
             // Fix up the index pointers (no stats accounting).
             self.recover_entry(&active_file, ns, kv, entry_offset, &mut match_scratch)?;
+            self.inner
+                .stats
+                .num_rebuilt_entries
+                .fetch_add(1, Ordering::Relaxed);
+            last_durable_offset = next_offset;
             crash_point("rebuild_entry");
 
             bytes_since_checkpoint += entry_bytes;
@@ -128,7 +133,15 @@ impl CandyStore {
             }
         }
 
-        let durable_extent = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+        let durable_extent = last_durable_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+
+        if durable_extent < pre_rebuild_used_bytes {
+            self.inner
+                .stats
+                .num_rebuild_purged_bytes
+                .fetch_add(pre_rebuild_used_bytes - durable_extent, Ordering::Relaxed);
+            active_file.truncate_to_offset(durable_extent)?;
+        }
 
         // Purge any phantom index entries that reference the active file
         // beyond this point (OS flushed the index page but not the data).

@@ -550,6 +550,18 @@ impl IndexFile {
         Ok(())
     }
 
+    pub(crate) fn sync_all_with_rows_guard(
+        &self,
+        rows_table: &mut RowsTableWriteGuard<'_>,
+    ) -> Result<()> {
+        rows_table.row_guard.flush().map_err(Error::IOError)?;
+        self.rows_file.sync_all().map_err(Error::IOError)?;
+        self.header_mmap.flush().map_err(Error::IOError)?;
+        #[cfg(windows)]
+        self.header_file.sync_all().map_err(Error::IOError)?;
+        Ok(())
+    }
+
     pub(crate) fn file_size_bytes(&self) -> u64 {
         let header = size_of::<IndexFileLayout>() as u64;
         let rows = self.rows_file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -664,9 +676,11 @@ impl IndexFile {
         1usize << gsl
     }
 
-    pub(crate) fn shrink(&self, min_rows: usize) -> Result<usize> {
-        let mut row_table = self.rows_table_mut();
-
+    pub(crate) fn shrink_with_rows_guard(
+        &self,
+        min_rows: usize,
+        mut row_table: RowsTableWriteGuard<'_>,
+    ) -> Result<usize> {
         loop {
             let global_split_level = self.header_ref().global_split_level.load(Ordering::Acquire);
             let current_rows = 1usize << global_split_level;

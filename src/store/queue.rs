@@ -43,7 +43,7 @@ impl<'a> QueueIterator<'a> {
     }
 
     fn try_heal_head(&self, new_head: u64) -> Result<()> {
-        let _lock = self.store.logical_write_guard(self.ns.meta, &self.queue);
+        let _lock = self.store.list_write_guard(self.ns.meta, &self.queue);
         let mut meta = get_queue_meta(self.store, self.ns, &self.queue)?;
         if meta.head >= self.initial_next_idx && meta.head < new_head {
             meta.head = new_head;
@@ -57,7 +57,7 @@ impl<'a> QueueIterator<'a> {
     }
 
     fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
-        let _lock = self.store.logical_write_guard(self.ns.meta, &self.queue);
+        let _lock = self.store.list_write_guard(self.ns.meta, &self.queue);
         let mut meta = get_queue_meta(self.store, self.ns, &self.queue)?;
         if meta.tail <= self.initial_end_idx && meta.tail > new_tail {
             meta.tail = new_tail;
@@ -298,7 +298,7 @@ impl CandyStore {
         queue: &[u8],
         value: &[u8],
     ) -> Result<u64> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         self._queue_push_tail_with_ns(ns, queue, value)
     }
 
@@ -327,7 +327,7 @@ impl CandyStore {
         queue: &[u8],
         value: &[u8],
     ) -> Result<u64> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         let mut meta = get_queue_meta(self, ns, queue)?;
         let new_head = meta.head - 1;
         let key = make_queue_data_key(queue, new_head);
@@ -346,7 +346,7 @@ impl CandyStore {
         ns: QueueNamespaces,
         queue: &[u8],
     ) -> Result<Option<(u64, Vec<u8>)>> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         let mut meta = get_queue_meta(self, ns, queue)?;
         loop {
             if meta.head > meta.tail {
@@ -376,7 +376,7 @@ impl CandyStore {
         ns: QueueNamespaces,
         queue: &[u8],
     ) -> Result<Option<(u64, Vec<u8>)>> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         let mut meta = get_queue_meta(self, ns, queue)?;
         loop {
             if meta.head > meta.tail {
@@ -406,7 +406,7 @@ impl CandyStore {
         ns: QueueNamespaces,
         queue: &[u8],
     ) -> Result<Option<(u64, Vec<u8>)>> {
-        let _lock = self.logical_read_guard(ns.meta, queue);
+        let _lock = self.list_read_guard(ns.meta, queue);
         let meta = get_queue_meta(self, ns, queue)?;
         if meta.head > meta.tail {
             return Ok(None);
@@ -425,7 +425,7 @@ impl CandyStore {
         ns: QueueNamespaces,
         queue: &[u8],
     ) -> Result<Option<(u64, Vec<u8>)>> {
-        let _lock = self.logical_read_guard(ns.meta, queue);
+        let _lock = self.list_read_guard(ns.meta, queue);
         let meta = get_queue_meta(self, ns, queue)?;
         if meta.head > meta.tail {
             return Ok(None);
@@ -444,7 +444,7 @@ impl CandyStore {
     }
 
     pub(super) fn queue_discard_with_ns(&self, ns: QueueNamespaces, queue: &[u8]) -> Result<bool> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         self._queue_discard_with_ns(ns, queue)
     }
 
@@ -467,7 +467,7 @@ impl CandyStore {
         queue: &[u8],
         idx: u64,
     ) -> Result<Option<Vec<u8>>> {
-        let _lock = self.logical_write_guard(ns.meta, queue);
+        let _lock = self.list_write_guard(ns.meta, queue);
         let mut meta = get_queue_meta(self, ns, queue)?;
         let key = make_queue_data_key(queue, idx);
         let removed = match self.remove_ns(ns.data, &key)? {
@@ -528,7 +528,7 @@ impl CandyStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<bool> {
-        let _lock = self.logical_write_guard(ns.meta, key);
+        let _lock = self.list_write_guard(ns.meta, key);
         let existed = self._queue_discard_with_ns(ns, key)?;
 
         let max_chunk_len = self.max_big_chunk_len(key)?;
@@ -546,7 +546,7 @@ impl CandyStore {
         ns: QueueNamespaces,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let _lock = self.logical_read_guard(ns.meta, key);
+        let _lock = self.list_read_guard(ns.meta, key);
         let meta = get_queue_meta(self, ns, key)?;
         let expected_chunks = meta.count;
         if expected_chunks == 0 {
