@@ -63,7 +63,7 @@ impl StoreInner {
 
         let mut row_idx = 0;
         loop {
-            if self.shutting_down.load(Ordering::Acquire) {
+            if self.compaction_shutting_down.load(Ordering::Acquire) {
                 return Ok(CompactionOutcome {
                     compacted_files: 0,
                     reclaimed_bytes: 0,
@@ -141,8 +141,10 @@ impl StoreInner {
                         ns,
                         kv.key(),
                         kv.value(),
+                        row.shard_idx,
+                        &self.inflight_tracker,
                     ) {
-                        Ok((file_off, size, _inflight_guard)) => {
+                        Ok((file_off, size, inflight_guard)) => {
                             self.record_write(size as u64);
                             moved_bytes = moved_bytes.saturating_add(size as u64);
                             row.replace_pointer(
@@ -154,6 +156,7 @@ impl StoreInner {
                                     entry.masked_row_selector(),
                                 ),
                             );
+                            inflight_guard.complete();
                             break;
                         }
                         Err(Error::RotateDataFile(rotate_idx)) => {
@@ -225,7 +228,9 @@ impl StoreInner {
 
 impl CandyStore {
     pub(super) fn stop_compaction(&self) {
-        self.inner.shutting_down.store(true, Ordering::Release);
+        self.inner
+            .compaction_shutting_down
+            .store(true, Ordering::Release);
         {
             let mut state = self.inner.compaction_state.lock();
             state.wake_requested = true;
@@ -251,7 +256,9 @@ impl CandyStore {
             return;
         }
 
-        self.inner.shutting_down.store(false, Ordering::Release);
+        self.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
         let ctx = Arc::clone(&self.inner);
         let thd = std::thread::Builder::new()
             .name("candy_compact".into())
@@ -259,7 +266,7 @@ impl CandyStore {
                 if ctx.config.compaction_throughput_bytes_per_sec == 0 {
                     // Compaction disabled — park until shutdown.
                     let mut state = ctx.compaction_state.lock();
-                    while !ctx.shutting_down.load(Ordering::Acquire) {
+                    while !ctx.compaction_shutting_down.load(Ordering::Acquire) {
                         ctx.compaction_condvar.wait(&mut state);
                     }
                     return;
@@ -280,11 +287,13 @@ impl CandyStore {
                 loop {
                     {
                         let mut state = ctx.compaction_state.lock();
-                        while !state.wake_requested && !ctx.shutting_down.load(Ordering::Acquire) {
+                        while !state.wake_requested
+                            && !ctx.compaction_shutting_down.load(Ordering::Acquire)
+                        {
                             ctx.compaction_condvar.wait(&mut state);
                         }
 
-                        if ctx.shutting_down.load(Ordering::Acquire) {
+                        if ctx.compaction_shutting_down.load(Ordering::Acquire) {
                             break;
                         }
 
@@ -295,7 +304,7 @@ impl CandyStore {
                         if candidates.is_empty() {
                             break;
                         }
-                        if ctx.shutting_down.load(Ordering::Acquire) {
+                        if ctx.compaction_shutting_down.load(Ordering::Acquire) {
                             return;
                         }
                         #[cfg(windows)]
@@ -347,7 +356,7 @@ impl Drop for CandyStore {
         if !self.allow_clean_shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let _ = self.checkpoint_locked();
+        let _ = self.checkpoint();
     }
 }
 
@@ -420,7 +429,9 @@ mod tests {
 
         let before_read_ops = db.stats().num_read_ops;
         let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
-        db.inner.shutting_down.store(false, Ordering::Release);
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
         let outcome = db.inner.compact_files(
             &[(target_idx, target_ordinal)],
             &mut pacer,
@@ -485,7 +496,9 @@ mod tests {
 
         let before_read_ops = db.stats().num_read_ops;
         let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
-        db.inner.shutting_down.store(false, Ordering::Release);
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
         let outcome = db.inner.compact_files(
             &targets,
             &mut pacer,
@@ -547,7 +560,7 @@ mod tests {
             let mut pacer = Pacer::new(256, Duration::from_millis(10), 256);
             db_for_compaction
                 .inner
-                .shutting_down
+                .compaction_shutting_down
                 .store(false, Ordering::Release);
             db_for_compaction.inner.compact_files(
                 &[(target_idx, target_ordinal)],

@@ -5,12 +5,13 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use std::{
     fs::File,
+    hash::Hasher,
     mem::{offset_of, size_of},
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -21,6 +22,34 @@ use crate::internal::{
     index_rows_file_path, invalid_data_error, read_available_at, unexpected_eof_error,
 };
 use crate::types::{Config, Error, Result};
+
+const CHECKPOINT_SLOT_COUNT: usize = 2;
+
+#[derive(Clone, Copy)]
+struct CheckpointCursor {
+    generation: u64,
+    file_ordinal: u64,
+    offset: u64,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout)]
+#[repr(C)]
+pub(crate) struct CheckpointSlot {
+    generation: AtomicU64,
+    file_ordinal: AtomicU64,
+    offset: AtomicU64,
+    checksum: AtomicU64,
+}
+
+const _: () = assert!(size_of::<CheckpointSlot>() == 32);
+
+fn checkpoint_slot_checksum(generation: u64, file_ordinal: u64, offset: u64) -> u64 {
+    let mut hasher = siphasher::sip::SipHasher13::new();
+    hasher.write_u64(generation);
+    hasher.write_u64(file_ordinal);
+    hasher.write_u64(offset);
+    hasher.finish()
+}
 
 #[derive(FromBytes, IntoBytes, KnownLayout)]
 #[repr(C)]
@@ -41,23 +70,21 @@ pub(crate) struct IndexFileHeader {
     ///////////////////////////////////
     // rebuild state
     ///////////////////////////////////
-    /// Persisted replay cursor: the active-file position already reflected in the index.
-    pub(crate) commit_file_ordinal: AtomicU64,
-    /// Persisted replay cursor offset within `commit_file_ordinal`.
-    pub(crate) commit_offset: AtomicU64,
-    _padding1024: [u8; 896 - 2 * 8],
+    /// Persisted replay cursor, double-buffered so recovery can pick the
+    /// newest valid slot after crashes or torn writes.
+    pub(crate) checkpoint_slots: [CheckpointSlot; CHECKPOINT_SLOT_COUNT],
+    _padding1024: [u8; 896 - CHECKPOINT_SLOT_COUNT * 32],
 
     ///////////////////////////////////
     // stats
     ///////////////////////////////////
     pub(crate) committed_num_entries: AtomicU64,
-    pub(crate) uncommitted_entries_delta: AtomicI64,
 
-    _trailer: [u8; PAGE_SIZE - 1024 - 2 * 8],
+    _trailer: [u8; PAGE_SIZE - 1024 - 8],
 }
 
 const _: () = assert!(offset_of!(IndexFileHeader, global_split_level) == 64);
-const _: () = assert!(offset_of!(IndexFileHeader, commit_file_ordinal) == 128);
+const _: () = assert!(offset_of!(IndexFileHeader, checkpoint_slots) == 128);
 const _: () = assert!(offset_of!(IndexFileHeader, committed_num_entries) == 1024);
 const _: () = assert!(size_of::<IndexFileHeader>() == PAGE_SIZE);
 
@@ -224,18 +251,6 @@ fn row_mut_bytes(bytes: &mut [u8], idx: usize) -> &mut RowLayout {
         .expect("row bytes should contain an aligned row")
 }
 
-fn apply_signed_counter_delta(counter: &AtomicU64, delta: i64) {
-    if delta == 0 {
-        return;
-    }
-
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add_signed(delta))
-        })
-        .unwrap();
-}
-
 unsafe fn row_mut_ptr(base_ptr: *const u8, idx: usize) -> *mut RowLayout {
     unsafe { base_ptr.add(row_offset(idx)) as *mut RowLayout }
 }
@@ -269,7 +284,8 @@ impl<'a> RowsTableReadGuard<'a> {
     }
 
     pub(crate) fn row_mut(&self, idx: usize) -> RowWriteGuard<'_> {
-        let row_guard = self.index_file.row_locks[idx & self.index_file.row_locks_mask].write();
+        let shard_idx = idx & self.index_file.row_locks_mask;
+        let row_guard = self.index_file.row_locks[shard_idx].write();
         let row_count = row_count_for_len(self.row_guard.len());
         assert!(
             idx < row_count,
@@ -279,6 +295,7 @@ impl<'a> RowsTableReadGuard<'a> {
         RowWriteGuard {
             _row_guard: row_guard,
             row,
+            shard_idx,
         }
     }
 
@@ -323,6 +340,7 @@ impl Deref for RowReadGuard<'_> {
 pub(crate) struct RowWriteGuard<'a> {
     _row_guard: RwLockWriteGuard<'a, ()>,
     row: &'a mut RowLayout,
+    pub(crate) shard_idx: usize,
 }
 
 impl Deref for RowWriteGuard<'_> {
@@ -353,9 +371,76 @@ pub(crate) struct IndexFile {
     row_locks: Vec<RwLock<()>>,
     row_locks_mask: usize,
     config: Arc<Config>,
+    /// Cached checkpoint state so concurrent readers (e.g. compaction candidate
+    /// selection) always see a consistent snapshot without going through the
+    /// double-buffer slot protocol.
+    cached_checkpoint_generation: AtomicU64,
+    cached_checkpoint_ordinal: AtomicU64,
+    cached_checkpoint_offset: AtomicU64,
 }
 
 impl IndexFile {
+    fn read_checkpoint_slot(slot: &CheckpointSlot) -> Option<CheckpointCursor> {
+        let generation = slot.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return None;
+        }
+
+        let file_ordinal = slot.file_ordinal.load(Ordering::Relaxed);
+        let offset = slot.offset.load(Ordering::Relaxed);
+        let checksum = slot.checksum.load(Ordering::Acquire);
+        if checksum != checkpoint_slot_checksum(generation, file_ordinal, offset) {
+            return None;
+        }
+
+        Some(CheckpointCursor {
+            generation,
+            file_ordinal,
+            offset,
+        })
+    }
+
+    fn durable_checkpoint(&self) -> Option<CheckpointCursor> {
+        self.header_ref()
+            .checkpoint_slots
+            .iter()
+            .filter_map(Self::read_checkpoint_slot)
+            .max_by_key(|cursor| cursor.generation)
+    }
+
+    pub(crate) fn checkpoint_cursor(&self) -> (u64, u64) {
+        let generation = self.cached_checkpoint_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return (0, 0);
+        }
+        let ordinal = self.cached_checkpoint_ordinal.load(Ordering::Relaxed);
+        let offset = self.cached_checkpoint_offset.load(Ordering::Relaxed);
+        (ordinal, offset)
+    }
+
+    pub(crate) fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) {
+        let current_gen = self.cached_checkpoint_generation.load(Ordering::Relaxed);
+        let next_generation = current_gen
+            .checked_add(1)
+            .expect("checkpoint generation overflow");
+        let slot =
+            &self.header_ref().checkpoint_slots[next_generation as usize % CHECKPOINT_SLOT_COUNT];
+
+        slot.checksum.store(0, Ordering::Release);
+        slot.generation.store(next_generation, Ordering::Relaxed);
+        slot.file_ordinal.store(ordinal, Ordering::Relaxed);
+        slot.offset.store(offset, Ordering::Relaxed);
+        slot.checksum.store(
+            checkpoint_slot_checksum(next_generation, ordinal, offset),
+            Ordering::Release,
+        );
+
+        // Update the cache so concurrent readers see the new values immediately.
+        self.cached_checkpoint_ordinal.store(ordinal, Ordering::Relaxed);
+        self.cached_checkpoint_offset.store(offset, Ordering::Relaxed);
+        self.cached_checkpoint_generation.store(next_generation, Ordering::Release);
+    }
+
     #[cfg(target_os = "linux")]
     fn maybe_lock_mmap(config: &Config, mmap: &MmapMut) {
         if config.mlock_index {
@@ -524,11 +609,21 @@ impl IndexFile {
             row_locks,
             row_locks_mask,
             config,
+            cached_checkpoint_generation: AtomicU64::new(0),
+            cached_checkpoint_ordinal: AtomicU64::new(0),
+            cached_checkpoint_offset: AtomicU64::new(0),
         };
 
         if new_file {
             let rows_table = inst.rows_table_mut();
             inst.init_header_and_rows(rows_table, hash_key)?;
+        } else if let Some(cursor) = inst.durable_checkpoint() {
+            inst.cached_checkpoint_generation
+                .store(cursor.generation, Ordering::Relaxed);
+            inst.cached_checkpoint_ordinal
+                .store(cursor.file_ordinal, Ordering::Relaxed);
+            inst.cached_checkpoint_offset
+                .store(cursor.offset, Ordering::Relaxed);
         }
 
         Ok(inst)
@@ -537,18 +632,6 @@ impl IndexFile {
     pub(crate) fn sync_all(&self) -> Result<()> {
         // Persist row updates before any header state that claims those rows are durable.
         self.rows_mmap.write().flush().map_err(Error::IOError)?;
-        self.rows_file.sync_all().map_err(Error::IOError)?;
-        self.header_mmap.flush().map_err(Error::IOError)?;
-        #[cfg(windows)]
-        self.header_file.sync_all().map_err(Error::IOError)?;
-        Ok(())
-    }
-
-    pub(crate) fn sync_all_with_rows_guard(
-        &self,
-        rows_table: &mut RowsTableWriteGuard<'_>,
-    ) -> Result<()> {
-        rows_table.row_guard.flush().map_err(Error::IOError)?;
         self.rows_file.sync_all().map_err(Error::IOError)?;
         self.header_mmap.flush().map_err(Error::IOError)?;
         #[cfg(windows)]
@@ -611,14 +694,6 @@ impl IndexFile {
         self.full_header_ref().waste_levels[file_idx as usize].swap(0, Ordering::Relaxed)
     }
 
-    pub(crate) fn rollover_uncommitted_counters(&self) {
-        let h = self.header_ref();
-        apply_signed_counter_delta(
-            &h.committed_num_entries,
-            h.uncommitted_entries_delta.swap(0, Ordering::Relaxed),
-        );
-    }
-
     pub(crate) fn grow(&self, nsl: u64) -> Result<Option<Duration>> {
         let mut layout_mut = self.rows_table_mut();
         let gsl = self.header_ref().global_split_level.load(Ordering::Acquire);
@@ -668,6 +743,10 @@ impl IndexFile {
     pub(crate) fn num_rows(&self) -> usize {
         let gsl = self.header_ref().global_split_level.load(Ordering::Acquire) as usize;
         1usize << gsl
+    }
+
+    pub(crate) fn num_shards(&self) -> usize {
+        self.row_locks.len()
     }
 
     pub(crate) fn shrink_with_rows_guard(

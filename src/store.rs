@@ -14,13 +14,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use crate::{
-    data_file::DataFile,
+    data_file::{DataFile, InflightTracker},
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
         EntryType, HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL,
@@ -94,12 +94,15 @@ struct StoreInner {
     list_meta_locks: Vec<RwLock<()>>,
     list_meta_locks_mask: usize,
     data_files: RwLock<HashMap<u16, Arc<DataFile>>>,
+    inflight_tracker: InflightTracker,
     active_file_idx: AtomicU16,
     active_file_ordinal: AtomicU64,
+    uncommitted_entries_delta: AtomicI64,
+    checkpoint_lock: Mutex<()>,
     rotation_lock: Mutex<()>,
     compaction_state: Mutex<CompactionState>,
     compaction_condvar: Condvar,
-    shutting_down: AtomicBool,
+    compaction_shutting_down: AtomicBool,
     stats: InnerStats,
 }
 
@@ -110,6 +113,7 @@ struct ExistingEntryUpdate<'a> {
     val: &'a [u8],
     hc: HashCoord,
     col: usize,
+    shard_idx: usize,
     src_file_idx: u16,
     old_klen: usize,
     old_vlen: usize,
@@ -141,6 +145,7 @@ impl StoreInner {
         state: OpenState,
         num_logical_locks: usize,
     ) -> Self {
+        let num_shards = state.index_file.num_shards();
         Self {
             base_path,
             config,
@@ -148,12 +153,15 @@ impl StoreInner {
             list_meta_locks: (0..num_logical_locks).map(|_| RwLock::new(())).collect(),
             list_meta_locks_mask: num_logical_locks - 1,
             data_files: RwLock::new(state.data_files),
+            inflight_tracker: InflightTracker::new(num_shards),
             active_file_idx: AtomicU16::new(state.active_file_idx),
             active_file_ordinal: AtomicU64::new(state.active_file_ordinal),
+            uncommitted_entries_delta: AtomicI64::new(0),
+            checkpoint_lock: Mutex::new(()),
             rotation_lock: Mutex::new(()),
             compaction_state: Mutex::new(CompactionState::default()),
             compaction_condvar: Condvar::new(),
-            shutting_down: AtomicBool::new(false),
+            compaction_shutting_down: AtomicBool::new(false),
             stats: InnerStats::default(),
         }
     }
@@ -169,6 +177,7 @@ impl StoreInner {
         let mut data_files = self.data_files.write();
 
         data_files.clear();
+        self.inflight_tracker.clear_all();
         self.index_file.reset(row_table)?;
 
         let index_path = index_file_path(self.base_path.as_path());
@@ -210,6 +219,7 @@ impl StoreInner {
             .store(active_file_idx, Ordering::Release);
         self.active_file_ordinal
             .store(active_file_ordinal, Ordering::Release);
+        self.uncommitted_entries_delta.store(0, Ordering::Relaxed);
         self.stats.reset();
 
         Ok(())
@@ -268,11 +278,13 @@ impl StoreInner {
 
     fn next_compaction_candidates(&self, max_candidates: usize) -> Vec<(u16, u64)> {
         let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
+        let commit_file_ordinal = self.index_file.checkpoint_cursor().0;
         let files = self.data_files.read();
         let mut candidates = files
             .iter()
             .filter_map(|(&file_idx, data_file)| {
                 if file_idx == active_file_idx
+                    || data_file.file_ordinal >= commit_file_ordinal
                     || self.index_file.file_waste(file_idx) <= self.config.compaction_min_threshold
                 {
                     return None;
@@ -313,6 +325,12 @@ impl StoreInner {
             .ok_or(Error::MissingDataFile(file_idx))
     }
 
+    fn ordered_data_files(&self) -> Vec<Arc<DataFile>> {
+        let mut files = self.data_files.read().values().cloned().collect::<Vec<_>>();
+        files.sort_by_key(|data_file| data_file.file_ordinal);
+        files
+    }
+
     fn bump_histogram(&self, entry_size: u64) {
         // Buckets: [<64, <256, <1K, <4K, <16K, >=16K]
         // Boundaries at ilog2 = 6, 8, 10, 12, 14 → bucket = ((ilog2 - 4) / 2).clamp(0, 5)
@@ -321,22 +339,81 @@ impl StoreInner {
     }
 
     fn add_uncommitted_num_entries(&self, delta: i64) {
-        self.index_file
-            .header_ref()
-            .uncommitted_entries_delta
+        self.uncommitted_entries_delta
             .fetch_add(delta, Ordering::Relaxed);
     }
 
-    fn persist_active_file_checkpoint(&self, active_file: &Arc<DataFile>) {
-        self.index_file.rollover_uncommitted_counters();
-        self.index_file
-            .header_ref()
-            .commit_file_ordinal
-            .store(active_file.file_ordinal, Ordering::Release);
-        self.index_file
-            .header_ref()
-            .commit_offset
-            .store(active_file.used_bytes(), Ordering::Release);
+    /// Applies `delta` to the persisted committed entry count, clamping at
+    /// zero.  Returns the actual change applied (which may differ from `delta`
+    /// when the count would underflow).
+    fn advance_committed_num_entries(&self, delta: i64) -> i64 {
+        if delta == 0 {
+            return 0;
+        }
+
+        let committed = &self.index_file.header_ref().committed_num_entries;
+        let mut current = committed.load(Ordering::Relaxed);
+        loop {
+            let updated = current.saturating_add_signed(delta);
+            match committed.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return updated as i64 - current as i64,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Folds a checkpointed delta into the persisted committed count and
+    /// adjusts the runtime uncommitted delta so that
+    /// `committed + uncommitted == live_count` is preserved.
+    ///
+    /// When many inserts and removes of the same keys happen within one
+    /// checkpoint window, the drained delta can be more negative than
+    /// `committed` can absorb (since it is unsigned).  In that case only
+    /// the clamped portion is applied and the remainder stays in
+    /// `uncommitted_entries_delta`.
+    fn fold_checkpointed_num_entries(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+
+        let actual = self.advance_committed_num_entries(delta);
+        self.uncommitted_entries_delta
+            .fetch_add(-actual, Ordering::Relaxed);
+    }
+
+    fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) {
+        self.index_file.persist_checkpoint_cursor(ordinal, offset);
+    }
+
+    fn checkpoint_cursor(&self) -> Result<()> {
+        let _checkpoint_lock = self.checkpoint_lock.lock();
+        let files = self.data_files.read();
+        let active_idx = self.active_file_idx.load(Ordering::Acquire);
+        let active_file = files
+            .get(&active_idx)
+            .cloned()
+            .ok_or(Error::MissingDataFile(active_idx))?;
+        let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta) =
+            self.inflight_tracker.checkpoint_progress(&active_file);
+
+        let last_commit_ordinal = self.index_file.checkpoint_cursor().0;
+
+        for data_file in files.values() {
+            if data_file.file_ordinal >= last_commit_ordinal {
+                data_file.file.sync_all().map_err(Error::IOError)?;
+            }
+        }
+        drop(files);
+
+        self.fold_checkpointed_num_entries(checkpointed_delta);
+        self.persist_checkpoint_cursor(checkpoint_ordinal, checkpoint_offset);
+        self.index_file.sync_all()?;
+        sync_dir(&self.base_path)
     }
 
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
@@ -402,7 +479,6 @@ impl StoreInner {
     /// `compact_file` also writes to `data_files` (removing files) but only
     /// touches non-active indices, so there is no conflict.
     fn _rotate_data_file(&self, active_idx: u16) -> Result<()> {
-        let mut rows_table = self.index_file.rows_table_mut();
         let _rot_lock = self.rotation_lock.lock();
 
         if self.active_file_idx.load(Ordering::Acquire) != active_idx {
@@ -434,11 +510,6 @@ impl StoreInner {
         )?);
 
         active_file.seal_for_rotation();
-        active_file.wait_inflight();
-        let _ = active_file.file.sync_all();
-
-        self.persist_active_file_checkpoint(&active_file);
-        let _ = self.index_file.sync_all_with_rows_guard(&mut rows_table);
 
         self.data_files.write().insert(next_idx, data_file);
         self.active_file_idx.store(next_idx, Ordering::Release);
@@ -448,6 +519,8 @@ impl StoreInner {
         {
             self.signal_compaction_scan();
         }
+
+        self.checkpoint_cursor()?;
 
         Ok(())
     }
@@ -527,38 +600,6 @@ impl StoreInner {
 impl CandyStore {
     pub fn get_db_path(&self) -> &Path {
         &self.inner.base_path
-    }
-
-    pub(super) fn checkpoint_locked(&self) -> Result<()> {
-        let _logical_guards = self
-            .inner
-            .list_meta_locks
-            .iter()
-            .map(|lock| lock.write())
-            .collect::<Vec<_>>();
-        let mut rows_table = self.inner.index_file.rows_table_mut();
-        let _rotation_lock = self.inner.rotation_lock.lock();
-
-        let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
-        let active_file = self
-            .inner
-            .data_files
-            .read()
-            .get(&active_idx)
-            .cloned()
-            .ok_or(Error::MissingDataFile(active_idx))?;
-
-        let files = self.inner.data_files.read();
-        for data_file in files.values() {
-            data_file.file.sync_all().map_err(Error::IOError)?;
-        }
-        drop(files);
-
-        self.inner.persist_active_file_checkpoint(&active_file);
-        self.inner
-            .index_file
-            .sync_all_with_rows_guard(&mut rows_table)?;
-        sync_dir(&self.inner.base_path)
     }
 
     fn list_read_guard(&self, ns: KeyNamespace, key: &[u8]) -> RwLockReadGuard<'_, ()> {
@@ -714,8 +755,14 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, size, _inflight_guard) =
-                        active_file.append_kv(EntryType::Insert, ns, key, val)?;
+                    let (file_off, size, inflight_guard) = active_file.append_kv(
+                        EntryType::Insert,
+                        ns,
+                        key,
+                        val,
+                        row.shard_idx,
+                        &self.inner.inflight_tracker,
+                    )?;
                     self.inner.record_write(size as u64);
                     row.insert(
                         col,
@@ -723,6 +770,7 @@ impl CandyStore {
                         EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
                     );
                     self.record_write_stats(key.len(), val.len());
+                    inflight_guard.complete();
                     Ok(GetOrCreateStatus::CreatedNew(val.to_vec()))
                 } else {
                     Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
@@ -780,8 +828,14 @@ impl CandyStore {
             .files
             .get(&active_idx)
             .ok_or(Error::MissingDataFile(active_idx))?;
-        let (file_off, size, _inflight_guard) =
-            active_file.append_kv(EntryType::Update, update.ns, update.key, update.val)?;
+        let (file_off, size, inflight_guard) = active_file.append_kv(
+            EntryType::Update,
+            update.ns,
+            update.key,
+            update.val,
+            update.shard_idx,
+            &self.inner.inflight_tracker,
+        )?;
         self.inner.record_write(size as u64);
         if let Some(name) = update.crash_point_name {
             crate::crash_point(name);
@@ -793,6 +847,7 @@ impl CandyStore {
         );
         self.track_update_waste(update.src_file_idx, update.old_klen, update.old_vlen);
         self.record_replace_stats(update.key.len(), update.val.len());
+        inflight_guard.complete();
         Ok(())
     }
 
@@ -815,6 +870,7 @@ impl CandyStore {
                     let old_val = kv.into_value();
                     let src_file_idx = file.file_idx;
 
+                    let shard_idx = row.shard_idx;
                     self.apply_update_to_existing_entry(
                         &mut row,
                         ExistingEntryUpdate {
@@ -824,6 +880,7 @@ impl CandyStore {
                             val,
                             hc,
                             col,
+                            shard_idx,
                             src_file_idx,
                             old_klen: klen,
                             old_vlen: vlen,
@@ -844,8 +901,14 @@ impl CandyStore {
                 let active_file = files
                     .get(&active_idx)
                     .ok_or(Error::MissingDataFile(active_idx))?;
-                let (file_off, size, _inflight_guard) =
-                    active_file.append_kv(EntryType::Insert, ns, key, val)?;
+                let (file_off, size, inflight_guard) = active_file.append_kv(
+                    EntryType::Insert,
+                    ns,
+                    key,
+                    val,
+                    row.shard_idx,
+                    &self.inner.inflight_tracker,
+                )?;
                 self.inner.record_write(size as u64);
                 crate::crash_point("set_after_write_before_insert");
                 row.insert(
@@ -854,6 +917,7 @@ impl CandyStore {
                     EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
                 );
                 self.record_write_stats(key.len(), val.len());
+                inflight_guard.complete();
                 Ok(None)
             } else {
                 Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
@@ -902,6 +966,7 @@ impl CandyStore {
                     let old_val = kv.into_value();
                     let src_file_idx = file.file_idx;
 
+                    let shard_idx = row.shard_idx;
                     self.apply_update_to_existing_entry(
                         &mut row,
                         ExistingEntryUpdate {
@@ -911,6 +976,7 @@ impl CandyStore {
                             val,
                             hc,
                             col,
+                            shard_idx,
                             src_file_idx,
                             old_klen: klen,
                             old_vlen: vlen,
@@ -983,13 +1049,18 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (tombstone_size, _inflight_guard) =
-                        active_file.append_tombstone(ns, key)?;
+                    let (tombstone_size, inflight_guard) = active_file.append_tombstone(
+                        ns,
+                        key,
+                        row.shard_idx,
+                        &self.inner.inflight_tracker,
+                    )?;
                     self.inner.record_write(tombstone_size as u64);
 
                     row.remove(col);
                     self.track_tombstone_waste(src_file_idx, klen, vlen);
                     self.record_remove_stats();
+                    inflight_guard.complete();
                     return Ok(Some(old_val));
                 }
             }
@@ -1098,16 +1169,29 @@ impl CandyStore {
         sync_dir(&self.inner.base_path)
     }
 
-    /// Establishes a durable recovery checkpoint at the current end of the active file.
+    /// Establishes a durable recovery checkpoint.
     ///
-    /// This stops background compaction, blocks concurrent writers, syncs the
-    /// data and index files, and advances the persisted replay cursor so the
-    /// next open can resume from this point without replaying earlier writes.
+    /// Reads the earliest in-flight `(file_ordinal, offset)` tuple across all
+    /// shards to determine the first position that may still require replay.
+    /// If no writes are in flight, the checkpoint targets the active file tail.
+    /// Syncs the data and index files and advances the persisted replay cursor
+    /// so the next open can resume from this point without replaying earlier
+    /// writes.
+    ///
+    /// This does **not** block concurrent writers or compaction, but does block
+    /// compound operations like lists/queues to checkpoint at well-defined states
     pub fn checkpoint(&self) -> Result<()> {
-        self.stop_compaction();
-        let res = self.checkpoint_locked();
-        self.start_compaction();
-        res
+        // take all list_meta_locks so we don't ever create a checkpoint that has half-baked
+        // queue/list. note that rotation-induced checkpoints may do that, but user-induced ones
+        // will not.
+        let _logical_guards = self
+            .inner
+            .list_meta_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+
+        self.inner.checkpoint_cursor()
     }
 
     /// Returns the number of background compaction errors observed since open.
@@ -1117,11 +1201,19 @@ impl CandyStore {
 
     /// Returns the number of currently live entries.
     pub fn num_items(&self) -> usize {
-        let h = self.inner.index_file.header_ref();
-        h.committed_num_entries
-            .load(Ordering::Relaxed)
-            .saturating_add_signed(h.uncommitted_entries_delta.load(Ordering::Relaxed))
-            as usize
+        let committed = self
+            .inner
+            .index_file
+            .header_ref()
+            .committed_num_entries
+            .load(Ordering::Relaxed);
+        let uncommitted = self.inner.uncommitted_entries_delta.load(Ordering::Relaxed);
+        let count = committed.saturating_add_signed(uncommitted);
+        debug_assert!(
+            (committed as i128 + uncommitted as i128) >= 0,
+            "live entry count underflow: committed={committed}, uncommitted={uncommitted}"
+        );
+        count as usize
     }
 
     /// Returns the current index capacity in entries.
@@ -1236,6 +1328,8 @@ impl CandyStore {
 mod tests {
     use super::*;
 
+    use std::{thread, time::Instant};
+
     use tempfile::tempdir;
 
     #[test]
@@ -1322,6 +1416,33 @@ mod tests {
         let stats = db.stats();
         assert_eq!(stats.num_rebuilt_entries, 11);
         assert_eq!(stats.num_rebuild_purged_bytes, 96);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_does_not_join_compaction_thread() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.stop_compaction();
+        *db.compaction_thd.lock() = Some(thread::spawn(|| {
+            thread::sleep(Duration::from_millis(400));
+        }));
+
+        let t0 = Instant::now();
+        db.checkpoint()?;
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "checkpoint should not wait for the compaction thread handle"
+        );
+
+        db.compaction_thd
+            .lock()
+            .take()
+            .expect("test compaction thread should still be present")
+            .join()
+            .expect("test compaction thread panicked");
 
         Ok(())
     }
