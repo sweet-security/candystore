@@ -36,6 +36,10 @@ pub struct Config {
     pub reset_on_invalid_data: bool,
     /// Target background compaction throughput in bytes per second.
     pub compaction_throughput_bytes_per_sec: usize,
+    /// perform a checkpoint (for crash-consistency) every this much time (`None` to disable)
+    pub checkpoint_interval: Option<Duration>,
+    /// perform a checkpoint (for crash-consistency) every this many bytes written (`None` to disable)
+    pub checkpoint_delta_bytes: Option<usize>,
 }
 
 impl Default for Config {
@@ -50,6 +54,8 @@ impl Default for Config {
             max_concurrency: (2 * num_cpus::get()).clamp(16, 64),
             reset_on_invalid_data: false,
             compaction_throughput_bytes_per_sec: 4 * 1024 * 1024,
+            checkpoint_interval: Some(Duration::from_secs(5)),
+            checkpoint_delta_bytes: Some(128 * 1024),
         }
     }
 }
@@ -77,6 +83,9 @@ pub enum Error {
 
     #[error("Payload {0} too large")]
     PayloadTooLarge(usize),
+
+    #[error("Checkpoint shutdown: {0}")]
+    CheckpointShutdown(String),
 }
 
 /// Convenience result type used by the crate.
@@ -197,8 +206,21 @@ pub struct Stats {
 
     /// Time spent in the most recent grow remap operation.
     pub last_remap_dur: Duration,
+    /// Persisted checkpoint slot generation visible to recovery.
+    pub checkpoint_generation: u64,
+    /// Most recent completed runtime checkpoint epoch handled by the checkpoint worker.
+    pub checkpoint_epoch: u64,
+    /// Approximate bytes written since the last completed checkpoint.
+    ///
+    /// This is a best-effort runtime metric intended for monitoring rather
+    /// than an exact durable boundary.
+    pub uncheckpointed_bytes: u64,
+    /// Time spent in the most recent successful checkpoint operation.
+    pub last_checkpoint_dur: Duration,
     /// Number of completed background compactions.
     pub num_compactions: u64,
+    /// Number of background checkpoint errors since open.
+    pub checkpoint_errors: u64,
     /// Time spent in the most recent successful file compaction.
     pub last_compaction_dur: Duration,
     /// Bytes reclaimed by the most recent successful file compaction.

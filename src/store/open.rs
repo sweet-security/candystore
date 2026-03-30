@@ -2,13 +2,15 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
     data_file::DataFile,
     index_file::IndexFile,
     internal::{
-        MAX_REPRESENTABLE_FILE_SIZE, is_resettable_open_error, parse_data_file_idx, sync_dir,
+        FILE_OFFSET_ALIGNMENT, MAX_REPRESENTABLE_FILE_SIZE, is_resettable_open_error,
+        parse_data_file_idx, sync_dir,
     },
     types::{Config, Error, INITIAL_DATA_FILE_ORDINAL, Result},
 };
@@ -28,6 +30,7 @@ impl CandyStore {
             inner: Arc::new(StoreInner::new(base_path, config, state, num_logical_locks)),
             _lockfile: lockfile,
             compaction_thd: parking_lot::Mutex::new(None),
+            checkpoint_thd: parking_lot::Mutex::new(None),
             allow_clean_shutdown: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -139,6 +142,16 @@ impl CandyStore {
                 .compaction_min_threshold
                 .min((max_data_file_size as f64 * 0.8) as u32),
             remap_scaler: config.remap_scaler.clamp(1, 4),
+            checkpoint_interval: config.checkpoint_interval.map(|d| {
+                if d.is_zero() {
+                    Duration::from_millis(100)
+                } else {
+                    d
+                }
+            }),
+            checkpoint_delta_bytes: config
+                .checkpoint_delta_bytes
+                .map(|b| b.max(FILE_OFFSET_ALIGNMENT as usize)),
             ..config
         };
 
@@ -168,6 +181,7 @@ impl CandyStore {
         let store = Self::build_store(base_path.clone(), config.clone(), lockfile)?;
         match store.recover_index() {
             Ok(()) => {
+                store.start_checkpoint_worker();
                 store.start_compaction();
                 Ok(store)
             }
@@ -176,14 +190,17 @@ impl CandyStore {
                 let inner = unsafe { std::ptr::read(&store.inner) };
                 let lockfile = unsafe { std::ptr::read(&store._lockfile) };
                 let compaction_thd = unsafe { std::ptr::read(&store.compaction_thd) };
+                let checkpoint_thd = unsafe { std::ptr::read(&store.checkpoint_thd) };
                 let _allow_clean_shutdown = unsafe { std::ptr::read(&store.allow_clean_shutdown) };
                 drop(compaction_thd);
+                drop(checkpoint_thd);
                 drop(inner);
 
                 Self::clear_db_files(&base_path)?;
 
                 let recovered = Self::build_store(base_path, config, lockfile)?;
                 recovered.recover_index()?;
+                recovered.start_checkpoint_worker();
                 recovered.start_compaction();
                 Ok(recovered)
             }
@@ -201,12 +218,14 @@ impl CandyStore {
     pub fn clear(&self) -> Result<()> {
         // stop bg thread
         self.stop_compaction();
+        self.stop_checkpoint_worker();
 
         // now we're single-threaded. take all locks and clear state
         self.inner.reset()?;
 
         self.allow_clean_shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.start_checkpoint_worker();
         self.start_compaction();
 
         Ok(())

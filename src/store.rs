@@ -1,3 +1,4 @@
+mod checkpoint;
 mod compaction;
 mod list;
 mod open;
@@ -37,10 +38,55 @@ struct CompactionState {
     wake_requested: bool,
 }
 
+// this is needed because std::io::Error is not clone()
+#[derive(Debug, Clone)]
+enum CheckpointFailure {
+    IO(std::io::ErrorKind, String),
+    MissingDataFile(u16),
+    Other(String),
+}
+
+impl CheckpointFailure {
+    fn from_error(err: Error) -> Self {
+        match err {
+            Error::IOError(io_err) => Self::IO(io_err.kind(), io_err.to_string()),
+            Error::MissingDataFile(file_idx) => Self::MissingDataFile(file_idx),
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn to_error(&self) -> Error {
+        match self {
+            Self::IO(kind, message) => Error::IOError(std::io::Error::new(*kind, message.clone())),
+            Self::MissingDataFile(file_idx) => Error::MissingDataFile(*file_idx),
+            Self::Other(message) => Error::IOError(std::io::Error::other(message.clone())),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CheckpointState {
+    requested_epoch: u64,
+    handled_epoch: u64,
+    completed_epoch: u64,
+    last_failure_epoch: u64,
+    last_failure: Option<CheckpointFailure>,
+    last_checkpoint_dur_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointSnapshot {
+    checkpoint_ordinal: u64,
+    checkpoint_offset: u64,
+    checkpointed_delta: i64,
+    last_commit_ordinal: u64,
+}
+
 #[derive(Default)]
 struct InnerStats {
     num_compactions: AtomicU64,
     compaction_errors: AtomicU64,
+    checkpoint_errors: AtomicU64,
     num_positive_lookups: AtomicU64,
     num_negative_lookups: AtomicU64,
     num_collisions: AtomicU64,
@@ -64,6 +110,7 @@ impl InnerStats {
     fn reset(&self) {
         self.num_compactions.store(0, Ordering::Relaxed);
         self.compaction_errors.store(0, Ordering::Relaxed);
+        self.checkpoint_errors.store(0, Ordering::Relaxed);
         self.num_positive_lookups.store(0, Ordering::Relaxed);
         self.num_negative_lookups.store(0, Ordering::Relaxed);
         self.num_collisions.store(0, Ordering::Relaxed);
@@ -98,7 +145,9 @@ struct StoreInner {
     active_file_idx: AtomicU16,
     active_file_ordinal: AtomicU64,
     uncommitted_entries_delta: AtomicI64,
-    checkpoint_lock: Mutex<()>,
+    checkpoint_state: Mutex<CheckpointState>,
+    checkpoint_condvar: Condvar,
+    checkpoint_shutting_down: AtomicBool,
     rotation_lock: Mutex<()>,
     compaction_state: Mutex<CompactionState>,
     compaction_condvar: Condvar,
@@ -125,6 +174,7 @@ pub struct CandyStore {
     inner: Arc<StoreInner>,
     _lockfile: fslock::LockFile,
     compaction_thd: Mutex<Option<std::thread::JoinHandle<()>>>,
+    checkpoint_thd: Mutex<Option<std::thread::JoinHandle<()>>>,
     allow_clean_shutdown: AtomicBool,
 }
 
@@ -157,7 +207,9 @@ impl StoreInner {
             active_file_idx: AtomicU16::new(state.active_file_idx),
             active_file_ordinal: AtomicU64::new(state.active_file_ordinal),
             uncommitted_entries_delta: AtomicI64::new(0),
-            checkpoint_lock: Mutex::new(()),
+            checkpoint_state: Mutex::new(CheckpointState::default()),
+            checkpoint_condvar: Condvar::new(),
+            checkpoint_shutting_down: AtomicBool::new(false),
             rotation_lock: Mutex::new(()),
             compaction_state: Mutex::new(CompactionState::default()),
             compaction_condvar: Condvar::new(),
@@ -220,6 +272,7 @@ impl StoreInner {
         self.active_file_ordinal
             .store(active_file_ordinal, Ordering::Release);
         self.uncommitted_entries_delta.store(0, Ordering::Relaxed);
+        *self.checkpoint_state.lock() = CheckpointState::default();
         self.stats.reset();
 
         Ok(())
@@ -244,11 +297,12 @@ impl StoreInner {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn record_write(&self, bytes: u64) {
+    fn record_write(&self, offset: u64, bytes: u64) {
         self.stats.num_write_ops.fetch_add(1, Ordering::Relaxed);
         self.stats
             .num_write_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        self.note_checkpoint_write(offset + bytes);
     }
 
     fn signal_compaction_scan(&self) {
@@ -390,8 +444,19 @@ impl StoreInner {
         self.index_file.persist_checkpoint_cursor(ordinal, offset);
     }
 
-    fn checkpoint_cursor(&self) -> Result<()> {
-        let _checkpoint_lock = self.checkpoint_lock.lock();
+    fn perform_checkpoint(&self) -> Result<()> {
+        let snapshot = self.snapshot_checkpoint_progress()?;
+        let current_cursor = self.index_file.checkpoint_cursor();
+        if snapshot.checkpoint_ordinal == current_cursor.0
+            && snapshot.checkpoint_offset == current_cursor.1
+            && snapshot.checkpointed_delta == 0
+        {
+            return Ok(());
+        }
+        self.sync_checkpoint(snapshot)
+    }
+
+    fn snapshot_checkpoint_progress(&self) -> Result<CheckpointSnapshot> {
         let files = self.data_files.read();
         let active_idx = self.active_file_idx.load(Ordering::Acquire);
         let active_file = files
@@ -400,22 +465,38 @@ impl StoreInner {
             .ok_or(Error::MissingDataFile(active_idx))?;
         let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta) =
             self.inflight_tracker.checkpoint_progress(&active_file);
-
         let last_commit_ordinal = self.index_file.checkpoint_cursor().0;
+        Ok(CheckpointSnapshot {
+            checkpoint_ordinal,
+            checkpoint_offset,
+            checkpointed_delta,
+            last_commit_ordinal,
+        })
+    }
 
+    fn sync_checkpoint(&self, snap: CheckpointSnapshot) -> Result<()> {
+        let files = self.data_files.read();
         for data_file in files.values() {
-            if data_file.file_ordinal >= last_commit_ordinal {
+            if data_file.file_ordinal >= snap.last_commit_ordinal {
                 data_file.file.sync_all().map_err(Error::IOError)?;
             }
         }
         drop(files);
 
-        self.fold_checkpointed_num_entries(checkpointed_delta);
-        self.persist_checkpoint_cursor(checkpoint_ordinal, checkpoint_offset);
+        self.fold_checkpointed_num_entries(snap.checkpointed_delta);
+        self.persist_checkpoint_cursor(snap.checkpoint_ordinal, snap.checkpoint_offset);
         self.index_file.sync_all()?;
         sync_dir(&self.base_path)
     }
 
+    fn perform_checkpoint_with_logical_locks(&self) -> Result<()> {
+        let _logical_guards = self
+            .list_meta_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+        self.perform_checkpoint()
+    }
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
         let nsl = sl + 1;
         let low_row_idx = hc.row_index(sl);
@@ -479,49 +560,51 @@ impl StoreInner {
     /// `compact_file` also writes to `data_files` (removing files) but only
     /// touches non-active indices, so there is no conflict.
     fn _rotate_data_file(&self, active_idx: u16) -> Result<()> {
-        let _rot_lock = self.rotation_lock.lock();
-
-        if self.active_file_idx.load(Ordering::Acquire) != active_idx {
-            return Ok(());
-        }
-
-        let active_file = self.data_file(active_idx)?;
-        let active_ordinal = active_file.file_ordinal;
-
-        let mut next_idx = (self.active_file_idx.load(Ordering::Relaxed) + 1) & MAX_DATA_FILE_IDX;
-        let mut attempts = 0;
         {
-            let files = self.data_files.read();
-            while files.contains_key(&next_idx) {
-                next_idx = (next_idx + 1) & MAX_DATA_FILE_IDX;
-                attempts += 1;
-                if attempts > MAX_DATA_FILES {
-                    return Err(Error::TooManyDataFiles);
+            let _rot_lock = self.rotation_lock.lock();
+
+            if self.active_file_idx.load(Ordering::Acquire) != active_idx {
+                return Ok(());
+            }
+
+            let active_file = self.data_file(active_idx)?;
+            let active_ordinal = active_file.file_ordinal;
+
+            let mut next_idx =
+                (self.active_file_idx.load(Ordering::Relaxed) + 1) & MAX_DATA_FILE_IDX;
+            let mut attempts = 0;
+            {
+                let files = self.data_files.read();
+                while files.contains_key(&next_idx) {
+                    next_idx = (next_idx + 1) & MAX_DATA_FILE_IDX;
+                    attempts += 1;
+                    if attempts > MAX_DATA_FILES {
+                        return Err(Error::TooManyDataFiles);
+                    }
                 }
+            }
+
+            let ordinal = self.active_file_ordinal.fetch_add(1, Ordering::Relaxed) + 1;
+            let data_file = Arc::new(DataFile::create(
+                self.base_path.as_path(),
+                self.config.clone(),
+                next_idx,
+                ordinal,
+            )?);
+
+            active_file.seal_for_rotation();
+
+            self.data_files.write().insert(next_idx, data_file);
+            self.active_file_idx.store(next_idx, Ordering::Release);
+
+            if active_ordinal != 0
+                && self.index_file.file_waste(active_idx) > self.config.compaction_min_threshold
+            {
+                self.signal_compaction_scan();
             }
         }
 
-        let ordinal = self.active_file_ordinal.fetch_add(1, Ordering::Relaxed) + 1;
-        let data_file = Arc::new(DataFile::create(
-            self.base_path.as_path(),
-            self.config.clone(),
-            next_idx,
-            ordinal,
-        )?);
-
-        active_file.seal_for_rotation();
-
-        self.data_files.write().insert(next_idx, data_file);
-        self.active_file_idx.store(next_idx, Ordering::Release);
-
-        if active_ordinal != 0
-            && self.index_file.file_waste(active_idx) > self.config.compaction_min_threshold
-        {
-            self.signal_compaction_scan();
-        }
-
-        self.checkpoint_cursor()?;
-
+        _ = self.request_checkpoint_epoch();
         Ok(())
     }
 
@@ -763,7 +846,7 @@ impl CandyStore {
                         row.shard_idx,
                         &self.inner.inflight_tracker,
                     )?;
-                    self.inner.record_write(size as u64);
+                    self.inner.record_write(file_off, size as u64);
                     row.insert(
                         col,
                         hc.sig,
@@ -836,7 +919,7 @@ impl CandyStore {
             update.shard_idx,
             &self.inner.inflight_tracker,
         )?;
-        self.inner.record_write(size as u64);
+        self.inner.record_write(file_off, size as u64);
         if let Some(name) = update.crash_point_name {
             crate::crash_point(name);
         }
@@ -909,7 +992,7 @@ impl CandyStore {
                     row.shard_idx,
                     &self.inner.inflight_tracker,
                 )?;
-                self.inner.record_write(size as u64);
+                self.inner.record_write(file_off, size as u64);
                 crate::crash_point("set_after_write_before_insert");
                 row.insert(
                     col,
@@ -1049,13 +1132,13 @@ impl CandyStore {
                     let active_file = files
                         .get(&active_idx)
                         .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (tombstone_size, inflight_guard) = active_file.append_tombstone(
+                    let (file_off, tombstone_size, inflight_guard) = active_file.append_tombstone(
                         ns,
                         key,
                         row.shard_idx,
                         &self.inner.inflight_tracker,
                     )?;
-                    self.inner.record_write(tombstone_size as u64);
+                    self.inner.record_write(file_off, tombstone_size as u64);
 
                     row.remove(col);
                     self.track_tombstone_waste(src_file_idx, klen, vlen);
@@ -1178,20 +1261,12 @@ impl CandyStore {
     /// so the next open can resume from this point without replaying earlier
     /// writes.
     ///
-    /// This does **not** block concurrent writers or compaction, but does block
-    /// compound operations like lists/queues to checkpoint at well-defined states
+    /// This waits for the background checkpoint worker to establish a checkpoint
+    /// after taking all logical list/queue locks, so compound operations are
+    /// checkpointed only at well-defined boundaries.
     pub fn checkpoint(&self) -> Result<()> {
-        // take all list_meta_locks so we don't ever create a checkpoint that has half-baked
-        // queue/list. note that rotation-induced checkpoints may do that, but user-induced ones
-        // will not.
-        let _logical_guards = self
-            .inner
-            .list_meta_locks
-            .iter()
-            .map(|lock| lock.write())
-            .collect::<Vec<_>>();
-
-        self.inner.checkpoint_cursor()
+        let target_epoch = self.inner.request_checkpoint_epoch();
+        self.inner.wait_for_checkpoint_epoch(target_epoch)
     }
 
     /// Returns the number of background compaction errors observed since open.
@@ -1272,6 +1347,11 @@ impl CandyStore {
         };
         let waste_bytes = self.inner.index_file.total_waste();
         let s = &self.inner.stats;
+        let checkpoint_state = self.inner.checkpoint_state.lock();
+        let checkpoint_generation = self.inner.index_file.checkpoint_generation();
+        let checkpoint_epoch = checkpoint_state.completed_epoch;
+        let uncheckpointed_bytes = self.inner.approx_uncheckpointed_bytes();
+        let last_checkpoint_dur = Duration::from_millis(checkpoint_state.last_checkpoint_dur_ms);
 
         Stats {
             num_rows,
@@ -1283,8 +1363,13 @@ impl CandyStore {
             waste_bytes,
 
             num_compactions: s.num_compactions.load(Ordering::Relaxed),
+            checkpoint_errors: s.checkpoint_errors.load(Ordering::Relaxed),
 
             last_remap_dur: Duration::from_millis(s.last_remap_dur_ms.load(Ordering::Relaxed)),
+            checkpoint_generation,
+            checkpoint_epoch,
+            uncheckpointed_bytes,
+            last_checkpoint_dur,
             last_compaction_dur: Duration::from_millis(
                 s.last_compaction_dur_ms.load(Ordering::Relaxed),
             ),
@@ -1421,6 +1506,47 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_reports_checkpoint_state() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        db.stop_compaction();
+        db.set("checkpoint-stats", vec![b'z'; 512])?;
+
+        let active_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let active_ordinal = db
+            .inner
+            .data_files
+            .read()
+            .get(&active_idx)
+            .expect("active data file should exist")
+            .file_ordinal;
+        db.inner.persist_checkpoint_cursor(active_ordinal, 0);
+
+        {
+            let mut checkpoint_state = db.inner.checkpoint_state.lock();
+            checkpoint_state.completed_epoch = 13;
+            checkpoint_state.last_checkpoint_dur_ms = 29;
+        }
+
+        let expected_dirty = db
+            .inner
+            .data_files
+            .read()
+            .get(&active_idx)
+            .expect("active data file should exist")
+            .used_bytes();
+
+        let stats = db.stats();
+        assert!(stats.checkpoint_generation > 0);
+        assert_eq!(stats.checkpoint_epoch, 13);
+        assert_eq!(stats.uncheckpointed_bytes, expected_dirty);
+        assert_eq!(stats.last_checkpoint_dur, Duration::from_millis(29));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_checkpoint_does_not_join_compaction_thread() -> Result<()> {
         let dir = tempdir().unwrap();
         let db = CandyStore::open(dir.path(), Config::default())?;
@@ -1443,6 +1569,123 @@ mod tests {
             .expect("test compaction thread should still be present")
             .join()
             .expect("test compaction thread panicked");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rotation_schedules_background_checkpoint() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 2048,
+                compaction_min_threshold: u32::MAX,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Config::default()
+            },
+        )?;
+
+        db.stop_compaction();
+        while db.stats().num_data_files < 2 {
+            let idx = db.stats().num_write_ops;
+            db.set(
+                format!("rotate-{idx}"),
+                format!("payload-{}", "x".repeat(768)),
+            )?;
+        }
+
+        let t0 = Instant::now();
+        while db.inner.index_file.checkpoint_cursor() == (0, 0) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "rotation should enqueue a checkpoint that advances the replay cursor"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_without_new_bytes_skips_io_and_advances_epoch() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Config::default()
+            },
+        )?;
+
+        db.stop_compaction();
+        let cursor_before = db.inner.index_file.checkpoint_cursor();
+        let requested_before = db.inner.checkpoint_state.lock().requested_epoch;
+        db.checkpoint()?;
+        let state = db.inner.checkpoint_state.lock();
+        assert_eq!(state.requested_epoch, requested_before + 1);
+        assert_eq!(state.completed_epoch, requested_before + 1);
+        assert_eq!(db.inner.index_file.checkpoint_cursor(), cursor_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_delta_bytes_schedules_background_checkpoint() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: Some(512),
+                compaction_min_threshold: u32::MAX,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Config::default()
+            },
+        )?;
+
+        db.stop_compaction();
+        db.set("delta-threshold", vec![b'x'; 1024])?;
+
+        let t0 = Instant::now();
+        while db.inner.index_file.checkpoint_cursor() == (0, 0) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "checkpoint_delta_bytes should schedule a background checkpoint"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_interval_schedules_background_checkpoint() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                checkpoint_interval: Some(Duration::from_millis(50)),
+                checkpoint_delta_bytes: None,
+                compaction_min_threshold: u32::MAX,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Config::default()
+            },
+        )?;
+
+        db.stop_compaction();
+        db.set("interval-threshold", vec![b'y'; 256])?;
+
+        let t0 = Instant::now();
+        while db.inner.index_file.checkpoint_cursor() == (0, 0) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "checkpoint_interval should checkpoint dirty bytes even without explicit requests"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         Ok(())
     }

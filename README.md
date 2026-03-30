@@ -134,14 +134,16 @@ a pass, it simply deletes the old immutable file since no entry points to it.
 
 You can configure the throughput (bytes per second) of compaction.
 
-### Rebuild
+### Checkpointing & Rebuild
 
 We trust the operating system to flush the data files and mmap'ed rows table to storage,
 which means that even if your process crashes, your data will be fully consistent. However,
-this is not true on a power failure or a kernel panic -- in which case the state of the
-index file is unknown. In such cases Candy has an efficient rebuild mechanism (based on checkpointing)
-that essentially replays recent mutating operations in order and rebuilds the correct state from
-the data files.
+this is not true on a power failure or a kernel panic — in which case the state of the
+index file is unknown relative to the data files.
+
+To handle this gracefully, Candy employs **background checkpointing**. Instead of synchronously `fsync`ing index and data files on every write (which would block the writer), a background worker asynchronously persists a consistent snapshot of the current state at user-defined intervals or after a configured amount of bytes have been written.
+
+On an unexpected crash or an unclean shutdown, Candy features an efficient rebuild mechanism. It resumes from the latest successful checkpoint and rapidly replays only the recent mutating operations, restoring the full, robust state from the append-only data files.
 
 ## Design Goals
 
