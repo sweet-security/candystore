@@ -458,7 +458,7 @@ impl DataFile {
         key: &[u8],
         shard_idx: usize,
         inflight_tracker: &'a InflightTracker,
-    ) -> Result<(usize, InflightGuard<'a>)> {
+    ) -> Result<(u64, usize, InflightGuard<'a>)> {
         self.append_entry(
             EntryType::Tombstone,
             ns,
@@ -467,7 +467,6 @@ impl DataFile {
             shard_idx,
             inflight_tracker,
         )
-        .map(|(_, len, guard)| (len, guard))
     }
 
     pub(crate) fn read_kv_into<'a>(

@@ -145,7 +145,7 @@ impl StoreInner {
                         &self.inflight_tracker,
                     ) {
                         Ok((file_off, size, inflight_guard)) => {
-                            self.record_write(size as u64);
+                            self.record_write(file_off, size as u64);
                             moved_bytes = moved_bytes.saturating_add(size as u64);
                             row.replace_pointer(
                                 *col,
@@ -353,10 +353,14 @@ impl Drop for CandyStore {
     fn drop(&mut self) {
         self.stop_compaction();
 
-        if !self.allow_clean_shutdown.load(Ordering::Relaxed) {
+        let should_checkpoint = self.allow_clean_shutdown.load(Ordering::Relaxed);
+        self.stop_checkpoint_worker();
+
+        if !should_checkpoint {
             return;
         }
-        let _ = self.checkpoint();
+
+        let _ = self.inner.perform_checkpoint_with_logical_locks();
     }
 }
 

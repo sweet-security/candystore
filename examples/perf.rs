@@ -319,7 +319,14 @@ fn run_list_perf(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let store = Arc::new(CandyStore::open(dir.path(), Config::default())?);
+    let store = Arc::new(CandyStore::open(
+        dir.path(),
+        Config {
+            checkpoint_delta_bytes: None,
+            checkpoint_interval: None,
+            ..Default::default()
+        },
+    )?);
 
     // single threaded
     run_perf(store.clone(), 1_000_000, 1, 16, 16)?;

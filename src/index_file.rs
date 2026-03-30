@@ -418,6 +418,10 @@ impl IndexFile {
         (ordinal, offset)
     }
 
+    pub(crate) fn checkpoint_generation(&self) -> u64 {
+        self.cached_checkpoint_generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) {
         let current_gen = self.cached_checkpoint_generation.load(Ordering::Relaxed);
         let next_generation = current_gen
@@ -436,9 +440,12 @@ impl IndexFile {
         );
 
         // Update the cache so concurrent readers see the new values immediately.
-        self.cached_checkpoint_ordinal.store(ordinal, Ordering::Relaxed);
-        self.cached_checkpoint_offset.store(offset, Ordering::Relaxed);
-        self.cached_checkpoint_generation.store(next_generation, Ordering::Release);
+        self.cached_checkpoint_ordinal
+            .store(ordinal, Ordering::Relaxed);
+        self.cached_checkpoint_offset
+            .store(offset, Ordering::Relaxed);
+        self.cached_checkpoint_generation
+            .store(next_generation, Ordering::Release);
     }
 
     #[cfg(target_os = "linux")]

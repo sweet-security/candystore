@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use candystore::{CandyStore, CandyTypedDeque, CandyTypedList, CandyTypedStore, Config, Error};
 use tempfile::tempdir;
@@ -320,6 +321,39 @@ fn assert_rebuild_stats_non_zero(db: &CandyStore) {
         stats.num_rebuild_purged_bytes > 0,
         "expected rebuild to trim a dirty file tail"
     );
+}
+
+fn wait_for_background_checkpoint(db: &CandyStore, previous_generation: u64) {
+    let started_at = Instant::now();
+    loop {
+        let stats = db.stats();
+        if stats.checkpoint_generation > previous_generation {
+            return;
+        }
+        assert!(
+            started_at.elapsed() < Duration::from_secs(3),
+            "background checkpoint did not complete in time: prev_gen={previous_generation}, current_gen={}, uncheckpointed_bytes={}",
+            stats.checkpoint_generation,
+            stats.uncheckpointed_bytes,
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_checkpoint_generation_advance(db: &CandyStore, previous_generation: u64) {
+    let started_at = Instant::now();
+    loop {
+        let stats = db.stats();
+        if stats.checkpoint_generation > previous_generation {
+            return;
+        }
+        assert!(
+            started_at.elapsed() < Duration::from_secs(3),
+            "background checkpoint generation did not advance in time: prev_gen={previous_generation}, current_gen={}",
+            stats.checkpoint_generation,
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -1011,6 +1045,136 @@ fn test_checkpoint_advances_recovery_cursor() -> Result<(), Error> {
             db.get(format!("key{i:04}"))?,
             Some(format!("val{i:04}").into_bytes()),
             "key{i:04} missing after checkpointed reopen"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_checkpoint_delta_bytes_advances_recovery_cursor_in_background() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 8 * 1024,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: Some(512),
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let initial_generation = db.stats().checkpoint_generation;
+        for i in 0..24 {
+            db.set(
+                format!("delta-bg-key{i:04}"),
+                format!("delta-bg-val{i:04}-{}", "x".repeat(96)),
+            )?;
+        }
+        wait_for_background_checkpoint(&db, initial_generation);
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    let stats = db.stats();
+    assert!(
+        stats.num_rebuilt_entries < 24,
+        "threshold-triggered background checkpoint should avoid replaying the entire store"
+    );
+    assert_eq!(stats.num_rebuild_purged_bytes, 0);
+    for i in 0..24 {
+        assert_eq!(
+            db.get(format!("delta-bg-key{i:04}"))?,
+            Some(format!("delta-bg-val{i:04}-{}", "x".repeat(96)).into_bytes()),
+            "delta-bg-key{i:04} missing after threshold-triggered background checkpoint"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_checkpoint_interval_advances_recovery_cursor_in_background() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 8 * 1024,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        checkpoint_interval: Some(Duration::from_millis(50)),
+        checkpoint_delta_bytes: None,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let initial_generation = db.stats().checkpoint_generation;
+        for i in 0..24 {
+            db.set(
+                format!("interval-bg-key{i:04}"),
+                format!("interval-bg-val{i:04}-{}", "y".repeat(96)),
+            )?;
+        }
+        wait_for_background_checkpoint(&db, initial_generation);
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    let stats = db.stats();
+    assert_eq!(stats.num_rebuilt_entries, 0);
+    assert_eq!(stats.num_rebuild_purged_bytes, 0);
+    for i in 0..24 {
+        assert_eq!(
+            db.get(format!("interval-bg-key{i:04}"))?,
+            Some(format!("interval-bg-val{i:04}-{}", "y".repeat(96)).into_bytes()),
+            "interval-bg-key{i:04} missing after interval-triggered background checkpoint"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_rotation_advances_recovery_cursor_in_background() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 2048,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        ..Config::default()
+    };
+
+    let total_keys;
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        let initial_generation = db.stats().checkpoint_generation;
+        let mut next_idx = 0usize;
+        while db.stats().num_data_files < 2 {
+            db.set(
+                format!("rotate-bg-key{next_idx:04}"),
+                format!("rotate-bg-val{next_idx:04}-{}", "z".repeat(96)),
+            )?;
+            next_idx += 1;
+        }
+        total_keys = next_idx;
+        wait_for_checkpoint_generation_advance(&db, initial_generation);
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    let stats = db.stats();
+    assert!(
+        stats.num_rebuilt_entries < total_keys as u64,
+        "rotation-triggered checkpoint should avoid replaying the entire store"
+    );
+    assert_eq!(stats.num_rebuild_purged_bytes, 0);
+    for i in 0..total_keys {
+        assert_eq!(
+            db.get(format!("rotate-bg-key{i:04}"))?,
+            Some(format!("rotate-bg-val{i:04}-{}", "z".repeat(96)).into_bytes()),
+            "rotate-bg-key{i:04} missing after rotation-triggered background checkpoint"
         );
     }
 
