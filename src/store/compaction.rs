@@ -16,24 +16,33 @@ pub(super) struct CompactionOutcome {
     pub(super) moved_bytes: u32,
 }
 
+type CompactionSources = Vec<(u16, Arc<DataFile>)>;
+
+struct CompactionEntry {
+    row_idx: usize,
+    col: usize,
+    entry: EntryPointer,
+    source_file: Arc<DataFile>,
+}
+
+type CompactionRowSnapshot = Vec<CompactionEntry>;
+
 impl StoreInner {
-    pub(super) fn compact_files(
+    fn empty_compaction_outcome() -> CompactionOutcome {
+        CompactionOutcome {
+            compacted_files: 0,
+            reclaimed_bytes: 0,
+            moved_bytes: 0,
+        }
+    }
+
+    fn collect_compaction_sources(
         &self,
         candidates: &[(u16, u64)],
-        pacer: &mut Pacer,
-        #[cfg(windows)] pending_deletions: &mut Vec<std::path::PathBuf>,
-    ) -> Result<CompactionOutcome> {
-        if candidates.is_empty() {
-            return Ok(CompactionOutcome {
-                compacted_files: 0,
-                reclaimed_bytes: 0,
-                moved_bytes: 0,
-            });
-        }
-
-        let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
+        active_file_idx: u16,
+    ) -> CompactionSources {
         let files = self.data_files.read();
-        let sources = candidates
+        candidates
             .iter()
             .filter_map(|&(file_idx, expected_ordinal)| {
                 if file_idx == active_file_idx {
@@ -47,15 +56,145 @@ impl StoreInner {
 
                 Some((file_idx, data_file))
             })
-            .collect::<Vec<_>>();
-        drop(files);
+            .collect()
+    }
+
+    fn snapshot_compaction_row(
+        &self,
+        row_idx: usize,
+        sources: &CompactionSources,
+    ) -> Option<CompactionRowSnapshot> {
+        let rows = self.index_file.rows_table();
+        let active_rows = self.index_file.num_rows();
+        if row_idx >= active_rows {
+            return None;
+        }
+
+        let row = rows.row(row_idx);
+        Some(
+            row.pointers
+                .iter()
+                .enumerate()
+                .filter_map(|(col, &entry)| {
+                    if !entry.is_valid() {
+                        return None;
+                    }
+                    let (_, source_file) =
+                        sources.iter().find(|(idx, _)| *idx == entry.file_idx())?;
+                    Some(CompactionEntry {
+                        row_idx,
+                        col,
+                        entry,
+                        source_file: source_file.clone(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn rewrite_compacted_entry(
+        &self,
+        task: &CompactionEntry,
+        ns: KeyNamespace,
+        key: &[u8],
+        value: &[u8],
+        moved_bytes: &mut u64,
+    ) -> Result<()> {
+        let mut rotate_idx_req = None;
+        loop {
+            if let Some(rotate_idx) = rotate_idx_req.take() {
+                self._rotate_data_file(rotate_idx)?;
+            }
+
+            let rows = self.index_file.rows_table();
+            let active_rows = self.index_file.num_rows();
+            if task.row_idx >= active_rows {
+                return Ok(());
+            }
+
+            let mut row = rows.row_mut(task.row_idx);
+            if row.pointers[task.col] != task.entry {
+                return Ok(());
+            }
+
+            let active_idx = self.active_file_idx.load(Ordering::Acquire);
+            let active_file = self
+                .data_files
+                .read()
+                .get(&active_idx)
+                .cloned()
+                .ok_or(Error::MissingDataFile(active_idx))?;
+
+            match active_file.append_kv(
+                crate::internal::EntryType::Update,
+                ns,
+                key,
+                value,
+                row.shard_idx,
+                &self.inflight_tracker,
+            ) {
+                Ok((file_off, size, inflight_guard)) => {
+                    self.record_write(file_off, size as u64);
+                    *moved_bytes = moved_bytes.saturating_add(size as u64);
+                    row.replace_pointer(
+                        task.col,
+                        EntryPointer::new(
+                            active_idx,
+                            file_off,
+                            size,
+                            task.entry.masked_row_selector(),
+                        ),
+                    );
+                    inflight_guard.complete();
+                    return Ok(());
+                }
+                Err(Error::RotateDataFile(rotate_idx)) => {
+                    drop(row);
+                    rotate_idx_req = Some(rotate_idx);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn compact_snapshot_entry(
+        &self,
+        task: CompactionEntry,
+        pacer: &mut Pacer,
+        read_buf: &mut Vec<u8>,
+        moved_bytes: &mut u64,
+    ) -> Result<()> {
+        self.record_read(task.entry.size_hint() as u64);
+        pacer.consume(task.entry.size_hint() as u64);
+
+        let kv = task.source_file.read_kv_into(
+            task.entry.file_offset(),
+            task.entry.size_hint(),
+            read_buf,
+        )?;
+
+        let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
+            return Err(invalid_data_error("unknown key namespace in data file"));
+        };
+
+        self.rewrite_compacted_entry(&task, ns, kv.key(), kv.value(), moved_bytes)
+    }
+
+    pub(super) fn compact_files(
+        &self,
+        candidates: &[(u16, u64)],
+        pacer: &mut Pacer,
+        #[cfg(windows)] pending_deletions: &mut Vec<std::path::PathBuf>,
+    ) -> Result<CompactionOutcome> {
+        if candidates.is_empty() {
+            return Ok(Self::empty_compaction_outcome());
+        }
+
+        let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
+        let sources = self.collect_compaction_sources(candidates, active_file_idx);
 
         if sources.is_empty() {
-            return Ok(CompactionOutcome {
-                compacted_files: 0,
-                reclaimed_bytes: 0,
-                moved_bytes: 0,
-            });
+            return Ok(Self::empty_compaction_outcome());
         }
 
         let mut moved_bytes = 0u64;
@@ -64,110 +203,15 @@ impl StoreInner {
         let mut row_idx = 0;
         loop {
             if self.compaction_shutting_down.load(Ordering::Acquire) {
-                return Ok(CompactionOutcome {
-                    compacted_files: 0,
-                    reclaimed_bytes: 0,
-                    moved_bytes: 0,
-                });
+                return Ok(Self::empty_compaction_outcome());
             }
 
-            // Snapshot one row at a time, then drop the rows table read lock before any I/O.
-            let snapshot: Vec<(usize, EntryPointer, Arc<DataFile>)> = {
-                let rows = self.index_file.rows_table();
-                let active_rows = self.index_file.num_rows();
-                if row_idx >= active_rows {
-                    break;
-                }
-
-                let row = rows.row(row_idx);
-                row.pointers
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(col, &entry)| {
-                        if !entry.is_valid() {
-                            return None;
-                        }
-                        let (_, source_file) =
-                            sources.iter().find(|(idx, _)| *idx == entry.file_idx())?;
-                        Some((col, entry, source_file.clone()))
-                    })
-                    .collect()
+            let Some(snapshot) = self.snapshot_compaction_row(row_idx, &sources) else {
+                break;
             };
 
-            for (col, entry, source_file) in &snapshot {
-                self.record_read(entry.size_hint() as u64);
-                pacer.consume(entry.size_hint() as u64);
-
-                let kv = source_file.read_kv_into(
-                    entry.file_offset(),
-                    entry.size_hint(),
-                    &mut read_buf,
-                )?;
-
-                let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
-                    return Err(invalid_data_error("unknown key namespace in data file"));
-                };
-
-                // re-acquire the write lock and verify the pointer hasn't been moved
-                // by a concurrent set/remove before appending + replacing
-                let mut rotate_idx_req = None;
-                loop {
-                    if let Some(rotate_idx) = rotate_idx_req.take() {
-                        self._rotate_data_file(rotate_idx)?;
-                    }
-
-                    let rows = self.index_file.rows_table();
-                    let active_rows = self.index_file.num_rows();
-                    if row_idx >= active_rows {
-                        break;
-                    }
-
-                    let mut row = rows.row_mut(row_idx);
-                    if row.pointers[*col] != *entry {
-                        // a concurrent op already moved/removed this entry -- skip it
-                        break;
-                    }
-
-                    let active_idx = self.active_file_idx.load(Ordering::Acquire);
-                    let active_file = self
-                        .data_files
-                        .read()
-                        .get(&active_idx)
-                        .cloned()
-                        .ok_or(Error::MissingDataFile(active_idx))?;
-
-                    match active_file.append_kv(
-                        crate::internal::EntryType::Update,
-                        ns,
-                        kv.key(),
-                        kv.value(),
-                        row.shard_idx,
-                        &self.inflight_tracker,
-                    ) {
-                        Ok((file_off, size, inflight_guard)) => {
-                            self.record_write(file_off, size as u64);
-                            moved_bytes = moved_bytes.saturating_add(size as u64);
-                            row.replace_pointer(
-                                *col,
-                                EntryPointer::new(
-                                    active_idx,
-                                    file_off,
-                                    size,
-                                    entry.masked_row_selector(),
-                                ),
-                            );
-                            inflight_guard.complete();
-                            break;
-                        }
-                        Err(Error::RotateDataFile(rotate_idx)) => {
-                            drop(row);
-                            rotate_idx_req = Some(rotate_idx);
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
-                }
+            for task in snapshot {
+                self.compact_snapshot_entry(task, pacer, &mut read_buf, &mut moved_bytes)?;
             }
 
             row_idx += 1;

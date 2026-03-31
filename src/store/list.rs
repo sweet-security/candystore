@@ -42,10 +42,6 @@ pub struct ListIterator<'a> {
 type ListMetadata = RangeMetadata;
 
 impl ListIterator<'_> {
-    fn heal_head(&self, new_head: u64) {
-        let _ = self.try_heal_head(new_head);
-    }
-
     fn try_heal_head(&self, new_head: u64) -> Result<()> {
         self.store.try_heal_range_head(
             self.ns.meta,
@@ -55,10 +51,6 @@ impl ListIterator<'_> {
             |store, list| get_list_meta(store, self.ns, list),
             |store, list, meta| set_list_meta(store, self.ns, list, meta),
         )
-    }
-
-    fn heal_tail(&self, new_tail: u64) {
-        let _ = self.try_heal_tail(new_tail);
     }
 
     fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
@@ -82,7 +74,7 @@ impl Iterator for ListIterator<'_> {
             self.next_idx += 1;
 
             if idx > self.initial_next_idx + 1000 {
-                self.heal_head(idx);
+                let _ = self.try_heal_head(idx);
                 self.initial_next_idx = idx;
             }
 
@@ -118,7 +110,7 @@ impl DoubleEndedIterator for ListIterator<'_> {
             }
 
             if idx + 1000 < self.initial_end_idx {
-                self.heal_tail(idx);
+                let _ = self.try_heal_tail(idx);
                 self.initial_end_idx = idx;
             }
 
