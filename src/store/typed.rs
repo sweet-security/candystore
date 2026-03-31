@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, marker::PhantomData, ops::Range, sync::Arc};
 
-use databuf::{DecodeOwned, Encode, config::num::LE};
+use serde::{Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
 
 use crate::{
@@ -36,7 +36,7 @@ const INLINE_TYPED_BUF_SIZE: usize = 128;
 type InlineBytes = SmallVec<[u8; INLINE_TYPED_BUF_SIZE]>;
 
 /// Marker trait for typed keys and collection identifiers used by the typed wrappers.
-pub trait CandyTypedKey: Encode + DecodeOwned {
+pub trait CandyTypedKey: Serialize + DeserializeOwned {
     const TYPE_ID: u32;
 }
 
@@ -113,8 +113,8 @@ impl<L, K, V> Clone for CandyTypedList<L, K, V> {
 
 impl<K, V> CandyTypedStore<K, V>
 where
-    K: CandyTypedKey + Encode,
-    V: Encode + DecodeOwned,
+    K: CandyTypedKey + Serialize,
+    V: Serialize + DeserializeOwned,
 {
     /// Creates a typed key-value view over `store`.
     pub fn new(store: Arc<CandyStore>) -> Self {
@@ -124,7 +124,7 @@ where
         }
     }
 
-    fn make_key<Q: ?Sized + Encode>(key: &Q) -> InlineBytes
+    fn make_key<Q: ?Sized + Serialize>(key: &Q) -> InlineBytes
     where
         K: Borrow<Q>,
     {
@@ -132,7 +132,7 @@ where
     }
 
     /// Returns the decoded value for `key`, if present.
-    pub fn get<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
+    pub fn get<Q: ?Sized + Serialize>(&self, key: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
     {
@@ -144,7 +144,7 @@ where
     }
 
     /// Inserts or replaces `key` with `val`.
-    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn set<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         key: &Q1,
         val: &Q2,
@@ -162,7 +162,7 @@ where
     }
 
     /// Removes `key` and returns its previous decoded value if it existed.
-    pub fn remove<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
+    pub fn remove<Q: ?Sized + Serialize>(&self, key: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
     {
@@ -174,7 +174,7 @@ where
     }
 
     /// Returns `true` if `key` currently exists.
-    pub fn contains<Q: ?Sized + Encode>(&self, key: &Q) -> Result<bool>
+    pub fn contains<Q: ?Sized + Serialize>(&self, key: &Q) -> Result<bool>
     where
         K: Borrow<Q>,
     {
@@ -185,7 +185,7 @@ where
     }
 
     /// Returns the current value for `key`, or inserts and returns `val` if the key is missing.
-    pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn get_or_create<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         key: &Q1,
         val: &Q2,
@@ -206,7 +206,7 @@ where
     }
 
     /// Replaces `key` with `val` only if the current value matches `expected_val` when provided.
-    pub fn replace<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+    pub fn replace<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize, Q3: ?Sized + Serialize>(
         &self,
         key: &Q1,
         val: &Q2,
@@ -231,7 +231,7 @@ where
     }
 
     /// Stores a large typed value under `key`.
-    pub fn set_big<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn set_big<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         key: &Q1,
         val: &Q2,
@@ -253,7 +253,7 @@ where
     }
 
     /// Loads a large typed value previously stored with [`CandyTypedStore::set_big`].
-    pub fn get_big<Q: ?Sized + Encode>(&self, key: &Q) -> Result<Option<V>>
+    pub fn get_big<Q: ?Sized + Serialize>(&self, key: &Q) -> Result<Option<V>>
     where
         K: Borrow<Q>,
     {
@@ -271,7 +271,7 @@ where
     }
 
     /// Removes a large typed value previously stored with [`CandyTypedStore::set_big`].
-    pub fn remove_big<Q: ?Sized + Encode>(&self, key: &Q) -> Result<bool>
+    pub fn remove_big<Q: ?Sized + Serialize>(&self, key: &Q) -> Result<bool>
     where
         K: Borrow<Q>,
     {
@@ -288,8 +288,8 @@ where
 
 impl<L, V> CandyTypedDeque<L, V>
 where
-    L: CandyTypedKey + Encode,
-    V: Encode + DecodeOwned,
+    L: CandyTypedKey + Serialize,
+    V: Serialize + DeserializeOwned,
 {
     /// Creates a typed queue view over `store`.
     pub fn new(store: Arc<CandyStore>) -> Self {
@@ -299,7 +299,7 @@ where
         }
     }
 
-    fn make_queue_key<Q: ?Sized + Encode>(queue_key: &Q) -> InlineBytes
+    fn make_queue_key<Q: ?Sized + Serialize>(queue_key: &Q) -> InlineBytes
     where
         L: Borrow<Q>,
     {
@@ -307,7 +307,7 @@ where
     }
 
     /// Pushes `val` to the tail of `queue_key`.
-    pub fn push_tail<Q: ?Sized + Encode, QV: ?Sized + Encode>(
+    pub fn push_tail<Q: ?Sized + Serialize, QV: ?Sized + Serialize>(
         &self,
         queue_key: &Q,
         val: &QV,
@@ -324,7 +324,7 @@ where
     }
 
     /// Pushes `val` to the head of `queue_key`.
-    pub fn push_head<Q: ?Sized + Encode, QV: ?Sized + Encode>(
+    pub fn push_head<Q: ?Sized + Serialize, QV: ?Sized + Serialize>(
         &self,
         queue_key: &Q,
         val: &QV,
@@ -341,7 +341,10 @@ where
     }
 
     /// Removes and returns the head item of `queue_key` together with its logical index.
-    pub fn pop_head_with_idx<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<(usize, V)>>
+    pub fn pop_head_with_idx<Q: ?Sized + Serialize>(
+        &self,
+        queue_key: &Q,
+    ) -> Result<Option<(usize, V)>>
     where
         L: Borrow<Q>,
     {
@@ -355,7 +358,7 @@ where
     }
 
     /// Removes and returns the head value of `queue_key`.
-    pub fn pop_head<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    pub fn pop_head<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
     {
@@ -363,7 +366,10 @@ where
     }
 
     /// Removes and returns the tail item of `queue_key` together with its logical index.
-    pub fn pop_tail_with_idx<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<(usize, V)>>
+    pub fn pop_tail_with_idx<Q: ?Sized + Serialize>(
+        &self,
+        queue_key: &Q,
+    ) -> Result<Option<(usize, V)>>
     where
         L: Borrow<Q>,
     {
@@ -377,7 +383,7 @@ where
     }
 
     /// Removes and returns the tail value of `queue_key`.
-    pub fn pop_tail<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    pub fn pop_tail<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
     {
@@ -385,7 +391,7 @@ where
     }
 
     /// Returns the head item of `queue_key` and its logical index without removing it.
-    pub fn peek_head_with_idx<Q: ?Sized + Encode>(
+    pub fn peek_head_with_idx<Q: ?Sized + Serialize>(
         &self,
         queue_key: &Q,
     ) -> Result<Option<(usize, V)>>
@@ -402,7 +408,7 @@ where
     }
 
     /// Returns the head value of `queue_key` without removing it.
-    pub fn peek_head<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    pub fn peek_head<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
     {
@@ -410,7 +416,7 @@ where
     }
 
     /// Returns the tail item of `queue_key` and its logical index without removing it.
-    pub fn peek_tail_with_idx<Q: ?Sized + Encode>(
+    pub fn peek_tail_with_idx<Q: ?Sized + Serialize>(
         &self,
         queue_key: &Q,
     ) -> Result<Option<(usize, V)>>
@@ -427,7 +433,7 @@ where
     }
 
     /// Returns the tail value of `queue_key` without removing it.
-    pub fn peek_tail<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Option<V>>
+    pub fn peek_tail<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<Option<V>>
     where
         L: Borrow<Q>,
     {
@@ -435,7 +441,7 @@ where
     }
 
     /// Returns the number of live items in `queue_key`.
-    pub fn len<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<usize>
+    pub fn len<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<usize>
     where
         L: Borrow<Q>,
     {
@@ -446,7 +452,7 @@ where
     }
 
     /// Returns the current inclusive-exclusive logical index span for `queue_key`.
-    pub fn range<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<Range<usize>>
+    pub fn range<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<Range<usize>>
     where
         L: Borrow<Q>,
     {
@@ -455,7 +461,7 @@ where
     }
 
     /// Returns `true` when `queue_key` has no live items.
-    pub fn is_empty<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<bool>
+    pub fn is_empty<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<bool>
     where
         L: Borrow<Q>,
     {
@@ -466,7 +472,7 @@ where
     }
 
     /// Removes all items from `queue_key`.
-    pub fn discard<Q: ?Sized + Encode>(&self, queue_key: &Q) -> Result<bool>
+    pub fn discard<Q: ?Sized + Serialize>(&self, queue_key: &Q) -> Result<bool>
     where
         L: Borrow<Q>,
     {
@@ -475,7 +481,7 @@ where
     }
 
     /// Iterates over live items in `queue_key` from head to tail.
-    pub fn iter<'a, Q: ?Sized + Encode>(
+    pub fn iter<'a, Q: ?Sized + Serialize>(
         &'a self,
         queue_key: &Q,
     ) -> impl DoubleEndedIterator<Item = Result<(usize, V)>> + 'a
@@ -495,9 +501,9 @@ where
 
 impl<L, K, V> CandyTypedList<L, K, V>
 where
-    L: CandyTypedKey + Encode,
-    K: Encode + DecodeOwned,
-    V: Encode + DecodeOwned,
+    L: CandyTypedKey + Serialize,
+    K: Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned,
 {
     /// Creates a typed ordered-map/list view over `store`.
     pub fn new(store: Arc<CandyStore>) -> Self {
@@ -507,14 +513,14 @@ where
         }
     }
 
-    fn make_list_key<Q: ?Sized + Encode>(list_key: &Q) -> InlineBytes
+    fn make_list_key<Q: ?Sized + Serialize>(list_key: &Q) -> InlineBytes
     where
         L: Borrow<Q>,
     {
         append_type_id(encode_to_smallvec(list_key), L::TYPE_ID)
     }
 
-    fn make_item_key<Q: ?Sized + Encode>(item_key: &Q) -> InlineBytes
+    fn make_item_key<Q: ?Sized + Serialize>(item_key: &Q) -> InlineBytes
     where
         K: Borrow<Q>,
     {
@@ -522,7 +528,7 @@ where
     }
 
     /// Returns `true` if `item_key` exists in `list_key`.
-    pub fn contains<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn contains<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -535,7 +541,7 @@ where
     }
 
     /// Inserts or replaces `item_key` in `list_key`, placing it at the logical tail.
-    pub fn set<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+    pub fn set<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize, Q3: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -556,7 +562,7 @@ where
     }
 
     /// Returns the current value for `item_key`, or inserts `default_val` if it is missing.
-    pub fn get_or_create<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+    pub fn get_or_create<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize, Q3: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -580,10 +586,10 @@ where
 
     /// Replaces `item_key` only if its current value matches `expected_val` when provided.
     pub fn replace<
-        Q1: ?Sized + Encode,
-        Q2: ?Sized + Encode,
-        Q3: ?Sized + Encode,
-        Q4: ?Sized + Encode,
+        Q1: ?Sized + Serialize,
+        Q2: ?Sized + Serialize,
+        Q3: ?Sized + Serialize,
+        Q4: ?Sized + Serialize,
     >(
         &self,
         list_key: &Q1,
@@ -613,7 +619,7 @@ where
     }
 
     /// Returns the decoded value for `item_key`, if present.
-    pub fn get<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn get<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -631,7 +637,7 @@ where
     }
 
     /// Removes `item_key` and returns its previous decoded value if it existed.
-    pub fn remove<Q1: ?Sized + Encode, Q2: ?Sized + Encode>(
+    pub fn remove<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -649,7 +655,7 @@ where
     }
 
     /// Returns the number of live items in `list_key`.
-    pub fn len<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<usize>
+    pub fn len<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<usize>
     where
         L: Borrow<Q>,
     {
@@ -658,7 +664,7 @@ where
     }
 
     /// Returns the current inclusive-exclusive logical span for `list_key`.
-    pub fn range<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Range<usize>>
+    pub fn range<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<Range<usize>>
     where
         L: Borrow<Q>,
     {
@@ -667,7 +673,7 @@ where
     }
 
     /// Returns `true` when `list_key` has no live items.
-    pub fn is_empty<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<bool>
+    pub fn is_empty<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<bool>
     where
         L: Borrow<Q>,
     {
@@ -675,7 +681,7 @@ where
     }
 
     /// Removes all items from `list_key`.
-    pub fn discard<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<bool>
+    pub fn discard<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<bool>
     where
         L: Borrow<Q>,
     {
@@ -684,7 +690,7 @@ where
     }
 
     /// Compacts `list_key` when `params` indicate enough holes exist to justify rewriting it.
-    pub fn compact_if_needed<Q: ?Sized + Encode>(
+    pub fn compact_if_needed<Q: ?Sized + Serialize>(
         &self,
         list_key: &Q,
         params: ListCompactionParams,
@@ -698,7 +704,7 @@ where
     }
 
     /// Inserts or replaces `item_key`, moving it to the logical tail and returning the previous value when present.
-    pub fn set_promoting<Q1: ?Sized + Encode, Q2: ?Sized + Encode, Q3: ?Sized + Encode>(
+    pub fn set_promoting<Q1: ?Sized + Serialize, Q2: ?Sized + Serialize, Q3: ?Sized + Serialize>(
         &self,
         list_key: &Q1,
         item_key: &Q2,
@@ -719,7 +725,7 @@ where
     }
 
     /// Iterates over live items in `list_key` from head to tail.
-    pub fn iter<'a, Q: ?Sized + Encode>(
+    pub fn iter<'a, Q: ?Sized + Serialize>(
         &'a self,
         list_key: &Q,
     ) -> impl DoubleEndedIterator<Item = Result<(K, V)>> + 'a
@@ -740,7 +746,7 @@ where
     }
 
     /// Removes and returns the tail item of `list_key`.
-    pub fn pop_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    pub fn pop_tail<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
     {
@@ -755,7 +761,7 @@ where
     }
 
     /// Removes and returns the head item of `list_key`.
-    pub fn pop_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    pub fn pop_head<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
     {
@@ -770,7 +776,7 @@ where
     }
 
     /// Returns the tail item of `list_key` without removing it.
-    pub fn peek_tail<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    pub fn peek_tail<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
     {
@@ -783,7 +789,7 @@ where
     }
 
     /// Returns the head item of `list_key` without removing it.
-    pub fn peek_head<Q: ?Sized + Encode>(&self, list_key: &Q) -> Result<Option<(K, V)>>
+    pub fn peek_head<Q: ?Sized + Serialize>(&self, list_key: &Q) -> Result<Option<(K, V)>>
     where
         L: Borrow<Q>,
     {
@@ -795,7 +801,7 @@ where
     }
 
     /// Retains only items for which `func` returns `true`, preserving list order.
-    pub fn retain<Q: ?Sized + Encode>(
+    pub fn retain<Q: ?Sized + Serialize>(
         &self,
         list_key: &Q,
         mut func: impl FnMut(&K, &V) -> Result<bool>,
@@ -813,19 +819,14 @@ where
     }
 }
 
-fn decode_from_bytes<T: DecodeOwned>(bytes: &[u8]) -> Result<T> {
-    T::from_bytes::<LE>(bytes).map_err(|err| {
-        Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("decode error: {err}"),
-        ))
-    })
+fn decode_from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    postcard::from_bytes(bytes).map_err(Error::PostcardError)
 }
 
-fn encode_to_smallvec<T: ?Sized + Encode>(value: &T) -> InlineBytes {
-    let mut bytes = InlineBytes::new();
-    value.encode::<LE>(&mut bytes).unwrap();
-    bytes
+fn encode_to_smallvec<T: ?Sized + Serialize>(value: &T) -> InlineBytes {
+    let mut buf = InlineBytes::new();
+    postcard::to_io(value, &mut buf).unwrap();
+    buf
 }
 
 fn append_type_id(mut bytes: InlineBytes, type_id: u32) -> InlineBytes {

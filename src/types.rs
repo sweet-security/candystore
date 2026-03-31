@@ -86,6 +86,9 @@ pub enum Error {
 
     #[error("Checkpoint shutdown: {0}")]
     CheckpointShutdown(String),
+
+    #[error("Postcard error: {0}")]
+    PostcardError(postcard::Error),
 }
 
 /// Convenience result type used by the crate.

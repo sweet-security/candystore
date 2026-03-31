@@ -9,11 +9,12 @@ repository = "https://github.com/sweet-security/candystore"
 
 [dependencies]
 crc16-ibm3740-fast = "0.5.0"
-databuf = "0.5.0"
 fslock = "0.2.1"
 memmap2 = "0.9.10"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
+postcard = { version = "1.1.3", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
 simd-itertools = "0.3.0"
 siphasher = "1.0.2"
 smallvec = { version = "1.15.1", features = ["write"] }
