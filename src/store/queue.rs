@@ -38,10 +38,6 @@ pub struct QueueIterator<'a> {
 type QueueMetadata = RangeMetadata;
 
 impl<'a> QueueIterator<'a> {
-    fn heal_head(&self, new_head: u64) {
-        let _ = self.try_heal_head(new_head);
-    }
-
     fn try_heal_head(&self, new_head: u64) -> Result<()> {
         self.store.try_heal_range_head(
             self.ns.meta,
@@ -51,10 +47,6 @@ impl<'a> QueueIterator<'a> {
             |store, queue| get_queue_meta(store, self.ns, queue),
             |store, queue, meta| set_queue_meta(store, self.ns, queue, meta),
         )
-    }
-
-    fn heal_tail(&self, new_tail: u64) {
-        let _ = self.try_heal_tail(new_tail);
     }
 
     fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
@@ -78,7 +70,7 @@ impl Iterator for QueueIterator<'_> {
             self.next_idx += 1;
 
             if idx > self.initial_next_idx + 1000 {
-                self.heal_head(idx);
+                let _ = self.try_heal_head(idx);
                 self.initial_next_idx = idx;
             }
 
@@ -104,7 +96,7 @@ impl DoubleEndedIterator for QueueIterator<'_> {
             }
 
             if idx + 1000 < self.initial_end_idx {
-                self.heal_tail(idx);
+                let _ = self.try_heal_tail(idx);
                 self.initial_end_idx = idx;
             }
 
