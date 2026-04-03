@@ -47,37 +47,53 @@ proptest! {
 
         let mut db_opt = Some(CandyStore::open(dir.path(), config).unwrap());
 
-        for op in ops {
+        for (op_idx, op) in ops.iter().enumerate() {
             match op {
                 Op::Set(k, v) => {
                     oracle.insert(k.clone(), v.clone());
                     let db = db_opt.as_ref().unwrap();
-                    let _ = db.set(k.as_bytes(), v.as_bytes()).unwrap();
+                    let _ = db
+                        .set(k.as_bytes(), v.as_bytes())
+                        .unwrap_or_else(|err| panic!("set failed at op {op_idx}: {op:?}: {err}"));
                 }
                 Op::Get(k) => {
                     let db = db_opt.as_ref().unwrap();
-                    let expected = oracle.get(&k);
-                    let actual = db.get(k.as_bytes()).unwrap();
+                    let expected = oracle.get(k);
+                    let actual = db
+                        .get(k.as_bytes())
+                        .unwrap_or_else(|err| panic!("get failed at op {op_idx}: {op:?}: {err}"));
 
                     match expected {
-                        Some(v) => assert_eq!(Some(v.as_bytes()), actual.as_deref()),
-                        None => assert_eq!(None, actual),
+                        Some(v) => assert_eq!(
+                            Some(v.as_bytes()),
+                            actual.as_deref(),
+                            "get mismatch at op {op_idx}: {op:?}"
+                        ),
+                        None => assert_eq!(None, actual, "get mismatch at op {op_idx}: {op:?}"),
                     }
                 }
                 Op::Remove(k) => {
-                    oracle.remove(&k);
+                    oracle.remove(k);
                     let db = db_opt.as_ref().unwrap();
-                    let _ = db.remove(k.as_bytes()).unwrap();
+                    let _ = db
+                        .remove(k.as_bytes())
+                        .unwrap_or_else(|err| panic!("remove failed at op {op_idx}: {op:?}: {err}"));
                 }
                 Op::CleanShutdown => {
                     // Close the current DB instance by dropping it, then reopen
                     drop(db_opt.take().unwrap());
-                    db_opt = Some(CandyStore::open(dir.path(), config).unwrap());
+                    db_opt = Some(
+                        CandyStore::open(dir.path(), config)
+                            .unwrap_or_else(|err| panic!("reopen after clean shutdown failed at op {op_idx}: {op:?}: {err}")),
+                    );
                 }
                 Op::SimulateCrash => {
                     // Force a rebuild
                     db_opt.take().unwrap()._abort_for_testing();
-                    db_opt = Some(CandyStore::open(dir.path(), config).unwrap());
+                    db_opt = Some(
+                        CandyStore::open(dir.path(), config)
+                            .unwrap_or_else(|err| panic!("reopen after simulated crash failed at op {op_idx}: {op:?}: {err}")),
+                    );
                 }
             }
         }
@@ -87,8 +103,11 @@ proptest! {
 
         // Verify every key that should exist, DOES exist
         for (k, v) in oracle.iter() {
-            let actual = db.get(k.as_bytes()).unwrap().expect("Key should exist in store");
-            assert_eq!(v.as_bytes(), actual.as_slice());
+            let actual = db
+                .get(k.as_bytes())
+                .unwrap_or_else(|err| panic!("final get failed for key {k:?}: {err}"))
+                .unwrap_or_else(|| panic!("final verification missing key {k:?}"));
+            assert_eq!(v.as_bytes(), actual.as_slice(), "final verification mismatch for key {k:?}");
         }
     }
 }

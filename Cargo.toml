@@ -10,6 +10,7 @@ repository = "https://github.com/sweet-security/candystore"
 [dependencies]
 crc16-ibm3740-fast = "0.5.0"
 fslock = "0.2.1"
+libc = "0.2.183"
 memmap2 = "0.9.10"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
@@ -26,7 +27,6 @@ zerocopy = { version = "0.8.47", features = ["derive"] }
 proptest = "1.10.0"
 tempfile = "3"
 rand = "0.10.0"
-libc = "0.2.183"
 
 [features]
 whitebox-testing = []

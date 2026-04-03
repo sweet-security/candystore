@@ -238,7 +238,7 @@ impl StoreInner {
         if !removed.is_empty() {
             let active_idx = self.active_file_idx.load(Ordering::Acquire);
             if let Some(active_file) = self.data_files.read().get(&active_idx).cloned() {
-                let _ = active_file.file.sync_all();
+                let _ = active_file.sync_to_current();
             }
             let _ = self.index_file.sync_all();
         }

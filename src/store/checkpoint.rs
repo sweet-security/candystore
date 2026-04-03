@@ -230,10 +230,12 @@ impl StoreInner {
     ) {
         let snapshot_for_follow_up = snapshot.as_ref().ok().copied();
         let result = snapshot.and_then(|snap| self.sync_checkpoint(snap));
+        let mut should_signal_compaction = false;
 
         let mut state = self.checkpoint_state.lock();
         match result {
             Ok(()) => {
+                should_signal_compaction = true;
                 state.last_checkpoint_dur_ms =
                     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if let Some(target_epoch) = target_epoch {
@@ -265,6 +267,11 @@ impl StoreInner {
             }
         }
         self.checkpoint_condvar.notify_all();
+        drop(state);
+
+        if should_signal_compaction {
+            self.signal_compaction_scan();
+        }
     }
 
     fn run_checkpoint_worker(self: &Arc<Self>) {
