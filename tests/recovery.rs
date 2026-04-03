@@ -125,11 +125,7 @@ fn data_files_by_ordinal(dir: &std::path::Path) -> Result<Vec<(u64, u64)>, Error
         let mut buf = [0u8; 8];
         file.read_exact(&mut buf).map_err(Error::IOError)?;
         let ordinal = u64::from_le_bytes(buf);
-        let used_bytes = file
-            .metadata()
-            .map_err(Error::IOError)?
-            .len()
-            .saturating_sub(4096);
+        let used_bytes = common::logical_data_len(&path);
         files.push((ordinal, used_bytes));
     }
 
@@ -163,11 +159,7 @@ fn data_file_records_by_ordinal(
         let mut buf = [0u8; 8];
         file.read_exact(&mut buf).map_err(Error::IOError)?;
         let ordinal = u64::from_le_bytes(buf);
-        let used_bytes = file
-            .metadata()
-            .map_err(Error::IOError)?
-            .len()
-            .saturating_sub(4096);
+        let used_bytes = common::logical_data_len(&path);
         files.push((file_idx, ordinal, used_bytes, path));
     }
 
@@ -314,8 +306,8 @@ fn append_aligned_tail_garbage(dir: &std::path::Path, len: usize) -> Result<(), 
 fn assert_rebuild_stats_non_zero(db: &CandyStore) {
     let stats = db.stats();
     assert!(
-        stats.num_rebuilt_entries > 0,
-        "expected rebuild to replay at least one entry"
+        stats.num_rebuilt_entries > 0 || stats.checkpoint_generation > 0,
+        "expected either replayed entries or a checkpoint that already covered the data"
     );
     assert!(
         stats.num_rebuild_purged_bytes > 0,
@@ -860,8 +852,8 @@ fn test_recover_from_truncated_data_file() -> Result<(), Box<dyn std::error::Err
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(data_file.path())?;
-    let len = file.metadata()?.len();
-    file.set_len(len - 5)?;
+    let logical_len = common::logical_data_len(&data_file.path());
+    file.set_len(4096 + logical_len - 16)?;
 
     // We expect clear recovery (key2 was truncated, thus doesn't exist, but key1 is readable)
     let db = candystore::CandyStore::open(dir.path(), candystore::Config::default())?;
@@ -892,6 +884,219 @@ fn test_rebuild_if_dirty_recovers_from_invalid_commit_offset_without_double_coun
     assert_eq!(db.get("key2")?, Some(b"value2_updated".to_vec()));
     assert_eq!(db.get("key3")?, Some(b"value3".to_vec()));
     assert_eq!(db.num_items(), 3);
+    Ok(())
+}
+
+#[test]
+fn test_clean_reopen_preserves_overwrite_source_entries() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 4,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("dd", "S2pVu3sy437r2s22")?;
+        db.set("d", "1utyjA7IagDJy7eyp9")?;
+        db.set("b", "2YEAci7LZeShVxXcS3c2M41XFp9YPJACS5SUw4")?;
+        db.set("cd", "Sgbm1x3CQmy7HahPWXllPnt68UO9SdaTleWZ9")?;
+    }
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("ad", "Uj1734MhmFqkdmmFGi03F8N")?;
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(
+        db.get("cd")?,
+        Some(b"Sgbm1x3CQmy7HahPWXllPnt68UO9SdaTleWZ9".to_vec())
+    );
+    assert_eq!(
+        db.set("cd", "SGVF56VUXC8SpU4ERrUj0Z3Z80oqvXvKR2oOU3ij4yoo0Yuqt")?,
+        candystore::SetStatus::PrevValue(b"Sgbm1x3CQmy7HahPWXllPnt68UO9SdaTleWZ9".to_vec())
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_reopen_with_different_max_data_file_size() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: create with a small max_data_file_size.
+    let config_small = Config {
+        max_data_file_size: 1024 * 4,
+        ..Config::default()
+    };
+    {
+        let db = CandyStore::open(dir.path(), config_small)?;
+        for i in 0..20 {
+            db.set(format!("k{i}"), format!("v{i}"))?;
+        }
+    }
+
+    // Phase 2: reopen with a larger max_data_file_size.
+    // The old data file's physical size won't match the new config, so it
+    // should be detected as non-preallocated and fall back to sync_all.
+    let config_large = Config {
+        max_data_file_size: 1024 * 32,
+        ..Config::default()
+    };
+    {
+        let db = CandyStore::open(dir.path(), config_large)?;
+        for i in 0..20 {
+            assert_eq!(db.get(format!("k{i}"))?, Some(format!("v{i}").into_bytes()));
+        }
+        // Writes under the new config should also work.
+        db.set("new_key", "new_value")?;
+    }
+
+    // Phase 3: reopen again with the larger config and verify everything.
+    let db = CandyStore::open(dir.path(), config_large)?;
+    for i in 0..20 {
+        assert_eq!(db.get(format!("k{i}"))?, Some(format!("v{i}").into_bytes()));
+    }
+    assert_eq!(db.get("new_key")?, Some(b"new_value".to_vec()));
+
+    Ok(())
+}
+
+#[test]
+fn test_partial_entry_at_tail_of_preallocated_file() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 4,
+        ..Config::default()
+    };
+
+    // Write two valid entries, then close cleanly.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("key1", "value1")?;
+        db.set("key2", "value2")?;
+    }
+
+    // Inject a partial entry: write bytes that look like a valid header
+    // (correct magic for the offset) but with a truncated/invalid checksum.
+    // This simulates a crash mid-append on a preallocated file, where the
+    // kernel flushed part of a write but the entry is incomplete.
+    let data_path = dir.path().join("data_0000");
+    let logical_len = common::logical_data_len(&data_path);
+    {
+        const ALIGNMENT: u64 = 16;
+        const MAGIC: u32 = 0x91c8_d7cd;
+        const MASK: u32 = (1 << 24) - 1;
+
+        let entry_offset = logical_len;
+        let magic_offset = (((entry_offset / ALIGNMENT) as u32) ^ MAGIC) & MASK;
+        // EntryType::Insert = 0b00, ns = 0
+        let header: u32 = magic_offset;
+        let klen: u16 = 4; // "abcd"
+        let vlen: u16 = 8; // "12345678"
+
+        let mut partial = Vec::new();
+        partial.extend_from_slice(&header.to_le_bytes());
+        partial.extend_from_slice(&klen.to_le_bytes());
+        partial.extend_from_slice(&vlen.to_le_bytes());
+        // Write the value and key but NOT the checksum — the entry is incomplete.
+        partial.extend_from_slice(b"12345678"); // value
+        partial.extend_from_slice(b"abcd"); // key
+        // No checksum appended, and overwrite with bad trailing bytes.
+        partial.extend_from_slice(&[0xFF, 0xFF]);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(4096 + entry_offset))
+            .map_err(Error::IOError)?;
+        file.write_all(&partial).map_err(Error::IOError)?;
+        file.sync_all().map_err(Error::IOError)?;
+    }
+
+    // Reopen: the partial entry should be ignored by detect_used_bytes.
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key1")?, Some(b"value1".to_vec()));
+    assert_eq!(db.get("key2")?, Some(b"value2".to_vec()));
+    assert_eq!(db.get("abcd")?, None); // partial entry must not appear
+    assert_eq!(db.num_items(), 2);
+
+    // New writes should work (they overwrite the garbage region).
+    db.set("key3", "value3")?;
+    drop(db);
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key3")?, Some(b"value3".to_vec()));
+
+    Ok(())
+}
+
+#[test]
+fn test_incomplete_entry_with_valid_header_and_bad_checksum() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 4,
+        ..Config::default()
+    };
+
+    // Write one valid entry, abort (simulating crash), then inject a
+    // fully-sized entry whose checksum is deliberately wrong.
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("good", "data")?;
+        db._abort_for_testing();
+    }
+
+    let data_path = dir.path().join("data_0000");
+    let logical_len = common::logical_data_len(&data_path);
+    {
+        const ALIGNMENT: u64 = 16;
+        const MAGIC: u32 = 0x91c8_d7cd;
+        const MASK: u32 = (1 << 24) - 1;
+
+        let entry_offset = logical_len;
+        let magic_offset = (((entry_offset / ALIGNMENT) as u32) ^ MAGIC) & MASK;
+        let header: u32 = magic_offset;
+        let key = b"bad";
+        let val = b"entry";
+        let klen = key.len() as u16;
+        let vlen = val.len() as u16;
+        let entry_len = 4 + 4 + klen as usize + vlen as usize + 2;
+        let aligned_len = ((entry_len + 15) / 16) * 16;
+
+        let mut buf = vec![0u8; aligned_len];
+        buf[0..4].copy_from_slice(&header.to_le_bytes());
+        buf[4..6].copy_from_slice(&klen.to_le_bytes());
+        buf[6..8].copy_from_slice(&vlen.to_le_bytes());
+        buf[8..8 + val.len()].copy_from_slice(val);
+        buf[8 + val.len()..8 + val.len() + key.len()].copy_from_slice(key);
+        // Write a deliberately wrong checksum.
+        buf[entry_len - 2..entry_len].copy_from_slice(&[0xDE, 0xAD]);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .map_err(Error::IOError)?;
+        file.seek(SeekFrom::Start(4096 + entry_offset))
+            .map_err(Error::IOError)?;
+        file.write_all(&buf).map_err(Error::IOError)?;
+        file.sync_all().map_err(Error::IOError)?;
+    }
+
+    // Reopen via recovery (dirty shutdown + garbage entry).
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("good")?, Some(b"data".to_vec()));
+    assert_eq!(db.get("bad")?, None);
+
+    // The corrupted entry's bytes should have been purged.
+    let stats = db.stats();
+    assert!(
+        stats.num_rebuild_purged_bytes > 0,
+        "expected rebuild to purge the corrupted tail"
+    );
+
     Ok(())
 }
 

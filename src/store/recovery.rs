@@ -93,8 +93,8 @@ impl CandyStore {
         // extent. This handles the case where the data file was truncated
         // (e.g. disk-full or corruption) and ensures the replay loop won't
         // encounter stale pointers when comparing existing entries.
-        let pre_rebuild_used_bytes = data_file.used_bytes();
-        let pre_purge_extent = pre_rebuild_used_bytes.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+        let pre_rebuild_tail_upper_bound = data_file.recovery_tail_upper_bound();
+        let pre_purge_extent = pre_rebuild_tail_upper_bound.next_multiple_of(FILE_OFFSET_ALIGNMENT);
         self.apply_recovery_delta(
             self.purge_uncommitted_file_entries(data_file.file_idx, pre_purge_extent)?,
             pending_committed_delta,
@@ -151,11 +151,11 @@ impl CandyStore {
 
         let durable_extent = last_durable_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
-        if durable_extent < pre_rebuild_used_bytes {
+        if durable_extent < pre_rebuild_tail_upper_bound {
             self.inner
                 .stats
                 .num_rebuild_purged_bytes
-                .fetch_add(pre_rebuild_used_bytes - durable_extent, Ordering::Relaxed);
+                .fetch_add(pre_rebuild_tail_upper_bound - durable_extent, Ordering::Relaxed);
             data_file.truncate_to_offset(durable_extent)?;
         }
 

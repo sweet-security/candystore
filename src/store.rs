@@ -80,6 +80,7 @@ struct CheckpointSnapshot {
     checkpoint_offset: u64,
     checkpointed_delta: i64,
     last_commit_ordinal: u64,
+    last_commit_offset: u64,
 }
 
 #[derive(Default)]
@@ -465,20 +466,23 @@ impl StoreInner {
             .ok_or(Error::MissingDataFile(active_idx))?;
         let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta) =
             self.inflight_tracker.checkpoint_progress(&active_file);
-        let last_commit_ordinal = self.index_file.checkpoint_cursor().0;
+        let (last_commit_ordinal, last_commit_offset) = self.index_file.checkpoint_cursor();
         Ok(CheckpointSnapshot {
             checkpoint_ordinal,
             checkpoint_offset,
             checkpointed_delta,
             last_commit_ordinal,
+            last_commit_offset,
         })
     }
 
     fn sync_checkpoint(&self, snap: CheckpointSnapshot) -> Result<()> {
         let files = self.data_files.read();
         for data_file in files.values() {
-            if data_file.file_ordinal >= snap.last_commit_ordinal {
-                data_file.file.sync_all().map_err(Error::IOError)?;
+            if data_file.file_ordinal > snap.last_commit_ordinal {
+                data_file.sync_to_current()?;
+            } else if data_file.file_ordinal == snap.last_commit_ordinal {
+                data_file.sync_data(snap.last_commit_offset, data_file.used_bytes())?;
             }
         }
         drop(files);
@@ -1247,7 +1251,7 @@ impl CandyStore {
         self.inner.index_file.sync_all()?;
         let files = self.inner.data_files.read();
         for data_file in files.values() {
-            data_file.file.sync_all().map_err(Error::IOError)?;
+            data_file.sync_to_current()?;
         }
         sync_dir(&self.inner.base_path)
     }

@@ -17,7 +17,7 @@ use crate::internal::{
     DATA_ENTRY_OFFSET_MAGIC, DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION,
     EntryType, FILE_OFFSET_ALIGNMENT, KEY_NAMESPACE_BITS, KVBuf, KVRef, KeyNamespace,
     MAX_KEY_NAMESPACE, PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, data_file_path,
-    invalid_data_error, read_available_at, read_into_at, sync_dir, write_all_at,
+    invalid_data_error, read_available_at, read_into_at, sync_dir, sync_file_range, write_all_at,
 };
 use crate::types::{Config, Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result};
 
@@ -197,10 +197,13 @@ impl Drop for InflightGuard<'_> {
 pub(crate) struct DataFile {
     pub(crate) file: File,
     file_offset: AtomicU64,
+    last_synced_offset: AtomicU64,
     sealed_for_rotation: AtomicBool,
     config: Arc<Config>,
     pub(crate) file_idx: u16,
     pub(crate) file_ordinal: u64,
+    preallocated: bool,
+    recovery_tail_upper_bound: u64,
 }
 
 impl DataFile {
@@ -208,13 +211,110 @@ impl DataFile {
         self.file_offset.load(Ordering::Acquire)
     }
 
+    pub(crate) fn recovery_tail_upper_bound(&self) -> u64 {
+        self.recovery_tail_upper_bound
+    }
+
+    pub(crate) fn sync_data(&self, start_offset: u64, end_offset: u64) -> Result<()> {
+        let used_bytes = self.used_bytes();
+        let start_offset = start_offset.min(used_bytes);
+        let end_offset = end_offset.min(used_bytes);
+        if end_offset <= start_offset {
+            return Ok(());
+        }
+
+        if !self.preallocated {
+            self.file.sync_all().map_err(Error::IOError)?;
+        } else {
+            sync_file_range(
+                &self.file,
+                size_of::<DataFileHeader>() as u64 + start_offset,
+                end_offset - start_offset,
+            )?;
+        }
+        self.last_synced_offset
+            .fetch_max(end_offset, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn sync_to_current(&self) -> Result<()> {
+        let start = self.last_synced_offset.load(Ordering::Acquire);
+        self.sync_data(start, self.used_bytes())
+    }
+
     pub(crate) fn truncate_to_offset(&self, file_offset: u64) -> Result<()> {
         debug_assert_eq!(file_offset % FILE_OFFSET_ALIGNMENT, 0);
-        self.file
-            .set_len(size_of::<DataFileHeader>() as u64 + file_offset)
-            .map_err(Error::IOError)?;
+        if self.preallocated {
+            // A crash between the two set_len calls would leave the file
+            // non-preallocated.  That is harmless: the next open will
+            // detect it as non-preallocated and fall back to sync_all
+            // until rotation creates a fresh preallocated file.
+            self.file
+                .set_len(size_of::<DataFileHeader>() as u64 + file_offset)
+                .map_err(Error::IOError)?;
+            self.file
+                .set_len(size_of::<DataFileHeader>() as u64 + self.config.max_data_file_size as u64)
+                .map_err(Error::IOError)?;
+        } else {
+            self.file
+                .set_len(size_of::<DataFileHeader>() as u64 + file_offset)
+                .map_err(Error::IOError)?;
+        }
         self.file_offset.store(file_offset, Ordering::Release);
-        self.file.sync_all().map_err(Error::IOError)
+        self.file.sync_all().map_err(Error::IOError)?;
+        self.last_synced_offset
+            .store(file_offset, Ordering::Release);
+        Ok(())
+    }
+
+    fn used_data_upper_bound(file: &File, physical_data_len: u64) -> Result<u64> {
+        if physical_data_len == 0 {
+            return Ok(0);
+        }
+
+        let mut end = physical_data_len;
+        while end > 0 {
+            let start = end.saturating_sub(READ_BUFFER_SIZE as u64);
+            let chunk = read_available_at(
+                file,
+                (end - start) as usize,
+                size_of::<DataFileHeader>() as u64 + start,
+            )
+            .map_err(Error::IOError)?;
+            if let Some(rel) = chunk.iter().rposition(|byte| *byte != 0) {
+                let aligned = (start + rel as u64 + 1).next_multiple_of(FILE_OFFSET_ALIGNMENT);
+                return Ok(aligned.min(physical_data_len));
+            }
+            end = start;
+        }
+
+        Ok(0)
+    }
+
+    /// Scans forward from offset 0, parsing each entry, and returns the
+    /// aligned end of the last valid entry.  We temporarily set `file_offset`
+    /// to `tail_upper_bound` so that `read_next_entry_ref` won't short-circuit
+    /// before reaching it.  This is safe because `open` is single-threaded;
+    /// the real value is overwritten by the caller immediately after.
+    fn detect_used_bytes(&self, tail_upper_bound: u64) -> Result<u64> {
+        if tail_upper_bound == 0 {
+            return Ok(0);
+        }
+
+        self.file_offset.store(tail_upper_bound, Ordering::Release);
+
+        let mut offset = 0u64;
+        let mut read_buf = Vec::new();
+        let mut buf_file_offset = 0u64;
+        let mut last_durable_offset = 0u64;
+        while let Some((_, _, next_offset)) =
+            self.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
+        {
+            offset = next_offset;
+            last_durable_offset = next_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+        }
+
+        Ok(last_durable_offset)
     }
 
     fn parse_data_entry(buf: &[u8], offset: u64) -> Result<ParsedDataEntry> {
@@ -296,23 +396,30 @@ impl DataFile {
                 "invalid data file header",
             )));
         }
-        let mut file_offset = file
+        let physical_data_len = file
             .metadata()
             .map_err(Error::IOError)?
             .len()
             .saturating_sub(size_of::<DataFileHeader>() as u64);
-        file_offset -= file_offset % FILE_OFFSET_ALIGNMENT;
-        file.set_len(size_of::<DataFileHeader>() as u64 + file_offset)
-            .map_err(Error::IOError)?;
+        let preallocated = physical_data_len == config.max_data_file_size as u64;
+        let recovery_tail_upper_bound = Self::used_data_upper_bound(&file, physical_data_len)?;
 
-        Ok(Self {
+        let inst = Self {
             file,
-            file_offset: AtomicU64::new(file_offset),
+            file_offset: AtomicU64::new(physical_data_len),
+            last_synced_offset: AtomicU64::new(0),
             sealed_for_rotation: AtomicBool::new(false),
             config,
             file_idx,
             file_ordinal: header.ordinal,
-        })
+            preallocated,
+            recovery_tail_upper_bound,
+        };
+        let used_bytes = inst.detect_used_bytes(recovery_tail_upper_bound)?;
+        inst.file_offset.store(used_bytes, Ordering::Release);
+        inst.last_synced_offset.store(used_bytes, Ordering::Release);
+
+        Ok(inst)
     }
 
     pub(crate) fn create(
@@ -328,7 +435,7 @@ impl DataFile {
             .write(true)
             .open(data_file_path(base_path, file_idx))
             .map_err(Error::IOError)?;
-        file.set_len(size_of::<DataFileHeader>() as u64)
+        file.set_len(size_of::<DataFileHeader>() as u64 + config.max_data_file_size as u64)
             .map_err(Error::IOError)?;
         let header = DataFileHeader {
             magic: *DATA_FILE_SIGNATURE,
@@ -343,10 +450,13 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(0),
+            last_synced_offset: AtomicU64::new(0),
             sealed_for_rotation: AtomicBool::new(false),
             config,
             file_idx,
             file_ordinal: ordinal,
+            preallocated: true,
+            recovery_tail_upper_bound: 0,
         })
     }
 
@@ -554,9 +664,16 @@ impl DataFile {
         read_buf: &'a mut Vec<u8>,
         buf_file_offset: &mut u64,
     ) -> Result<Option<(KVRef<'a>, u64, u64)>> {
+        let used_bytes = self.used_bytes();
+        if offset >= used_bytes {
+            return Ok(None);
+        }
         offset = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
         loop {
+            if offset >= used_bytes {
+                return Ok(None);
+            }
             let buf_start = if offset >= *buf_file_offset {
                 (offset - *buf_file_offset) as usize
             } else {

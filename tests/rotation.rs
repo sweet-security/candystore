@@ -45,6 +45,28 @@ fn test_rotation_preserves_reads() -> Result<(), Error> {
 }
 
 #[test]
+fn test_new_data_files_are_preallocated() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = common::small_file_config();
+    let db = CandyStore::open(dir.path(), config)?;
+
+    let file_len = std::fs::metadata(dir.path().join("data_0000"))
+        .map_err(Error::IOError)?
+        .len();
+    assert_eq!(file_len, 4096 + config.max_data_file_size as u64);
+
+    db.set("prealloc", &[7u8; 128])?;
+    drop(db);
+
+    let reopened_len = std::fs::metadata(dir.path().join("data_0000"))
+        .map_err(Error::IOError)?
+        .len();
+    assert_eq!(reopened_len, 4096 + config.max_data_file_size as u64);
+
+    Ok(())
+}
+
+#[test]
 fn test_splits_and_rotation_with_small_files() -> Result<(), Error> {
     const KEYS: usize = 5000;
 

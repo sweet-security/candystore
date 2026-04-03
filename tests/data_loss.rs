@@ -3,6 +3,8 @@ use std::io::{Seek, SeekFrom, Write};
 
 use candystore::{CandyStore, Config};
 
+mod common;
+
 fn first_data_file_path(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::read_dir(dir)
         .unwrap()
@@ -38,9 +40,9 @@ fn test_zeroed_tail_data_file_lookup() {
     }
 
     let data_path = first_data_file_path(dir.path());
-    let file_len = std::fs::metadata(&data_path).unwrap().len();
+    let file_len = common::logical_data_len(&data_path);
     let zero_len = 2400usize;
-    zero_range(&data_path, file_len - zero_len as u64, zero_len);
+    zero_range(&data_path, 4096 + file_len - zero_len as u64, zero_len);
 
     let store = CandyStore::open(dir.path(), config).unwrap();
     let mut missing = 0;
@@ -80,8 +82,8 @@ fn test_truncated_data_file_queues() {
 
     let data_path = first_data_file_path(dir.path());
     let file = OpenOptions::new().write(true).open(&data_path).unwrap();
-    let file_len = file.metadata().unwrap().len();
-    file.set_len(file_len - 2400).unwrap();
+    let file_len = common::logical_data_len(&data_path);
+    file.set_len(4096 + file_len - 2400).unwrap();
 
     let store = CandyStore::open(dir.path(), config).unwrap();
 
@@ -130,8 +132,8 @@ fn test_truncated_data_file_lists() {
 
     let data_path = first_data_file_path(dir.path());
     let file = OpenOptions::new().write(true).open(&data_path).unwrap();
-    let file_len = file.metadata().unwrap().len();
-    file.set_len(file_len - 2400).unwrap();
+    let file_len = common::logical_data_len(&data_path);
+    file.set_len(4096 + file_len - 2400).unwrap();
 
     let store = CandyStore::open(dir.path(), config).unwrap();
 
