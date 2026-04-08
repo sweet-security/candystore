@@ -140,6 +140,7 @@ impl CandyStore {
     fn open_state(base_path: &Path, config: Arc<Config>) -> Result<OpenState> {
         let index_file = IndexFile::open(base_path, config.clone())?;
         let mut data_files = HashMap::new();
+        let mut file_ordinals = Vec::new();
         let mut seen_ordinals = HashSet::new();
         let mut active_file_idx = 0;
         let mut active_file_ordinal = INITIAL_DATA_FILE_ORDINAL;
@@ -150,16 +151,27 @@ impl CandyStore {
             let Some(file_idx) = parse_data_file_idx(&path) else {
                 continue;
             };
-            let data_file = Arc::new(DataFile::open(base_path, config.clone(), file_idx)?);
-            if !seen_ordinals.insert(data_file.file_ordinal) {
+            let file_ordinal = DataFile::read_ordinal(base_path, file_idx)?;
+            if !seen_ordinals.insert(file_ordinal) {
                 return Err(crate::internal::invalid_data_error(
                     "duplicate data file ordinal",
                 ));
             }
-            if data_files.is_empty() || data_file.file_ordinal > active_file_ordinal {
+            if file_ordinals.is_empty() || file_ordinal > active_file_ordinal {
                 active_file_idx = file_idx;
-                active_file_ordinal = data_file.file_ordinal;
+                active_file_ordinal = file_ordinal;
             }
+            file_ordinals.push((file_idx, file_ordinal));
+        }
+
+        for (file_idx, file_ordinal) in file_ordinals {
+            let validate_tail = file_ordinal == active_file_ordinal;
+            let data_file = Arc::new(DataFile::open(
+                base_path,
+                config.clone(),
+                file_idx,
+                validate_tail,
+            )?);
             data_files.insert(file_idx, data_file);
         }
 

@@ -6,6 +6,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     mem::size_of,
+    os::fd::AsRawFd,
     path::Path,
     sync::{
         Arc,
@@ -207,6 +208,40 @@ pub(crate) struct DataFile {
 }
 
 impl DataFile {
+    fn read_header(file: &File) -> Result<DataFileHeader> {
+        let header =
+            read_available_at(file, size_of::<DataFileHeader>(), 0).map_err(Error::IOError)?;
+        if header.len() < size_of::<DataFileHeader>() {
+            return Err(Error::IOError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "data file header too short",
+            )));
+        }
+
+        let header = DataFileHeader::read_from_bytes(&header).map_err(|_| {
+            Error::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid data file header size",
+            ))
+        })?;
+        if &header.magic != DATA_FILE_SIGNATURE || header.version != DATA_FILE_VERSION {
+            return Err(Error::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid data file header",
+            )));
+        }
+
+        Ok(header)
+    }
+
+    pub(crate) fn read_ordinal(base_path: &Path, file_idx: u16) -> Result<u64> {
+        let file = File::options()
+            .read(true)
+            .open(data_file_path(base_path, file_idx))
+            .map_err(Error::IOError)?;
+        Ok(Self::read_header(&file)?.ordinal)
+    }
+
     pub(crate) fn used_bytes(&self) -> u64 {
         self.file_offset.load(Ordering::Acquire)
     }
@@ -224,7 +259,7 @@ impl DataFile {
         }
 
         if !self.preallocated {
-            self.file.sync_all().map_err(Error::IOError)?;
+            self.file.sync_data().map_err(Error::IOError)?;
         } else {
             sync_file_range(
                 &self.file,
@@ -267,9 +302,56 @@ impl DataFile {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn data_extent_upper_bound(file: &File, physical_data_len: u64) -> Result<Option<u64>> {
+        if physical_data_len == 0 {
+            return Ok(Some(0));
+        }
+
+        let data_start = size_of::<DataFileHeader>() as u64;
+        let data_end = data_start + physical_data_len;
+        let fd = file.as_raw_fd();
+        let mut pos = data_start;
+        let mut last_data_end = data_start;
+
+        while pos < data_end {
+            let next_data = unsafe { libc::lseek(fd, pos as libc::off_t, libc::SEEK_DATA) };
+            if next_data == -1 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::ENXIO) => Ok(Some(last_data_end.saturating_sub(data_start))),
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
+                    _ => Err(Error::IOError(err)),
+                };
+            }
+
+            let next_hole = unsafe { libc::lseek(fd, next_data, libc::SEEK_HOLE) };
+            if next_hole == -1 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
+                    _ => Err(Error::IOError(err)),
+                };
+            }
+
+            last_data_end = (next_hole as u64).min(data_end);
+            if last_data_end >= data_end {
+                break;
+            }
+            pos = last_data_end;
+        }
+
+        Ok(Some(last_data_end.saturating_sub(data_start)))
+    }
+
     fn used_data_upper_bound(file: &File, physical_data_len: u64) -> Result<u64> {
         if physical_data_len == 0 {
             return Ok(0);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(upper_bound) = Self::data_extent_upper_bound(file, physical_data_len)? {
+            return Ok(upper_bound);
         }
 
         let mut end = physical_data_len;
@@ -370,32 +452,18 @@ impl DataFile {
         })
     }
 
-    pub(crate) fn open(base_path: &Path, config: Arc<Config>, file_idx: u16) -> Result<Self> {
+    pub(crate) fn open(
+        base_path: &Path,
+        config: Arc<Config>,
+        file_idx: u16,
+        validate_tail: bool,
+    ) -> Result<Self> {
         let file = File::options()
             .read(true)
             .write(true)
             .open(data_file_path(base_path, file_idx))
             .map_err(Error::IOError)?;
-        let header =
-            read_available_at(&file, size_of::<DataFileHeader>(), 0).map_err(Error::IOError)?;
-        if header.len() < size_of::<DataFileHeader>() {
-            return Err(Error::IOError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "data file header too short",
-            )));
-        }
-        let header = DataFileHeader::read_from_bytes(&header).map_err(|_| {
-            Error::IOError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid data file header size",
-            ))
-        })?;
-        if &header.magic != DATA_FILE_SIGNATURE || header.version != DATA_FILE_VERSION {
-            return Err(Error::IOError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid data file header",
-            )));
-        }
+        let header = Self::read_header(&file)?;
         let physical_data_len = file
             .metadata()
             .map_err(Error::IOError)?
@@ -415,7 +483,11 @@ impl DataFile {
             preallocated,
             recovery_tail_upper_bound,
         };
-        let used_bytes = inst.detect_used_bytes(recovery_tail_upper_bound)?;
+        let used_bytes = if validate_tail {
+            inst.detect_used_bytes(recovery_tail_upper_bound)?
+        } else {
+            recovery_tail_upper_bound
+        };
         inst.file_offset.store(used_bytes, Ordering::Release);
         inst.last_synced_offset.store(used_bytes, Ordering::Release);
 
