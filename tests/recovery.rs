@@ -1090,7 +1090,7 @@ fn test_incomplete_entry_with_valid_header_and_bad_checksum() -> Result<(), Erro
         let klen = key.len() as u16;
         let vlen = val.len() as u16;
         let entry_len = 4 + 4 + klen as usize + vlen as usize + 2;
-        let aligned_len = ((entry_len + 15) / 16) * 16;
+        let aligned_len = entry_len.div_ceil(16) * 16;
 
         let mut buf = vec![0u8; aligned_len];
         buf[0..4].copy_from_slice(&header.to_le_bytes());
