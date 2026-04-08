@@ -1,4 +1,4 @@
-<div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=v7"></div>
+<div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=main"></div>
 
 > [!NOTE]
 > 😸 v1.0 brings true crash-consistency, improved compaction and an overall simpler design. 
