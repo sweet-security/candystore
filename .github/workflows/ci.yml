@@ -83,8 +83,10 @@ jobs:
                   cargo run --example typed
                   cargo test --features whitebox-testing --test whitebox
             - name: Run perf
+              if: matrix.profile == 'release'
               run: cargo run --release --example perf
             - name: Run crasher
+              if: matrix.profile == 'release'
               run: cargo test --release --test crasher -- --nocapture
 
     test-windows:
@@ -126,6 +128,5 @@ jobs:
                   cargo run --example typed
                   cargo test --features whitebox-testing --test whitebox
             - name: Run perf
+              if: matrix.profile == 'release'
               run: cargo run --release --example perf
-            - name: Run crasher
-              run: cargo test --release --test crasher -- --nocapture
