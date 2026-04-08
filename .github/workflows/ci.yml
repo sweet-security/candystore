@@ -74,8 +74,6 @@ jobs:
                   else
                     cargo test -- --skip test_crash_recovery --test-threads=1
                   fi
-            - name: Run crasher
-              run: cargo test --release --test crasher -- --nocapture
             - name: Run examples
               run: |
                   cargo run --example simple
@@ -86,6 +84,8 @@ jobs:
                   cargo test --features whitebox-testing --test whitebox
             - name: Run perf
               run: cargo run --release --example perf
+            - name: Run crasher
+              run: cargo test --release --test crasher -- --nocapture
 
     test-windows:
         name: Test (Windows, ${{ matrix.profile }})
@@ -117,8 +117,6 @@ jobs:
                   } else {
                     cargo test -- --skip test_crash_recovery --test-threads=1
                   }
-            - name: Run crasher
-              run: cargo test --release --test crasher -- --nocapture
             - name: Run examples
               run: |
                   cargo run --example simple
@@ -129,3 +127,5 @@ jobs:
                   cargo test --features whitebox-testing --test whitebox
             - name: Run perf
               run: cargo run --release --example perf
+            - name: Run crasher
+              run: cargo test --release --test crasher -- --nocapture

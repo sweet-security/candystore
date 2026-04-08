@@ -100,7 +100,7 @@ pub(crate) fn sync_file_range(file: &File, offset: u64, len: u64) -> Result<()> 
     let err = std::io::Error::last_os_error();
     match err.raw_os_error() {
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => {
-            file.sync_all().map_err(Error::IOError)
+            file.sync_data().map_err(Error::IOError)
         }
         _ => Err(Error::IOError(err)),
     }
@@ -111,7 +111,7 @@ pub(crate) fn sync_file_range(file: &File, _offset: u64, len: u64) -> Result<()>
     if len == 0 {
         return Ok(());
     }
-    file.sync_all().map_err(Error::IOError)
+    file.sync_data().map_err(Error::IOError)
 }
 
 pub(crate) fn parse_data_file_idx(path: &Path) -> Option<u16> {
