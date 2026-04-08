@@ -55,7 +55,7 @@ fn test_new_data_files_are_preallocated() -> Result<(), Error> {
         .len();
     assert_eq!(file_len, 4096 + config.max_data_file_size as u64);
 
-    db.set("prealloc", &[7u8; 128])?;
+    db.set("prealloc", [7u8; 128])?;
     drop(db);
 
     let reopened_len = std::fs::metadata(dir.path().join("data_0000"))

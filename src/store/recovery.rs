@@ -152,10 +152,10 @@ impl CandyStore {
         let durable_extent = last_durable_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
         if durable_extent < pre_rebuild_tail_upper_bound {
-            self.inner
-                .stats
-                .num_rebuild_purged_bytes
-                .fetch_add(pre_rebuild_tail_upper_bound - durable_extent, Ordering::Relaxed);
+            self.inner.stats.num_rebuild_purged_bytes.fetch_add(
+                pre_rebuild_tail_upper_bound - durable_extent,
+                Ordering::Relaxed,
+            );
             data_file.truncate_to_offset(durable_extent)?;
         }
 
