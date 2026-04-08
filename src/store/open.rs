@@ -9,8 +9,9 @@ use crate::{
     data_file::DataFile,
     index_file::IndexFile,
     internal::{
-        FILE_OFFSET_ALIGNMENT, MAX_REPRESENTABLE_FILE_SIZE, is_resettable_open_error,
-        parse_data_file_idx, sync_dir,
+        DATA_FILE_SIGNATURE, DATA_FILE_VERSION, FILE_OFFSET_ALIGNMENT, INDEX_FILE_SIGNATURE,
+        INDEX_FILE_VERSION, MAX_REPRESENTABLE_FILE_SIZE, index_file_path, index_rows_file_path,
+        is_resettable_open_error, parse_data_file_idx, read_available_at, sync_dir,
     },
     types::{Config, Error, INITIAL_DATA_FILE_ORDINAL, Result},
 };
@@ -18,6 +19,83 @@ use crate::{
 use super::{CandyStore, OpenState, StoreInner};
 
 impl CandyStore {
+    fn recreate_index_files(base_path: &Path) -> Result<()> {
+        let mut removed_any = false;
+        for path in [index_file_path(base_path), index_rows_file_path(base_path)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed_any = true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(Error::IOError(err)),
+            }
+        }
+        if removed_any {
+            sync_dir(base_path)?;
+        }
+        Ok(())
+    }
+
+    fn existing_version_if_signature_matches(
+        path: &Path,
+        signature: &[u8; 8],
+    ) -> Result<Option<u32>> {
+        let file = match std::fs::File::options().read(true).open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::IOError(err)),
+        };
+
+        let header = read_available_at(&file, 12, 0).map_err(Error::IOError)?;
+        if header.len() < 12 || &header[0..8] != signature {
+            return Ok(None);
+        }
+
+        Ok(Some(u32::from_le_bytes(header[8..12].try_into().unwrap())))
+    }
+
+    fn has_unrecognized_index_version(base_path: &Path) -> Result<bool> {
+        Ok(matches!(
+            Self::existing_version_if_signature_matches(
+                &index_file_path(base_path),
+                INDEX_FILE_SIGNATURE,
+            )?,
+            Some(version) if version != INDEX_FILE_VERSION
+        ))
+    }
+
+    fn data_files_use_recognized_versions(base_path: &Path) -> Result<bool> {
+        let mut found_any = false;
+
+        for entry in std::fs::read_dir(base_path).map_err(Error::IOError)? {
+            let entry = entry.map_err(Error::IOError)?;
+            let path = entry.path();
+            if parse_data_file_idx(&path).is_none() {
+                continue;
+            }
+
+            let Some(version) =
+                Self::existing_version_if_signature_matches(&path, DATA_FILE_SIGNATURE)?
+            else {
+                return Ok(false);
+            };
+
+            if version != DATA_FILE_VERSION {
+                return Ok(false);
+            }
+
+            found_any = true;
+        }
+
+        Ok(found_any)
+    }
+
+    fn should_port_to_current_format(base_path: &Path) -> Result<bool> {
+        if !Self::has_unrecognized_index_version(base_path)? {
+            return Ok(false);
+        }
+
+        Self::data_files_use_recognized_versions(base_path)
+    }
+
     fn build_store(
         base_path: std::path::PathBuf,
         config: Arc<Config>,
@@ -126,11 +204,20 @@ impl CandyStore {
     fn open_or_reset_state(base_path: &Path, config: Arc<Config>) -> Result<OpenState> {
         match Self::open_state(base_path, config.clone()) {
             Ok(state) => Ok(state),
-            Err(err) if config.reset_on_invalid_data && is_resettable_open_error(&err) => {
-                Self::clear_db_files(base_path)?;
-                Self::open_state(base_path, config)
+            Err(err) => {
+                if config.port_to_current_format && Self::should_port_to_current_format(base_path)?
+                {
+                    Self::recreate_index_files(base_path)?;
+                    return Self::open_state(base_path, config);
+                }
+
+                if config.reset_on_invalid_data && is_resettable_open_error(&err) {
+                    Self::clear_db_files(base_path)?;
+                    return Self::open_state(base_path, config);
+                }
+
+                Err(err)
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -167,10 +254,12 @@ impl CandyStore {
 
     /// Opens a store at `path`, creating it if needed.
     ///
-    /// If `config.reset_on_invalid_data` is enabled, opening may remove all
-    /// contents and recreate fresh store files when the on-disk data is
-    /// corrupt. While the store is open, the active `.lockfile` is preserved
-    /// so the directory remains locked against concurrent opens.
+    /// If `config.port_to_current_format` is enabled, opening may recreate the
+    /// index files when their format is outdated but the data files are still
+    /// recognized. If `config.reset_on_invalid_data` is enabled, opening may
+    /// remove all contents and recreate fresh store files when the on-disk
+    /// data is corrupt. While the store is open, the active `.lockfile` is
+    /// preserved so the directory remains locked against concurrent opens.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path).map_err(Error::IOError)?;
