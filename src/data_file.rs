@@ -6,7 +6,6 @@ use std::{
     collections::VecDeque,
     fs::File,
     mem::size_of,
-    os::fd::AsRawFd,
     path::Path,
     sync::{
         Arc,
@@ -302,56 +301,9 @@ impl DataFile {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn data_extent_upper_bound(file: &File, physical_data_len: u64) -> Result<Option<u64>> {
-        if physical_data_len == 0 {
-            return Ok(Some(0));
-        }
-
-        let data_start = size_of::<DataFileHeader>() as u64;
-        let data_end = data_start + physical_data_len;
-        let fd = file.as_raw_fd();
-        let mut pos = data_start;
-        let mut last_data_end = data_start;
-
-        while pos < data_end {
-            let next_data = unsafe { libc::lseek(fd, pos as libc::off_t, libc::SEEK_DATA) };
-            if next_data == -1 {
-                let err = std::io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(libc::ENXIO) => Ok(Some(last_data_end.saturating_sub(data_start))),
-                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
-                    _ => Err(Error::IOError(err)),
-                };
-            }
-
-            let next_hole = unsafe { libc::lseek(fd, next_data, libc::SEEK_HOLE) };
-            if next_hole == -1 {
-                let err = std::io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
-                    _ => Err(Error::IOError(err)),
-                };
-            }
-
-            last_data_end = (next_hole as u64).min(data_end);
-            if last_data_end >= data_end {
-                break;
-            }
-            pos = last_data_end;
-        }
-
-        Ok(Some(last_data_end.saturating_sub(data_start)))
-    }
-
     fn used_data_upper_bound(file: &File, physical_data_len: u64) -> Result<u64> {
         if physical_data_len == 0 {
             return Ok(0);
-        }
-
-        #[cfg(target_os = "linux")]
-        if let Some(upper_bound) = Self::data_extent_upper_bound(file, physical_data_len)? {
-            return Ok(upper_bound);
         }
 
         let mut end = physical_data_len;
