@@ -70,10 +70,12 @@ jobs:
             - name: Run tests
               run: |
                   if [ "${{ matrix.profile }}" = "release" ]; then
-                    cargo test --release -- --test-threads=1
+                    cargo test --release -- --skip test_crash_recovery --test-threads=1
                   else
-                    cargo test -- --test-threads=1
+                    cargo test -- --skip test_crash_recovery --test-threads=1
                   fi
+            - name: Run crasher
+              run: cargo test --release --test crasher -- --nocapture
             - name: Run examples
               run: |
                   cargo run --example simple
@@ -111,10 +113,12 @@ jobs:
             - name: Run tests
               run: |
                   if ("${{ matrix.profile }}" -eq "release") {
-                    cargo test --release -- --test-threads=1
+                    cargo test --release -- --skip test_crash_recovery --test-threads=1
                   } else {
-                    cargo test -- --test-threads=1
+                    cargo test -- --skip test_crash_recovery --test-threads=1
                   }
+            - name: Run crasher
+              run: cargo test --release --test crasher -- --nocapture
             - name: Run examples
               run: |
                   cargo run --example simple
