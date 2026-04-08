@@ -1,10 +1,14 @@
 <div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=v7"></div>
 
 > [!NOTE]
-> 😸 v0.7 brings true crash-consistency, improved compaction and an overall simpler design. 
-> We're also close to a stable file format!
+> 😸 v1.0 brings true crash-consistency, improved compaction and an overall simpler design. 
+> v1.0 marks the data-file format as stable.
 >
-> However, the file format is not compatible with older versions of Candy.
+> The append-only data files are the compatibility boundary. The index format
+> may still evolve, and when the data-file format is recognized but the index
+> format is outdated, Candy recreates the index on open by default.
+>
+> Pre-v1.0 stores are not covered by this compatibility promise.
 
 # CandyStore
 
@@ -25,13 +29,12 @@ On my laptop (32 core AMD RYZEN AI MAX+ 395 with 64GB RAM, running Ubuntu 25.10 
 $ cargo run --release --example perf
 
 Testing key-value using 1 threads, each with 1000000 items (key size: 16, value size: 16)
-    Inserts: 0.499239 us/op
-    Updates: 0.611424 us/op
-    Positive Lookups: 0.316884 us/op
-    Negative Lookups: 0.045079 us/op
-    Iter all: 0.373904 us/op
-    Removes: 0.588206 us/op
-
+    Inserts: 0.514698 us/op
+    Updates: 0.608783 us/op
+    Positive Lookups: 0.308571 us/op
+    Negative Lookups: 0.047365 us/op
+    Iter all: 0.360074 us/op
+    Removes: 0.605519 us/op
 ```
 
 See [how to interpret the results\*](#how-to-interpret-the-performance-results).
@@ -144,6 +147,10 @@ index file is unknown relative to the data files.
 To handle this gracefully, Candy employs **background checkpointing**. Instead of synchronously `fsync`ing index and data files on every write (which would block the writer), a background worker asynchronously persists a consistent snapshot of the current state at user-defined intervals or after a configured amount of bytes have been written.
 
 On an unexpected crash or an unclean shutdown, Candy features an efficient rebuild mechanism. It resumes from the latest successful checkpoint and rapidly replays only the recent mutating operations, restoring the full, robust state from the append-only data files.
+
+Starting with v1.0, those append-only data files are also the on-disk compatibility contract. By default (`Config::port_to_current_format = true`), Candy uses that same rebuild path when it encounters an outdated index-file version alongside data files whose format is still recognized. In that case it recreates only the `index` and `rows` files and rebuilds them from the append-only data files.
+
+This does not make arbitrary older releases compatible. The v1.0 compatibility promise applies to stores written with the stable v1.x data-file format; if the data-file format itself is not recognized, open still fails.
 
 ## Design Goals
 

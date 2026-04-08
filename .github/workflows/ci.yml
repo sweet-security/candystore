@@ -81,6 +81,7 @@ jobs:
                   cargo run --example atomics
                   cargo run --example lists
                   cargo run --example typed
+                  cargo test --features whitebox-testing --test whitebox
             - name: Run perf
               run: cargo run --release --example perf
 
@@ -121,5 +122,6 @@ jobs:
                   cargo run --example atomics
                   cargo run --example lists
                   cargo run --example typed
+                  cargo test --features whitebox-testing --test whitebox
             - name: Run perf
               run: cargo run --release --example perf

@@ -32,6 +32,8 @@ pub struct Config {
     pub compaction_min_threshold: u32,
     /// Maximum logical concurrency used to size internal lock tables, defaults to num_cpus*2
     pub max_concurrency: usize,
+    /// Recreate index files from recognized data files when only the index format is outdated.
+    pub port_to_current_format: bool,
     /// Reset the database if opening encounters invalid on-disk data.
     pub reset_on_invalid_data: bool,
     /// Target background compaction throughput in bytes per second.
@@ -52,6 +54,7 @@ impl Default for Config {
             max_data_file_size: 64 * 1024 * 1024,
             compaction_min_threshold: 24 * 1024 * 1024,
             max_concurrency: (2 * num_cpus::get()).clamp(16, 64),
+            port_to_current_format: true,
             reset_on_invalid_data: false,
             compaction_throughput_bytes_per_sec: 4 * 1024 * 1024,
             checkpoint_interval: Some(Duration::from_secs(5)),

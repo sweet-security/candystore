@@ -72,6 +72,32 @@ fn rewrite_data_file_ordinal(
     Ok(())
 }
 
+fn read_index_version(dir: &std::path::Path) -> Result<u32, Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir.join("index"))
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(8)).map_err(Error::IOError)?;
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf).map_err(Error::IOError)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn rewrite_index_version(dir: &std::path::Path, version: u32) -> Result<(), Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("index"))
+        .map_err(Error::IOError)?;
+
+    file.seek(SeekFrom::Start(8)).map_err(Error::IOError)?;
+    file.write_all(&version.to_le_bytes())
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    Ok(())
+}
+
 fn active_file_ordinal(dir: &std::path::Path) -> Result<u64, Error> {
     let mut max_ordinal: Option<u64> = None;
 
@@ -1446,6 +1472,39 @@ fn test_progressive_rebuild_falls_back_to_older_valid_checkpoint_slot() -> Resul
             "key{i:04} missing after fallback to older valid checkpoint slot"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_open_ports_outdated_index_format_when_data_format_is_recognized() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+
+    let original_index_version;
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("port-key-1", "port-val-1")?;
+        db.set("port-key-2", "port-val-2")?;
+        original_index_version = read_index_version(dir.path())?;
+    }
+
+    rewrite_index_version(dir.path(), original_index_version ^ 1)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("port-key-1")?, Some(b"port-val-1".to_vec()));
+    assert_eq!(db.get("port-key-2")?, Some(b"port-val-2".to_vec()));
+    assert_eq!(read_index_version(dir.path())?, original_index_version);
+    assert!(
+        db.stats().num_rebuilt_entries >= 2,
+        "expected index recreation to replay the data files"
+    );
 
     Ok(())
 }
