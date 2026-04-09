@@ -12,10 +12,12 @@ use std::path::Path;
 
 use candystore::internal::{
     CHECKPOINT_SLOT_CHECKSUM_OFFSET, CHECKPOINT_SLOT_FILE_OFFSET,
-    CHECKPOINT_SLOT_GENERATION_OFFSET, CHECKPOINT_SLOT_ORDINAL_OFFSET, EntryPointer, HashCoord,
-    INDEX_CHECKPOINT_SLOT_0_OFFSET, KeyNamespace, MIN_SPLIT_LEVEL, PAGE_SIZE,
-    ROW_LAYOUT_POINTERS_OFFSET, ROW_LAYOUT_SIGNATURES_OFFSET, ROW_WIDTH,
+    CHECKPOINT_SLOT_GENERATION_OFFSET, CHECKPOINT_SLOT_ORDINAL_OFFSET, EntryPointer,
+    INDEX_CHECKPOINT_SLOT_0_OFFSET, PAGE_SIZE, ROW_LAYOUT_POINTERS_OFFSET,
+    ROW_LAYOUT_SIGNATURES_OFFSET,
 };
+#[cfg(unix)]
+use candystore::internal::{HashCoord, KeyNamespace, MIN_SPLIT_LEVEL, ROW_WIDTH};
 use candystore::{CandyStore, Config, Error};
 use tempfile::tempdir;
 
@@ -109,6 +111,7 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn colliding_user_keys(hash_key: (u64, u64), row_idx: usize, count: usize) -> Vec<String> {
     let mut keys = Vec::with_capacity(count);
     let mut candidate = 0u64;

@@ -1,137 +1,133 @@
 name: CI
 
 on:
-    push:
-    pull_request:
-    workflow_dispatch:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
-    contents: read
+  contents: read
 
 env:
-    CARGO_TERM_COLOR: always
-    RUST_BACKTRACE: "1"
-    RUSTFLAGS: "-D warnings"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-    fmt:
-        name: Rustfmt
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v6
-            - name: Print runner info
-              run: |
-                  echo "cores: $(nproc)"
-                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
-                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
-            - run: rustup component add rustfmt
-            - run: cargo fmt -- --check
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print runner info
+        run: |
+          echo "cores: $(nproc)"
+          echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+          echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
+      - run: rustup component add rustfmt
+      - run: cargo fmt -- --check
 
-    clippy:
-        name: Clippy
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v6
-            - name: Print runner info
-              run: |
-                  echo "cores: $(nproc)"
-                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
-                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
-            - uses: actions/cache@v5
-              with:
-                  path: |
-                      ~/.cargo/registry
-                      ~/.cargo/git
-                      target
-                  key: clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-            - run: rustup component add clippy
-            - run: cargo clippy --all-targets -- -D warnings
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print runner info
+        run: |
+          echo "cores: $(nproc)"
+          echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+          echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: clippy-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - run: rustup component add clippy
+      - run: cargo clippy --all-targets -- -D warnings
 
-    test-ubuntu:
-        name: Test (Ubuntu, ${{ matrix.profile }})
-        runs-on: ubuntu-latest
-        strategy:
-            matrix:
-                profile: [debug, release]
-        steps:
-            - uses: actions/checkout@v6
-            - name: Print runner info
-              run: |
-                  echo "cores: $(nproc)"
-                  echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
-                  echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
-            - uses: actions/cache@v5
-              with:
-                  path: |
-                      ~/.cargo/registry
-                      ~/.cargo/git
-                      target
-                  key: test-ubuntu-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
-            - name: Run tests
-              run: |
-                  if [ "${{ matrix.profile }}" = "release" ]; then
-                    cargo test --release -- --skip test_crash_recovery --test-threads=1
-                  else
-                    cargo test -- --skip test_crash_recovery --test-threads=1
-                  fi
-            - name: Run whitebox tests
-              run: cargo test --features whitebox-testing --test whitebox
-            - name: Run examples
-              run: |
-                  cargo run --example simple
-                  cargo run --example multithreaded
-                  cargo run --example atomics
-                  cargo run --example lists
-                  cargo run --example typed
-            - name: Run perf
-              if: matrix.profile == 'release'
-              run: cargo run --release --example perf
-            - name: Run crasher
-              run: |
-                  if [ "${{ matrix.profile }}" = "release" ]; then
-                    cargo test --release --test crasher -- --nocapture
-                  else
-                    cargo test --test crasher -- --nocapture
-                  fi
+  test-ubuntu:
+    name: Test (Ubuntu, ${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print runner info
+        run: |
+          echo "cores: $(nproc)"
+          echo "cpu model: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1)"
+          echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-ubuntu-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo test --release -- --skip test_crash_recovery --test-threads=1
+          else
+            cargo test -- --skip test_crash_recovery --test-threads=1
+          fi
+      - name: Run whitebox tests
+        run: cargo test --features whitebox-testing --test whitebox
+      - name: Run examples
+        run: |
+          cargo run --example simple
+          cargo run --example multithreaded
+          cargo run --example atomics
+          cargo run --example lists
+          cargo run --example typed
+      - name: Run perf
+        if: matrix.profile == 'release'
+        run: cargo run --release --example perf
+      - name: Run crasher
+        if: matrix.profile == 'release'
+        run: cargo test --release --test crasher -- --nocapture
 
-    test-windows:
-        name: Test (Windows, ${{ matrix.profile }})
-        runs-on: windows-latest
-        strategy:
-            matrix:
-                profile: [debug, release]
-        steps:
-            - uses: actions/checkout@v6
-            - name: Print runner info
-              shell: pwsh
-              run: |
-                  $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-                  $computer = Get-CimInstance Win32_ComputerSystem
-                  Write-Host "cores: $($cpu.NumberOfCores)"
-                  Write-Host "cpu model: $($cpu.Name.Trim())"
-                  Write-Host "ram: $([math]::Round($computer.TotalPhysicalMemory / 1GB, 2)) GB"
-            - uses: actions/cache@v5
-              with:
-                  path: |
-                      ~/.cargo/registry
-                      ~/.cargo/git
-                      target
-                  key: test-windows-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
-            - name: Run tests
-              run: |
-                  if ("${{ matrix.profile }}" -eq "release") {
-                    cargo test --release -- --skip test_crash_recovery --test-threads=1
-                  } else {
-                    cargo test -- --skip test_crash_recovery --test-threads=1
-                  }
-            - name: Run examples
-              run: |
-                  cargo run --example simple
-                  cargo run --example multithreaded
-                  cargo run --example atomics
-                  cargo run --example lists
-                  cargo run --example typed
-                  cargo test --features whitebox-testing --test whitebox
-            - name: Run perf
-              if: matrix.profile == 'release'
-              run: cargo run --release --example perf
+  test-windows:
+    name: Test (Windows, ${{ matrix.profile }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print runner info
+        shell: pwsh
+        run: |
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $computer = Get-CimInstance Win32_ComputerSystem
+          Write-Host "cores: $($cpu.NumberOfCores)"
+          Write-Host "cpu model: $($cpu.Name.Trim())"
+          Write-Host "ram: $([math]::Round($computer.TotalPhysicalMemory / 1GB, 2)) GB"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-windows-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run tests
+        run: |
+          if ("${{ matrix.profile }}" -eq "release") {
+            cargo test --release -- --skip test_crash_recovery --test-threads=1
+          } else {
+            cargo test -- --skip test_crash_recovery --test-threads=1
+          }
+      - name: Run examples
+        run: |
+          cargo run --example simple
+          cargo run --example multithreaded
+          cargo run --example atomics
+          cargo run --example lists
+          cargo run --example typed
+          cargo test --features whitebox-testing --test whitebox
+      - name: Run perf
+        if: matrix.profile == 'release'
+        run: cargo run --release --example perf
