@@ -2,10 +2,10 @@
 //!
 //! Run via: `cargo test --features whitebox-testing --test whitebox`
 
-#![cfg(feature = "whitebox-testing")]
+//#![cfg(feature = "whitebox-testing")]
 
 mod common;
-use crate::common::{active_file_ordinal, checkpoint_slot_checksum};
+use crate::common::active_file_ordinal;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -76,7 +76,7 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
 
     let ordinal = active_file_ordinal(dir)?;
     let generation = 1u64;
-    let checksum = checkpoint_slot_checksum(generation, ordinal, offset);
+    let checksum = candystore::internal::checkpoint_slot_checksum(generation, ordinal, offset);
 
     file.seek(SeekFrom::Start(
         INDEX_CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_GENERATION_OFFSET,
