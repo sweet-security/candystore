@@ -5,45 +5,23 @@
 #![cfg(feature = "whitebox-testing")]
 
 mod common;
-use crate::common::checkpoint_slot_checksum;
+use crate::common::{active_file_ordinal, checkpoint_slot_checksum};
 
-use std::hash::Hasher;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+use candystore::internal::{
+    CHECKPOINT_SLOT_CHECKSUM_OFFSET, CHECKPOINT_SLOT_FILE_OFFSET,
+    CHECKPOINT_SLOT_GENERATION_OFFSET, CHECKPOINT_SLOT_ORDINAL_OFFSET, EntryPointer, HashCoord,
+    INDEX_CHECKPOINT_SLOT_0_OFFSET, KeyNamespace, MIN_SPLIT_LEVEL, PAGE_SIZE,
+    ROW_LAYOUT_POINTERS_OFFSET, ROW_LAYOUT_SIGNATURES_OFFSET, ROW_WIDTH,
+};
 use candystore::{CandyStore, Config, Error};
-use siphasher::sip128::{Hasher128, SipHasher13};
 use tempfile::tempdir;
-
-/// PAGE_SIZE for one RowLayout.
-const PAGE_SIZE: usize = 4096;
-/// Number of slots per row.
-const ROW_WIDTH: usize = 336;
-/// Offset of `signatures` array within a RowLayout (after split_level + padding).
-const SIGS_OFFSET: usize = 64;
-/// Offset of `pointers` array within a RowLayout (after signatures).
-const PTRS_OFFSET: usize = SIGS_OFFSET + ROW_WIDTH * 4;
-/// FILE_OFFSET_ALIGNMENT used in EntryPointer encoding.
-const FILE_OFFSET_ALIGNMENT: u64 = 16;
-const MIN_SPLIT_LEVEL: u64 = 3;
-
-/// Offset of checkpoint slot 0 within the index header.
-const CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
-const CHECKPOINT_SLOT_GENERATION_OFFSET: u64 = 0;
-const CHECKPOINT_SLOT_ORDINAL_OFFSET: u64 = 8;
-const CHECKPOINT_SLOT_FILE_OFFSET: u64 = 16;
-const CHECKPOINT_SLOT_CHECKSUM_OFFSET: u64 = 24;
 
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
-
-fn encode_entry_pointer(file_idx: u16, file_offset: u64, size: usize) -> u64 {
-    let fi = (file_idx as u64) & ((1 << 12) - 1);
-    let fo = ((file_offset / FILE_OFFSET_ALIGNMENT) & ((1 << 26) - 1)) << 12;
-    let sh = (size.div_ceil(512) as u64) << (12 + 26);
-    fi | fo | sh
-}
 
 /// Write a phantom entry into the rows file at the given row and column.
 fn inject_phantom_entry(
@@ -54,7 +32,7 @@ fn inject_phantom_entry(
     file_offset: u64,
 ) -> Result<(), Error> {
     let sig: u32 = 0xDEAD_BEEF;
-    let ptr = encode_entry_pointer(file_idx, file_offset, 512);
+    let ptr = EntryPointer::new(file_idx, file_offset, 512, 0).0;
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -64,13 +42,13 @@ fn inject_phantom_entry(
     let row_base = row_idx * PAGE_SIZE;
 
     // Write signature
-    let sig_off = (row_base + SIGS_OFFSET + col * 4) as u64;
+    let sig_off = (row_base + ROW_LAYOUT_SIGNATURES_OFFSET + col * 4) as u64;
     file.seek(SeekFrom::Start(sig_off))
         .map_err(Error::IOError)?;
     file.write_all(&sig.to_le_bytes()).map_err(Error::IOError)?;
 
     // Write pointer
-    let ptr_off = (row_base + PTRS_OFFSET + col * 8) as u64;
+    let ptr_off = (row_base + ROW_LAYOUT_POINTERS_OFFSET + col * 8) as u64;
     file.seek(SeekFrom::Start(ptr_off))
         .map_err(Error::IOError)?;
     file.write_all(&ptr.to_le_bytes()).map_err(Error::IOError)?;
@@ -83,41 +61,11 @@ fn inject_phantom_entry(
 fn read_signature(dir: &Path, row_idx: usize, col: usize) -> Result<u32, Error> {
     use std::io::Read;
     let mut file = std::fs::File::open(dir.join("rows")).map_err(Error::IOError)?;
-    let off = (row_idx * PAGE_SIZE + SIGS_OFFSET + col * 4) as u64;
+    let off = (row_idx * PAGE_SIZE + ROW_LAYOUT_SIGNATURES_OFFSET + col * 4) as u64;
     file.seek(SeekFrom::Start(off)).map_err(Error::IOError)?;
     let mut buf = [0u8; 4];
     file.read_exact(&mut buf).map_err(Error::IOError)?;
     Ok(u32::from_le_bytes(buf))
-}
-
-fn active_file_ordinal(dir: &Path) -> Result<u64, Error> {
-    use std::io::Read;
-
-    let mut max_ordinal: Option<u64> = None;
-    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
-        let entry = entry.map_err(Error::IOError)?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("data_") {
-            continue;
-        }
-
-        let mut file = std::fs::File::open(path).map_err(Error::IOError)?;
-        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf).map_err(Error::IOError)?;
-        let ordinal = u64::from_le_bytes(buf);
-        max_ordinal = Some(max_ordinal.map_or(ordinal, |current| current.max(ordinal)));
-    }
-
-    max_ordinal.ok_or_else(|| {
-        Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no data files found",
-        ))
-    })
 }
 
 fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
@@ -131,28 +79,28 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
     let checksum = checkpoint_slot_checksum(generation, ordinal, offset);
 
     file.seek(SeekFrom::Start(
-        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_GENERATION_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_GENERATION_OFFSET,
     ))
     .map_err(Error::IOError)?;
     file.write_all(&generation.to_le_bytes())
         .map_err(Error::IOError)?;
 
     file.seek(SeekFrom::Start(
-        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_ORDINAL_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_ORDINAL_OFFSET,
     ))
     .map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
 
     file.seek(SeekFrom::Start(
-        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_FILE_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_FILE_OFFSET,
     ))
     .map_err(Error::IOError)?;
     file.write_all(&offset.to_le_bytes())
         .map_err(Error::IOError)?;
 
     file.seek(SeekFrom::Start(
-        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_CHECKSUM_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_CHECKSUM_OFFSET,
     ))
     .map_err(Error::IOError)?;
     file.write_all(&checksum.to_le_bytes())
@@ -161,20 +109,13 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn user_row_index(hash_key: (u64, u64), key: &[u8], split_level: u64) -> usize {
-    let mut hasher = SipHasher13::new_with_keys(hash_key.0, hash_key.1);
-    hasher.write_u8(1);
-    hasher.write(key);
-    let hash = hasher.finish128();
-    ((hash.h1 as u64) & ((1 << split_level) - 1)) as usize
-}
-
 fn colliding_user_keys(hash_key: (u64, u64), row_idx: usize, count: usize) -> Vec<String> {
     let mut keys = Vec::with_capacity(count);
     let mut candidate = 0u64;
     while keys.len() < count {
         let key = format!("split-key-{candidate:06}");
-        if user_row_index(hash_key, key.as_bytes(), MIN_SPLIT_LEVEL) == row_idx {
+        let hc = HashCoord::new(KeyNamespace::User, key.as_bytes(), hash_key);
+        if hc.row_index(MIN_SPLIT_LEVEL as u64) == row_idx {
             keys.push(key);
         }
         candidate += 1;

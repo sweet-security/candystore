@@ -74,6 +74,8 @@ jobs:
                   else
                     cargo test -- --skip test_crash_recovery --test-threads=1
                   fi
+            - name: Run whitebox tests
+              run: cargo test --features whitebox-testing --test whitebox
             - name: Run examples
               run: |
                   cargo run --example simple
@@ -81,13 +83,16 @@ jobs:
                   cargo run --example atomics
                   cargo run --example lists
                   cargo run --example typed
-                  cargo test --features whitebox-testing --test whitebox
             - name: Run perf
               if: matrix.profile == 'release'
               run: cargo run --release --example perf
             - name: Run crasher
-              if: matrix.profile == 'release'
-              run: cargo test --release --test crasher -- --nocapture
+              run: |
+                  if [ "${{ matrix.profile }}" = "release" ]; then
+                    cargo test --release --test crasher -- --nocapture
+                  else
+                    cargo test --test crasher -- --nocapture
+                  fi
 
     test-windows:
         name: Test (Windows, ${{ matrix.profile }})

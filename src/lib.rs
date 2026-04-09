@@ -1,6 +1,6 @@
 mod data_file;
 mod index_file;
-mod internal;
+pub mod internal;
 mod pacer;
 mod store;
 mod types;
@@ -48,5 +48,3 @@ pub type CandyError = Error;
 pub const MAX_KEY_LEN: usize = MAX_USER_KEY_SIZE;
 /// Maximum supported inline value length in bytes.
 pub const MAX_VALUE_LEN: usize = MAX_USER_VALUE_SIZE;
-
-pub use crate::internal::entry_magic_offset;

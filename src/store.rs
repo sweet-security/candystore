@@ -597,6 +597,12 @@ impl StoreInner {
         low_row.set_split_level(nsl);
 
         // Phase 3: Remove the now-duplicate entries from the low row.
+        // NOTE: if the process crashes after Phase 2 but before Phase 3
+        // completes, these stale duplicates will persist in the low row.
+        // They are invisible to lookups, iteration, and compaction (all of
+        // which check `entry_belongs_to_row`), but they occupy row slots
+        // until the next split of this row triggers the Phase 0 phantom
+        // purge above.
         for col in 0..ROW_WIDTH {
             if low_row.signatures[col] != HashCoord::INVALID_SIG
                 && low_row.pointers[col].is_valid()

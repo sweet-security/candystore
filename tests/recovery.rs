@@ -6,14 +6,16 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use candystore::internal::{
+    CHECKPOINT_SLOT_CHECKSUM_OFFSET, CHECKPOINT_SLOT_FILE_OFFSET, CHECKPOINT_SLOT_ORDINAL_OFFSET,
+    DATA_FILE_HEADER_LEN, DATA_FILE_ORDINAL_OFFSET, FILE_OFFSET_ALIGNMENT,
+    INDEX_CHECKPOINT_SLOT_0_OFFSET, INDEX_CHECKPOINT_SLOT_STRIDE, INDEX_FILE_VERSION_OFFSET,
+    parse_data_file_idx,
+};
 use candystore::{CandyStore, CandyTypedDeque, CandyTypedList, CandyTypedStore, Config, Error};
 use tempfile::tempdir;
 
-use crate::common::checkpoint_slot_checksum;
-
-const CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
-const CHECKPOINT_SLOT_STRIDE: u64 = 32;
-const CHECKPOINT_SLOT_CHECKSUM_OFFSET: u64 = 24;
+use crate::common::{active_file_ordinal, read_data_file_ordinal};
 
 fn patterned_bytes_with_seed(len: usize, seed: usize) -> Vec<u8> {
     (0..len)
@@ -31,7 +33,8 @@ fn rewrite_first_data_entry_header(
         .open(dir.join("data_0000"))
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(4096)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_HEADER_LEN))
+        .map_err(Error::IOError)?;
     let mut entry_header = [0u8; 8];
     file.read_exact(&mut entry_header).map_err(Error::IOError)?;
 
@@ -40,7 +43,8 @@ fn rewrite_first_data_entry_header(
     let vlen = u16::from_le_bytes(entry_header[6..8].try_into().unwrap()) as usize;
     let entry_len = 4 + 4 + klen + vlen + 2;
 
-    file.seek(SeekFrom::Start(4096)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_HEADER_LEN))
+        .map_err(Error::IOError)?;
     let mut entry = vec![0u8; entry_len];
     file.read_exact(&mut entry).map_err(Error::IOError)?;
     entry[0..4].copy_from_slice(&rewrite(header).to_le_bytes());
@@ -48,7 +52,8 @@ fn rewrite_first_data_entry_header(
     let checksum = crc16_ibm3740_fast::hash(&entry[..entry_len - 2]) as u16;
     entry[entry_len - 2..entry_len].copy_from_slice(&checksum.to_le_bytes());
 
-    file.seek(SeekFrom::Start(4096)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_HEADER_LEN))
+        .map_err(Error::IOError)?;
     file.write_all(&entry).map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
     Ok(())
@@ -65,7 +70,8 @@ fn rewrite_data_file_ordinal(
         .open(dir.join(format!("data_{file_idx:04}")))
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_ORDINAL_OFFSET))
+        .map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
@@ -78,7 +84,8 @@ fn read_index_version(dir: &std::path::Path) -> Result<u32, Error> {
         .open(dir.join("index"))
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(8)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(INDEX_FILE_VERSION_OFFSET))
+        .map_err(Error::IOError)?;
     let mut buf = [0u8; 4];
     file.read_exact(&mut buf).map_err(Error::IOError)?;
     Ok(u32::from_le_bytes(buf))
@@ -91,43 +98,12 @@ fn rewrite_index_version(dir: &std::path::Path, version: u32) -> Result<(), Erro
         .open(dir.join("index"))
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(8)).map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(INDEX_FILE_VERSION_OFFSET))
+        .map_err(Error::IOError)?;
     file.write_all(&version.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
     Ok(())
-}
-
-fn active_file_ordinal(dir: &std::path::Path) -> Result<u64, Error> {
-    let mut max_ordinal: Option<u64> = None;
-
-    for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
-        let entry = entry.map_err(Error::IOError)?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("data_") {
-            continue;
-        }
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(Error::IOError)?;
-        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf).map_err(Error::IOError)?;
-        let ordinal = u64::from_le_bytes(buf);
-        max_ordinal = Some(max_ordinal.map_or(ordinal, |current| current.max(ordinal)));
-    }
-
-    max_ordinal.ok_or_else(|| {
-        Error::IOError(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no data files found",
-        ))
-    })
 }
 
 fn data_files_by_ordinal(dir: &std::path::Path) -> Result<Vec<(u64, u64)>, Error> {
@@ -136,21 +112,11 @@ fn data_files_by_ordinal(dir: &std::path::Path) -> Result<Vec<(u64, u64)>, Error
     for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
         let entry = entry.map_err(Error::IOError)?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("data_") {
+        if parse_data_file_idx(&path).is_none() {
             continue;
         }
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(Error::IOError)?;
-        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf).map_err(Error::IOError)?;
-        let ordinal = u64::from_le_bytes(buf);
+        let ordinal = read_data_file_ordinal(&path)?;
         let used_bytes = common::logical_data_len(&path);
         files.push((ordinal, used_bytes));
     }
@@ -167,24 +133,11 @@ fn data_file_records_by_ordinal(
     for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
         let entry = entry.map_err(Error::IOError)?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(file_idx) = name
-            .strip_prefix("data_")
-            .and_then(|suffix| suffix.parse::<u16>().ok())
-        else {
+        let Some(file_idx) = parse_data_file_idx(&path) else {
             continue;
         };
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(Error::IOError)?;
-        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf).map_err(Error::IOError)?;
-        let ordinal = u64::from_le_bytes(buf);
+        let ordinal = read_data_file_ordinal(&path)?;
         let used_bytes = common::logical_data_len(&path);
         files.push((file_idx, ordinal, used_bytes, path));
     }
@@ -210,26 +163,31 @@ fn write_commit_cursor_for_ordinal(
         .map_err(Error::IOError)?;
 
     let generation = next_checkpoint_generation(&mut file)?;
-    let checksum = checkpoint_slot_checksum(generation, ordinal, offset);
-    let slot_offset = 128 + (generation as u64 % 2) * 32;
+    let checksum = candystore::internal::checkpoint_slot_checksum(generation, ordinal, offset);
+    let slot_offset =
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + (generation as u64 % 2) * INDEX_CHECKPOINT_SLOT_STRIDE;
 
     file.seek(SeekFrom::Start(slot_offset))
         .map_err(Error::IOError)?;
     file.write_all(&generation.to_le_bytes())
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(slot_offset + 8))
-        .map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(
+        slot_offset + CHECKPOINT_SLOT_ORDINAL_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
     file.write_all(&ordinal.to_le_bytes())
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(slot_offset + 16))
+    file.seek(SeekFrom::Start(slot_offset + CHECKPOINT_SLOT_FILE_OFFSET))
         .map_err(Error::IOError)?;
     file.write_all(&offset.to_le_bytes())
         .map_err(Error::IOError)?;
 
-    file.seek(SeekFrom::Start(slot_offset + 24))
-        .map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(
+        slot_offset + CHECKPOINT_SLOT_CHECKSUM_OFFSET,
+    ))
+    .map_err(Error::IOError)?;
     file.write_all(&checksum.to_le_bytes())
         .map_err(Error::IOError)?;
     file.sync_all().map_err(Error::IOError)?;
@@ -240,7 +198,10 @@ fn next_checkpoint_generation(file: &mut std::fs::File) -> Result<u64, Error> {
     use std::io::Read;
 
     let mut max_generation = 0u64;
-    for slot_offset in [128u64, 160u64] {
+    for slot_offset in [
+        INDEX_CHECKPOINT_SLOT_0_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + INDEX_CHECKPOINT_SLOT_STRIDE,
+    ] {
         file.seek(SeekFrom::Start(slot_offset))
             .map_err(Error::IOError)?;
         let mut buf = [0u8; 8];
@@ -259,10 +220,10 @@ fn corrupt_latest_checkpoint_slot_checksum(dir: &std::path::Path) -> Result<(), 
         .map_err(Error::IOError)?;
 
     let mut latest_generation = 0u64;
-    let mut latest_slot_offset = CHECKPOINT_SLOT_0_OFFSET;
+    let mut latest_slot_offset = INDEX_CHECKPOINT_SLOT_0_OFFSET;
     for slot_offset in [
-        CHECKPOINT_SLOT_0_OFFSET,
-        CHECKPOINT_SLOT_0_OFFSET + CHECKPOINT_SLOT_STRIDE,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET,
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + INDEX_CHECKPOINT_SLOT_STRIDE,
     ] {
         file.seek(SeekFrom::Start(slot_offset))
             .map_err(Error::IOError)?;
@@ -291,21 +252,11 @@ fn active_data_file_path(dir: &std::path::Path) -> Result<std::path::PathBuf, Er
     for entry in std::fs::read_dir(dir).map_err(Error::IOError)? {
         let entry = entry.map_err(Error::IOError)?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("data_") {
+        if parse_data_file_idx(&path).is_none() {
             continue;
         }
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .map_err(Error::IOError)?;
-        file.seek(SeekFrom::Start(16)).map_err(Error::IOError)?;
-        let mut buf = [0u8; 8];
-        file.read_exact(&mut buf).map_err(Error::IOError)?;
-        if u64::from_le_bytes(buf) == active_ordinal {
+        if read_data_file_ordinal(&path)? == active_ordinal {
             return Ok(path);
         }
     }
@@ -317,7 +268,7 @@ fn active_data_file_path(dir: &std::path::Path) -> Result<std::path::PathBuf, Er
 }
 
 fn append_aligned_tail_garbage(dir: &std::path::Path, len: usize) -> Result<(), Error> {
-    debug_assert_eq!(len % 16, 0);
+    debug_assert_eq!(len % FILE_OFFSET_ALIGNMENT as usize, 0);
 
     let path = active_data_file_path(dir)?;
     let mut file = std::fs::OpenOptions::new()
@@ -1012,7 +963,7 @@ fn test_partial_entry_at_tail_of_preallocated_file() -> Result<(), Error> {
     let logical_len = common::logical_data_len(&data_path);
     {
         let entry_offset = logical_len;
-        let magic_offset = candystore::entry_magic_offset(entry_offset);
+        let magic_offset = candystore::internal::entry_magic_offset(entry_offset);
         // EntryType::Insert = 0b00, ns = 0
         let header: u32 = magic_offset;
         let klen: u16 = 4; // "abcd"
@@ -1075,14 +1026,15 @@ fn test_incomplete_entry_with_valid_header_and_bad_checksum() -> Result<(), Erro
     let logical_len = common::logical_data_len(&data_path);
     {
         let entry_offset = logical_len;
-        let magic_offset = candystore::entry_magic_offset(entry_offset);
+        let magic_offset = candystore::internal::entry_magic_offset(entry_offset);
         let header: u32 = magic_offset;
         let key = b"bad";
         let val = b"entry";
         let klen = key.len() as u16;
         let vlen = val.len() as u16;
         let entry_len = 4 + 4 + klen as usize + vlen as usize + 2;
-        let aligned_len = entry_len.div_ceil(16) * 16;
+        let aligned_len =
+            entry_len.div_ceil(FILE_OFFSET_ALIGNMENT as usize) * FILE_OFFSET_ALIGNMENT as usize;
 
         let mut buf = vec![0u8; aligned_len];
         buf[0..4].copy_from_slice(&header.to_le_bytes());

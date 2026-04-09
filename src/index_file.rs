@@ -43,7 +43,7 @@ pub(crate) struct CheckpointSlot {
 
 const _: () = assert!(size_of::<CheckpointSlot>() == 32);
 
-fn checkpoint_slot_checksum(generation: u64, file_ordinal: u64, offset: u64) -> u64 {
+pub fn checkpoint_slot_checksum(generation: u64, file_ordinal: u64, offset: u64) -> u64 {
     let mut hasher = siphasher::sip::SipHasher13::new();
     hasher.write_u64(generation);
     hasher.write_u64(file_ordinal);
@@ -90,17 +90,12 @@ const _: () = assert!(size_of::<IndexFileHeader>() == PAGE_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(transparent)]
-pub(crate) struct EntryPointer(pub(crate) u64);
+pub struct EntryPointer(pub u64);
 
 impl EntryPointer {
-    pub(crate) const INVALID_POINTER: Self = Self(0);
+    pub const INVALID_POINTER: Self = Self(0);
 
-    pub(crate) fn new(
-        file_idx: u16,
-        file_offset: u64,
-        size: usize,
-        masked_row_selector: u32,
-    ) -> Self {
+    pub fn new(file_idx: u16, file_offset: u64, size: usize, masked_row_selector: u32) -> Self {
         debug_assert!(size > 0 && size <= u8::MAX as usize * SIZE_HINT_UNIT);
 
         let fi = (file_idx as u64) & ((1 << 12) - 1);
@@ -110,23 +105,23 @@ impl EntryPointer {
         Self(fi | fo | sh | rs)
     }
 
-    pub(crate) fn file_idx(&self) -> u16 {
+    pub fn file_idx(&self) -> u16 {
         (self.0 & ((1 << 12) - 1)) as u16
     }
 
-    pub(crate) fn file_offset(&self) -> u64 {
+    pub fn file_offset(&self) -> u64 {
         ((self.0 >> 12) & ((1 << 26) - 1)) * FILE_OFFSET_ALIGNMENT
     }
 
-    pub(crate) fn size_hint(&self) -> usize {
+    pub fn size_hint(&self) -> usize {
         ((self.0 >> (12 + 26)) & ((1 << 8) - 1)) as usize * SIZE_HINT_UNIT
     }
 
-    pub(crate) fn masked_row_selector(&self) -> u32 {
+    pub fn masked_row_selector(&self) -> u32 {
         (self.0 >> (12 + 26 + 8)) as u32
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         self.0 != Self::INVALID_POINTER.0
     }
 }

@@ -8,9 +8,23 @@ use std::{
 
 use crate::types::{Error, Result};
 
-pub(crate) const PAGE_SIZE: usize = 4096;
-pub(crate) const ROW_WIDTH: usize = 16 * 21;
-pub(crate) const MIN_SPLIT_LEVEL: usize = 3;
+pub use crate::index_file::{EntryPointer, checkpoint_slot_checksum};
+
+pub const DATA_FILE_HEADER_LEN: u64 = PAGE_SIZE as u64;
+pub const DATA_FILE_ORDINAL_OFFSET: u64 = 16;
+pub const INDEX_FILE_VERSION_OFFSET: u64 = 8;
+pub const INDEX_CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
+pub const INDEX_CHECKPOINT_SLOT_STRIDE: u64 = 32;
+pub const CHECKPOINT_SLOT_GENERATION_OFFSET: u64 = 0;
+pub const CHECKPOINT_SLOT_ORDINAL_OFFSET: u64 = 8;
+pub const CHECKPOINT_SLOT_FILE_OFFSET: u64 = 16;
+pub const CHECKPOINT_SLOT_CHECKSUM_OFFSET: u64 = 24;
+pub const ROW_LAYOUT_SIGNATURES_OFFSET: usize = 64;
+pub const ROW_LAYOUT_POINTERS_OFFSET: usize = ROW_LAYOUT_SIGNATURES_OFFSET + ROW_WIDTH * 4;
+
+pub const PAGE_SIZE: usize = 4096;
+pub const ROW_WIDTH: usize = 16 * 21;
+pub const MIN_SPLIT_LEVEL: usize = 3;
 pub(crate) const MASKED_ROW_SELECTOR_BITS: u32 = 18;
 pub(crate) const MIN_INITIAL_ROWS: usize = 1 << MIN_SPLIT_LEVEL;
 pub(crate) const MAX_REPRESENTABLE_FILE_SIZE: u32 =
@@ -25,14 +39,15 @@ pub(crate) const INDEX_FILE_SIGNATURE: &[u8; 8] = b"CandyIdx";
 pub(crate) const INDEX_FILE_VERSION: u32 = 0x0002_0009;
 pub(crate) const DATA_FILE_SIGNATURE: &[u8; 8] = b"CandyDat";
 pub(crate) const DATA_FILE_VERSION: u32 = 0x0002_0003;
-pub(crate) const FILE_OFFSET_ALIGNMENT: u64 = 16;
-pub(crate) const SIZE_HINT_UNIT: usize = 512;
+pub const FILE_OFFSET_ALIGNMENT: u64 = 16;
+pub const SIZE_HINT_UNIT: usize = 512;
 pub(crate) const DATA_ENTRY_OFFSET_MAGIC: u32 = 0x91c8_d7cd;
 pub(crate) const DATA_ENTRY_OFFSET_BITS: u8 = 24;
 pub(crate) const DATA_ENTRY_OFFSET_MASK: u32 = (1 << DATA_ENTRY_OFFSET_BITS) - 1;
 pub(crate) const KEY_NAMESPACE_BITS: u8 = 6;
 
-/// Computes the magic offset field for a data entry at the given file offset.
+/// Computes the magic offset field for a data entry at the given file offset. Pub for tests
+#[doc(hidden)]
 pub fn entry_magic_offset(file_offset: u64) -> u32 {
     let magic = (((file_offset / FILE_OFFSET_ALIGNMENT) as u32) ^ DATA_ENTRY_OFFSET_MAGIC)
         & DATA_ENTRY_OFFSET_MASK;
@@ -127,7 +142,7 @@ pub(crate) fn sync_file_range(file: &File, _offset: u64, len: u64) -> Result<()>
     file.sync_data().map_err(Error::IOError)
 }
 
-pub(crate) fn parse_data_file_idx(path: &Path) -> Option<u16> {
+pub fn parse_data_file_idx(path: &Path) -> Option<u16> {
     let name = path.file_name()?.to_str()?;
     let suffix = name.strip_prefix("data_")?;
     if suffix.len() != 4 {
@@ -209,7 +224,7 @@ pub(crate) fn is_resettable_open_error(err: &Error) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub(crate) enum KeyNamespace {
+pub enum KeyNamespace {
     #[allow(dead_code)]
     Invalid = 0, // reserves 0, must NOT be written to the file
     User = 1,
@@ -257,15 +272,15 @@ impl KeyNamespace {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct HashCoord {
-    pub(crate) sig: u32,
-    pub(crate) row_selector: u32,
+pub struct HashCoord {
+    pub sig: u32,
+    pub row_selector: u32,
 }
 
 impl HashCoord {
-    pub(crate) const INVALID_SIG: u32 = 0;
+    pub const INVALID_SIG: u32 = 0;
 
-    pub(crate) fn new(ns: KeyNamespace, key: &[u8], hash_key: (u64, u64)) -> Self {
+    pub fn new(ns: KeyNamespace, key: &[u8], hash_key: (u64, u64)) -> Self {
         let mut hasher = SipHasher13::new_with_keys(hash_key.0, hash_key.1);
         hasher.write_u8(ns as u8);
         hasher.write(key);
@@ -285,11 +300,11 @@ impl HashCoord {
         Self { sig, row_selector }
     }
 
-    pub(crate) fn masked_row_selector(&self) -> u32 {
+    pub fn masked_row_selector(&self) -> u32 {
         (self.row_selector >> MIN_SPLIT_LEVEL) & ((1 << MASKED_ROW_SELECTOR_BITS) - 1)
     }
 
-    pub(crate) fn row_index(&self, split_level: u64) -> usize {
+    pub fn row_index(&self, split_level: u64) -> usize {
         debug_assert!(split_level >= MIN_SPLIT_LEVEL as u64, "sl={split_level}");
         ((self.row_selector as u64) & ((1 << split_level) - 1)) as usize
     }
