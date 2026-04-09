@@ -24,9 +24,10 @@ use crate::{
     data_file::{DataFile, InflightTracker},
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
-        EntryType, HashCoord, KeyNamespace, MAX_DATA_FILE_IDX, MAX_DATA_FILES, MIN_SPLIT_LEVEL,
-        ROW_WIDTH, RangeMetadata, aligned_data_entry_size, aligned_data_entry_waste,
-        aligned_tombstone_entry_waste, index_file_path, index_rows_file_path, sync_dir,
+        EntryType, HashCoord, KeyNamespace, MASKED_ROW_SELECTOR_BITS, MAX_DATA_FILE_IDX,
+        MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH, RangeMetadata, aligned_data_entry_size,
+        aligned_data_entry_waste, aligned_tombstone_entry_waste, index_file_path,
+        index_rows_file_path, invalid_data_error, sync_dir,
     },
     types::{
         Config, Error, GetOrCreateStatus, INITIAL_DATA_FILE_ORDINAL, ReplaceStatus, Result, Stats,
@@ -503,6 +504,9 @@ impl StoreInner {
     }
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
         let nsl = sl + 1;
+        if nsl > (MASKED_ROW_SELECTOR_BITS as u64 + MIN_SPLIT_LEVEL as u64) {
+            return Err(Error::MaxSplitLevel(nsl));
+        }
         let low_row_idx = hc.row_index(sl);
         let high_row_idx = low_row_idx | (1 << sl);
 
@@ -535,24 +539,72 @@ impl StoreInner {
         if low_row.split_level.load(Ordering::Acquire) != sl {
             return Ok(());
         }
-        // SAFETY: the high row (being created) has a split_level of 0, making it unusable by anyone.
-        // We properly hold the high_row shard lock if it differs from the low_row shard.
-        let high_row = unsafe { &mut *rows_table.unlocked_row_ptr(high_row_idx) };
-        debug_assert_eq!(high_row.split_level.load(Ordering::Acquire), 0);
-        let split_bit = 1 << (sl - MIN_SPLIT_LEVEL as u64);
+
+        // Discard phantom entries from a previous interrupted split.
         for col in 0..ROW_WIDTH {
-            let entry = low_row.pointers[col];
             if low_row.signatures[col] != HashCoord::INVALID_SIG
-                && entry.is_valid()
-                && (entry.masked_row_selector() as u64) & split_bit != 0
+                && low_row.pointers[col].is_valid()
+                && !low_row.entry_belongs_to_row(col, low_row_idx, sl)
             {
-                high_row.insert(col, low_row.signatures[col], entry);
                 low_row.remove(col);
             }
         }
 
+        // SAFETY: we hold the low-row shard lock and, when needed, the high-row
+        // shard lock. The target high row is either still unpublished
+        // (`split_level == 0`) or already published by an interrupted earlier
+        // attempt at the same split.
+        let high_row = unsafe { &mut *rows_table.unlocked_row_ptr(high_row_idx) };
+        let high_row_sl = high_row.split_level.load(Ordering::Acquire);
+        let split_bit = 1 << (sl - MIN_SPLIT_LEVEL as u64);
+
+        if high_row_sl == 0 {
+            // An earlier split attempt may have crashed after copying into the
+            // unpublished high row. Clear that inaccessible state before we
+            // repopulate it from the current low row contents.
+            high_row.signatures.fill(HashCoord::INVALID_SIG);
+            high_row.pointers.fill(EntryPointer::INVALID_POINTER);
+
+            // Phase 1: Copy eligible entries into the high row WITHOUT removing
+            // them from the low row yet. If the process is killed during this
+            // phase, the high row remains unpublished and will be rebuilt from
+            // scratch on the next attempt.
+            for col in 0..ROW_WIDTH {
+                let entry = low_row.pointers[col];
+                if low_row.signatures[col] != HashCoord::INVALID_SIG
+                    && entry.is_valid()
+                    && (entry.masked_row_selector() as u64) & split_bit != 0
+                {
+                    high_row.insert(col, low_row.signatures[col], entry);
+                }
+            }
+
+            crate::crash_point("split_row_after_copy_before_publish");
+
+            // Publish the high row first. If we crash before publishing the
+            // low row, lookups for the new child already route correctly and a
+            // later retry can finish by advancing only the low row.
+            high_row.set_split_level(nsl);
+            crate::crash_point("split_row_after_high_publish_before_low_publish");
+        } else if high_row_sl < nsl {
+            return Err(invalid_data_error("invalid split target row level"));
+        }
+
+        // Phase 2: Publish the low row at the new split level. After this
+        // point queries route to the correct row. Duplicates still present in
+        // the low row are harmless because lookups for those keys are now
+        // routed to the high row.
         low_row.set_split_level(nsl);
-        high_row.set_split_level(nsl);
+
+        // Phase 3: Remove the now-duplicate entries from the low row.
+        for col in 0..ROW_WIDTH {
+            if low_row.signatures[col] != HashCoord::INVALID_SIG
+                && low_row.pointers[col].is_valid()
+                && (low_row.pointers[col].masked_row_selector() as u64) & split_bit != 0
+            {
+                low_row.remove(col);
+            }
+        }
 
         Ok(())
     }
@@ -1225,12 +1277,14 @@ impl CandyStore {
                     row_idx += 1;
 
                     let row = row_table.row(idx);
-                    if row.split_level.load(Ordering::Acquire) == 0 {
+                    let sl = row.split_level.load(Ordering::Acquire);
+                    if sl == 0 {
                         continue;
                     }
                     for col in 0..ROW_WIDTH {
                         if row.signatures[col] != HashCoord::INVALID_SIG
                             && row.pointers[col].is_valid()
+                            && row.entry_belongs_to_row(col, idx, sl)
                         {
                             row_entries.push(row.pointers[col]);
                         }

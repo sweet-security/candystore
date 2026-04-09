@@ -145,6 +145,24 @@ const _: () = assert!(offset_of!(RowLayout, signatures) % 8 == 0);
 const _: () = assert!(offset_of!(RowLayout, pointers) % 8 == 0);
 
 impl RowLayout {
+    /// Returns `true` if the entry at `col` has selector bits consistent with
+    /// being in the row at `row_idx` with the given `split_level`.  Phantom
+    /// entries left by an interrupted split will fail this check.
+    pub(crate) fn entry_belongs_to_row(
+        &self,
+        col: usize,
+        row_idx: usize,
+        split_level: u64,
+    ) -> bool {
+        if split_level <= MIN_SPLIT_LEVEL as u64 {
+            return true;
+        }
+        let selector_bits = split_level - MIN_SPLIT_LEVEL as u64;
+        let mask = (1u32 << selector_bits) - 1;
+        let expected = (row_idx >> MIN_SPLIT_LEVEL) as u32 & mask;
+        self.pointers[col].masked_row_selector() & mask == expected
+    }
+
     pub(crate) fn iter_matches(&self, hash_coord: HashCoord) -> RowMatchIterator<'_> {
         RowMatchIterator {
             row: self,

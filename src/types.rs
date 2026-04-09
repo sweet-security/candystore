@@ -78,6 +78,9 @@ pub enum Error {
     #[error("Row needs splitting at split level {0}")]
     SplitRow(u64),
 
+    #[error("Maximum split level {0} reached")]
+    MaxSplitLevel(u64),
+
     #[error("Too many data files")]
     TooManyDataFiles,
 

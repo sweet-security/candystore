@@ -7,10 +7,12 @@
 mod common;
 use crate::common::checkpoint_slot_checksum;
 
+use std::hash::Hasher;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use candystore::{CandyStore, Config, Error};
+use siphasher::sip128::{Hasher128, SipHasher13};
 use tempfile::tempdir;
 
 /// PAGE_SIZE for one RowLayout.
@@ -23,6 +25,7 @@ const SIGS_OFFSET: usize = 64;
 const PTRS_OFFSET: usize = SIGS_OFFSET + ROW_WIDTH * 4;
 /// FILE_OFFSET_ALIGNMENT used in EntryPointer encoding.
 const FILE_OFFSET_ALIGNMENT: u64 = 16;
+const MIN_SPLIT_LEVEL: u64 = 3;
 
 /// Offset of checkpoint slot 0 within the index header.
 const CHECKPOINT_SLOT_0_OFFSET: u64 = 128;
@@ -158,6 +161,27 @@ fn write_commit_cursor(dir: &Path, offset: u64) -> Result<(), Error> {
     Ok(())
 }
 
+fn user_row_index(hash_key: (u64, u64), key: &[u8], split_level: u64) -> usize {
+    let mut hasher = SipHasher13::new_with_keys(hash_key.0, hash_key.1);
+    hasher.write_u8(1);
+    hasher.write(key);
+    let hash = hasher.finish128();
+    ((hash.h1 as u64) & ((1 << split_level) - 1)) as usize
+}
+
+fn colliding_user_keys(hash_key: (u64, u64), row_idx: usize, count: usize) -> Vec<String> {
+    let mut keys = Vec::with_capacity(count);
+    let mut candidate = 0u64;
+    while keys.len() < count {
+        let key = format!("split-key-{candidate:06}");
+        if user_row_index(hash_key, key.as_bytes(), MIN_SPLIT_LEVEL) == row_idx {
+            keys.push(key);
+        }
+        candidate += 1;
+    }
+    keys
+}
+
 /// Fork, run `child_fn` in the child (which should abort), wait and assert
 /// the child was killed by SIGABRT.
 #[cfg(unix)]
@@ -181,6 +205,57 @@ fn fork_expect_abort(child_fn: impl FnOnce()) {
         libc::SIGABRT,
         "child killed by unexpected signal"
     );
+}
+
+#[cfg(unix)]
+fn run_split_row_resume_test(crash_point: &'static std::ffi::CStr) -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 256 * 1024,
+        ..Config::default()
+    };
+    let keys = colliding_user_keys(config.hash_key, 0, ROW_WIDTH + 1);
+    let child_keys = keys.clone();
+
+    fork_expect_abort(|| {
+        unsafe {
+            libc::setenv(c"CANDYSTORE_CRASH_POINT".as_ptr(), crash_point.as_ptr(), 1);
+            libc::setenv(c"CANDYSTORE_CRASH_AFTER".as_ptr(), c"0".as_ptr(), 1);
+        }
+
+        let db = CandyStore::open(dir.path(), config).unwrap();
+        for (idx, key) in child_keys.iter().enumerate() {
+            db.set(key, format!("value{idx:04}")).unwrap();
+        }
+    });
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for (idx, key) in keys.iter().take(ROW_WIDTH).enumerate() {
+        assert_eq!(
+            db.get(key)?,
+            Some(format!("value{idx:04}").into_bytes()),
+            "{key} missing after split-row crash recovery"
+        );
+    }
+    assert_eq!(db.get(&keys[ROW_WIDTH])?, None);
+
+    db.set(&keys[ROW_WIDTH], "value-post-crash")?;
+    drop(db);
+
+    let db = CandyStore::open(dir.path(), config)?;
+    for (idx, key) in keys.iter().take(ROW_WIDTH).enumerate() {
+        assert_eq!(
+            db.get(key)?,
+            Some(format!("value{idx:04}").into_bytes()),
+            "{key} missing after reopening resumed split-row state"
+        );
+    }
+    assert_eq!(
+        db.get(&keys[ROW_WIDTH])?,
+        Some(b"value-post-crash".to_vec())
+    );
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -386,4 +461,16 @@ fn test_crash_after_write_before_insert_recovers_on_rebuild() -> Result<(), Erro
     // best-effort.
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_split_row_crash_before_publish_retries_cleanly() -> Result<(), Error> {
+    run_split_row_resume_test(c"split_row_after_copy_before_publish")
+}
+
+#[cfg(unix)]
+#[test]
+fn test_split_row_crash_after_high_publish_retries_cleanly() -> Result<(), Error> {
+    run_split_row_resume_test(c"split_row_after_high_publish_before_low_publish")
 }

@@ -71,12 +71,19 @@ impl StoreInner {
         }
 
         let row = rows.row(row_idx);
+        let sl = row.split_level.load(std::sync::atomic::Ordering::Acquire);
+        if sl == 0 {
+            return Some(Vec::new());
+        }
         Some(
             row.pointers
                 .iter()
                 .enumerate()
                 .filter_map(|(col, &entry)| {
                     if !entry.is_valid() {
+                        return None;
+                    }
+                    if !row.entry_belongs_to_row(col, row_idx, sl) {
                         return None;
                     }
                     let (_, source_file) =
@@ -412,9 +419,25 @@ impl Drop for CandyStore {
 mod tests {
     use super::*;
 
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{mem::size_of, sync::Arc, thread, time::Duration};
 
+    use crate::index_file::RowLayout;
+    use crate::internal::{HashCoord, KeyNamespace, MIN_SPLIT_LEVEL, ROW_WIDTH};
     use crate::{CandyStore, Config};
+
+    fn colliding_user_keys(hash_key: (u64, u64), row_idx: usize, count: usize) -> Vec<String> {
+        let mut keys = Vec::with_capacity(count);
+        let mut candidate = 0u64;
+        while keys.len() < count {
+            let key = format!("compaction-split-{candidate:06}");
+            let hc = HashCoord::new(KeyNamespace::User, key.as_bytes(), hash_key);
+            if hc.row_index(MIN_SPLIT_LEVEL as u64) == row_idx {
+                keys.push(key);
+            }
+            candidate += 1;
+        }
+        keys
+    }
 
     fn count_live_entries_in_file(store: &CandyStore, file_idx: u16) -> u64 {
         let rows = store.inner.index_file.rows_table();
@@ -431,6 +454,70 @@ mod tests {
         }
 
         count
+    }
+
+    #[test]
+    fn test_snapshot_compaction_row_skips_unpublished_rows() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), Config::default())?;
+        db.stop_compaction();
+
+        let keys = colliding_user_keys(db.inner.config.hash_key, 0, ROW_WIDTH + 1);
+        for (idx, key) in keys.iter().enumerate() {
+            db.set(key, format!("value{idx:04}"))?;
+        }
+
+        assert_eq!(
+            db.inner.index_file.num_rows(),
+            1usize << (MIN_SPLIT_LEVEL + 1)
+        );
+
+        let (sig, ptr) = {
+            let rows = db.inner.index_file.rows_table();
+            let row = rows.row(0);
+            row.signatures
+                .iter()
+                .enumerate()
+                .find_map(|(col, &sig)| {
+                    let ptr = row.pointers[col];
+                    (sig != HashCoord::INVALID_SIG && ptr.is_valid()).then_some((sig, ptr))
+                })
+                .expect("split row should retain at least one live entry")
+        };
+
+        let unpublished_row_idx = (1usize << MIN_SPLIT_LEVEL) + 1;
+        {
+            let mut rows = db.inner.index_file.rows_table_mut();
+            let row = unsafe {
+                &mut *(rows
+                    .row_guard
+                    .as_mut_ptr()
+                    .add(unpublished_row_idx * size_of::<RowLayout>())
+                    as *mut RowLayout)
+            };
+            assert_eq!(row.split_level.load(Ordering::Acquire), 0);
+            row.signatures[0] = sig;
+            row.pointers[0] = ptr;
+        }
+
+        let source_file = db
+            .inner
+            .data_files
+            .read()
+            .get(&ptr.file_idx())
+            .cloned()
+            .ok_or(Error::MissingDataFile(ptr.file_idx()))?;
+        let sources = vec![(ptr.file_idx(), source_file)];
+        let snapshot = db
+            .inner
+            .snapshot_compaction_row(unpublished_row_idx, &sources)
+            .expect("row is inside active rows");
+        assert!(
+            snapshot.is_empty(),
+            "compaction must ignore split_level=0 rows even if they contain stale pointers"
+        );
+
+        Ok(())
     }
 
     #[test]
