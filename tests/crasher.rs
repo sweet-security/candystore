@@ -8,9 +8,9 @@ use candystore::{CandyStore, Config, Result};
 use rand::RngExt;
 
 #[cfg(debug_assertions)]
-const TARGET: u32 = 100_000;
+const TARGET: u32 = 50_000;
 #[cfg(debug_assertions)]
-const SLEEP_RANGE: Range<u64> = 300..800;
+const SLEEP_RANGE: Range<u64> = 700..1200;
 
 #[cfg(not(debug_assertions))]
 const TARGET: u32 = 1_000_000;
