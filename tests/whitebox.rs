@@ -2,7 +2,7 @@
 //!
 //! Run via: `cargo test --features whitebox-testing --test whitebox`
 
-//#![cfg(feature = "whitebox-testing")]
+#![cfg(feature = "whitebox-testing")]
 
 mod common;
 use crate::common::active_file_ordinal;
