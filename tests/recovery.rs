@@ -592,7 +592,7 @@ fn test_rebuild_if_dirty_rejects_unknown_data_entry_type() -> Result<(), Error> 
         db._abort_for_testing();
     }
 
-    rewrite_first_data_entry_header(dir.path(), |header| (header & !(0b11 << 30)) | (0b10 << 30))?;
+    rewrite_first_data_entry_header(dir.path(), |header| (header & !(0b11 << 30)) | (0b11 << 30))?;
 
     match CandyStore::open(dir.path(), config) {
         Err(Error::IOError(io_err)) if io_err.kind() == std::io::ErrorKind::InvalidData => Ok(()),
@@ -845,7 +845,7 @@ fn test_reset_on_invalid_data_clears_recovery_time_corruption() -> Result<(), Er
         db._abort_for_testing();
     }
 
-    rewrite_first_data_entry_header(dir.path(), |header| (header & !(0b11 << 30)) | (0b10 << 30))?;
+    rewrite_first_data_entry_header(dir.path(), |header| (header & !(0b11 << 30)) | (0b11 << 30))?;
     fs::write(dir.path().join("extra.txt"), b"junk").map_err(Error::IOError)?;
     fs::create_dir(dir.path().join("extra_dir")).map_err(Error::IOError)?;
     fs::write(dir.path().join("extra_dir").join("nested.txt"), b"junk").map_err(Error::IOError)?;
@@ -1011,12 +1011,8 @@ fn test_partial_entry_at_tail_of_preallocated_file() -> Result<(), Error> {
     let data_path = dir.path().join("data_0000");
     let logical_len = common::logical_data_len(&data_path);
     {
-        const ALIGNMENT: u64 = 16;
-        const MAGIC: u32 = 0x91c8_d7cd;
-        const MASK: u32 = (1 << 24) - 1;
-
         let entry_offset = logical_len;
-        let magic_offset = (((entry_offset / ALIGNMENT) as u32) ^ MAGIC) & MASK;
+        let magic_offset = candystore::entry_magic_offset(entry_offset);
         // EntryType::Insert = 0b00, ns = 0
         let header: u32 = magic_offset;
         let klen: u16 = 4; // "abcd"
@@ -1078,12 +1074,8 @@ fn test_incomplete_entry_with_valid_header_and_bad_checksum() -> Result<(), Erro
     let data_path = dir.path().join("data_0000");
     let logical_len = common::logical_data_len(&data_path);
     {
-        const ALIGNMENT: u64 = 16;
-        const MAGIC: u32 = 0x91c8_d7cd;
-        const MASK: u32 = (1 << 24) - 1;
-
         let entry_offset = logical_len;
-        let magic_offset = (((entry_offset / ALIGNMENT) as u32) ^ MAGIC) & MASK;
+        let magic_offset = candystore::entry_magic_offset(entry_offset);
         let header: u32 = magic_offset;
         let key = b"bad";
         let val = b"entry";

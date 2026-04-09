@@ -29,12 +29,12 @@ On my laptop (32 core AMD RYZEN AI MAX+ 395 with 64GB RAM, running Ubuntu 25.10 
 $ cargo run --release --example perf
 
 Testing key-value using 1 threads, each with 1000000 items (key size: 16, value size: 16)
-    Inserts: 0.514698 us/op
-    Updates: 0.608783 us/op
-    Positive Lookups: 0.308571 us/op
-    Negative Lookups: 0.047365 us/op
-    Iter all: 0.360074 us/op
-    Removes: 0.605519 us/op
+    Inserts: 0.530478 us/op
+    Updates: 0.626602 us/op
+    Positive Lookups: 0.311369 us/op
+    Negative Lookups: 0.045717 us/op
+    Iter all: 0.366935 us/op
+    Removes: 0.604568 us/op
 ```
 
 See [how to interpret the results\*](#how-to-interpret-the-performance-results).

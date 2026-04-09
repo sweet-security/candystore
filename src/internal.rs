@@ -21,15 +21,28 @@ pub(crate) const MAX_INTERNAL_VALUE_SIZE: usize = (1 << 16) - 1;
 pub(crate) const MAX_DATA_FILES: u16 = 1 << 12;
 pub(crate) const MAX_DATA_FILE_IDX: u16 = MAX_DATA_FILES - 1;
 
-pub(crate) const INDEX_FILE_SIGNATURE: &[u8; 8] = b"CandyStr";
+pub(crate) const INDEX_FILE_SIGNATURE: &[u8; 8] = b"CandyIdx";
 pub(crate) const INDEX_FILE_VERSION: u32 = 0x0002_0009;
 pub(crate) const DATA_FILE_SIGNATURE: &[u8; 8] = b"CandyDat";
-pub(crate) const DATA_FILE_VERSION: u32 = 0x0002_0002;
+pub(crate) const DATA_FILE_VERSION: u32 = 0x0002_0003;
 pub(crate) const FILE_OFFSET_ALIGNMENT: u64 = 16;
 pub(crate) const SIZE_HINT_UNIT: usize = 512;
 pub(crate) const DATA_ENTRY_OFFSET_MAGIC: u32 = 0x91c8_d7cd;
-pub(crate) const DATA_ENTRY_OFFSET_MASK: u32 = (1 << 24) - 1;
+pub(crate) const DATA_ENTRY_OFFSET_BITS: u8 = 24;
+pub(crate) const DATA_ENTRY_OFFSET_MASK: u32 = (1 << DATA_ENTRY_OFFSET_BITS) - 1;
 pub(crate) const KEY_NAMESPACE_BITS: u8 = 6;
+
+/// Computes the magic offset field for a data entry at the given file offset.
+pub fn entry_magic_offset(file_offset: u64) -> u32 {
+    let magic = (((file_offset / FILE_OFFSET_ALIGNMENT) as u32) ^ DATA_ENTRY_OFFSET_MAGIC)
+        & DATA_ENTRY_OFFSET_MASK;
+    // ensure magic is never 0 so a valid entry cannot be all zeros
+    if magic == 0 {
+        DATA_ENTRY_OFFSET_MAGIC & DATA_ENTRY_OFFSET_MASK
+    } else {
+        magic
+    }
+}
 pub(crate) const MAX_KEY_NAMESPACE: u8 = (1 << KEY_NAMESPACE_BITS) - 1;
 pub(crate) const READ_BUFFER_SIZE: usize = 128 * 1024;
 
@@ -163,8 +176,10 @@ impl RangeMetadata {
 pub(crate) enum EntryType {
     Insert = 0,
     Update = 1,
-    _Unused2 = 2,
-    Tombstone = 3,
+    Tombstone = 2,
+    // for future use: extended entries
+    #[allow(unused)]
+    Extended = 3,
 }
 
 pub(crate) fn invalid_data_error(message: &'static str) -> Error {
@@ -195,23 +210,27 @@ pub(crate) fn is_resettable_open_error(err: &Error) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum KeyNamespace {
-    User = 0,
-    QueueMeta = 1,
-    QueueData = 2,
-    BigMeta = 3,
-    BigData = 4,
-    ListMeta = 5,
-    ListIndex = 6,
-    ListData = 7,
-    Typed = 8,
-    TypedQueueMeta = 9,
-    TypedQueueData = 10,
-    TypedBigMeta = 11,
-    TypedBigData = 12,
-    TypedListMeta = 13,
-    TypedListIndex = 14,
-    TypedListData = 15,
+    #[allow(dead_code)]
+    Invalid = 0, // reserves 0, must NOT be written to the file
+    User = 1,
+    QueueMeta = 2,
+    QueueData = 3,
+    BigMeta = 4,
+    BigData = 5,
+    ListMeta = 6,
+    ListIndex = 7,
+    ListData = 8,
+    Typed = 9,
+    TypedQueueMeta = 10,
+    TypedQueueData = 11,
+    TypedBigMeta = 12,
+    TypedBigData = 13,
+    TypedListMeta = 14,
+    TypedListIndex = 15,
+    TypedListData = 16,
 }
+
+const _: () = assert!((KeyNamespace::TypedListData as u8) < (1 << KEY_NAMESPACE_BITS));
 
 impl KeyNamespace {
     pub(crate) fn from_u8(ns: u8) -> Option<Self> {

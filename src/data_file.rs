@@ -14,9 +14,9 @@ use std::{
 };
 
 use crate::internal::{
-    DATA_ENTRY_OFFSET_MAGIC, DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION,
-    EntryType, FILE_OFFSET_ALIGNMENT, KEY_NAMESPACE_BITS, KVBuf, KVRef, KeyNamespace,
-    MAX_KEY_NAMESPACE, PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, data_file_path,
+    DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION, EntryType,
+    FILE_OFFSET_ALIGNMENT, KEY_NAMESPACE_BITS, KVBuf, KVRef, KeyNamespace, MAX_KEY_NAMESPACE,
+    PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, data_file_path, entry_magic_offset,
     invalid_data_error, read_available_at, read_into_at, sync_dir, sync_file_range, write_all_at,
 };
 use crate::types::{Config, Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result};
@@ -360,8 +360,7 @@ impl DataFile {
         }
 
         let header = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let magic_offset = (((offset / FILE_OFFSET_ALIGNMENT) as u32) ^ DATA_ENTRY_OFFSET_MAGIC)
-            & DATA_ENTRY_OFFSET_MASK;
+        let magic_offset = entry_magic_offset(offset);
 
         if header & DATA_ENTRY_OFFSET_MASK != magic_offset {
             return Err(Error::IOError(std::io::Error::new(
@@ -542,9 +541,7 @@ impl DataFile {
         unsafe { buf.set_len(aligned_len) };
         let buf = &mut buf[..];
 
-        let magic_offset = (((file_offset / FILE_OFFSET_ALIGNMENT) as u32)
-            ^ DATA_ENTRY_OFFSET_MAGIC)
-            & DATA_ENTRY_OFFSET_MASK;
+        let magic_offset = entry_magic_offset(file_offset);
         let header = magic_offset | ((entry_type as u32) << 30) | ((ns as u32) << 24);
 
         buf[0..4].copy_from_slice(&header.to_le_bytes());
@@ -558,7 +555,8 @@ impl DataFile {
             buf[6..6 + key.len()].copy_from_slice(key);
         }
 
-        buf[entry_len..aligned_len].fill(0);
+        // use a non-zero padding byte
+        buf[entry_len..aligned_len].fill(0xff);
         let checksum = crc16_ibm3740_fast::hash(&buf[..entry_len - 2]) as u16;
         buf[entry_len - 2..entry_len].copy_from_slice(&checksum.to_le_bytes());
 
@@ -723,9 +721,7 @@ impl DataFile {
             let avail = &read_buf[rel..];
 
             let header = u32::from_le_bytes(avail[0..4].try_into().unwrap());
-            let magic_offset = (((offset / FILE_OFFSET_ALIGNMENT) as u32)
-                ^ DATA_ENTRY_OFFSET_MAGIC)
-                & DATA_ENTRY_OFFSET_MASK;
+            let magic_offset = entry_magic_offset(offset);
             if header & DATA_ENTRY_OFFSET_MASK != magic_offset {
                 offset += FILE_OFFSET_ALIGNMENT;
                 continue;
