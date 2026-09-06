@@ -1,6 +1,9 @@
 <div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=main"></div>
 
 > [!NOTE]
+> v1.1 fixes durability issues in checkpointing (data files are now `fdatasync`ed) and some (very
+> rare) concurrency issues; file format is unchanged.
+>
 > 😸 v1.0 brings true crash-consistency, improved compaction and an overall simpler design,
 > as well as a stable file format.
 >
@@ -148,6 +151,12 @@ To handle this gracefully, Candy employs **background checkpointing**. Instead o
 
 On an unexpected crash or an unclean shutdown, Candy features an efficient rebuild mechanism. It resumes from the latest successful checkpoint and rapidly replays only the recent mutating operations, restoring the full, robust state from the append-only data files.
 
+The durability guarantee is therefore checkpoint-granular: a write is guaranteed to survive power loss
+once a checkpoint (or an explicit `flush()`) completes after it. Writes made after the last checkpoint
+are replayed if they reached the disk, and lost otherwise. Checkpoints run every `checkpoint_interval`
+(default 5s) or every `checkpoint_delta_bytes` written (default 128KB), whichever comes first, and
+can be forced with `checkpoint()` when you need a synchronous durability point.
+
 Starting with v1.0, those append-only data files are also the on-disk compatibility contract. By default (`Config::port_to_current_format = true`), Candy uses that same rebuild path when it encounters an outdated index-file version alongside data files whose format is still recognized. In that case it recreates only the `index` and `rows` files and rebuilds them from the append-only data files.
 
 This does not make arbitrary older releases compatible. The v1.0 compatibility promise applies to stores written with the stable v1.x data-file format; if the data-file format itself is not recognized, open still fails.
@@ -164,8 +173,9 @@ Example use cases for Candy are
   and perform them) 
 * A caching layer for your application logic
 
-It is designed to be durable for process crashes (where the kernel will flush everything properly)
-but it does not attempt to optimize for durability under kernel panics (full rebuild).
+It is designed to be fully consistent across process crashes (where the kernel will flush everything
+properly). Under power failure or kernel panic, durability is bounded by the last completed checkpoint
+(see [Checkpointing & Rebuild](#checkpointing--rebuild)).
 
 ## How to Interpret the Performance Results
 
