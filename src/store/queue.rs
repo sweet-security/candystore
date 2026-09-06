@@ -3,9 +3,9 @@ use siphasher::sip::SipHasher13;
 use std::{hash::Hasher, mem::size_of, ops::Range};
 
 use crate::{
-    internal::{KeyNamespace, RangeMetadata, aligned_data_entry_size},
+    internal::{KeyNamespace, RangeMetadata, aligned_data_entry_size, invalid_data_error},
     store::CandyStore,
-    types::{Error, MAX_USER_VALUE_SIZE, Result},
+    types::{Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result},
 };
 
 #[derive(Clone, Copy)]
@@ -29,6 +29,7 @@ pub struct QueueIterator<'a> {
     store: &'a CandyStore,
     queue: Vec<u8>,
     ns: QueueNamespaces,
+    initial_error: Option<Error>,
     next_idx: u64,
     end_idx: u64,
     initial_next_idx: u64,
@@ -65,6 +66,9 @@ impl Iterator for QueueIterator<'_> {
     type Item = Result<(usize, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.initial_error.take() {
+            return Some(Err(err));
+        }
         while self.next_idx <= self.end_idx {
             let idx = self.next_idx;
             self.next_idx += 1;
@@ -87,6 +91,9 @@ impl Iterator for QueueIterator<'_> {
 
 impl DoubleEndedIterator for QueueIterator<'_> {
     fn next_back(&mut self) -> Option<<Self as Iterator>::Item> {
+        if let Some(err) = self.initial_error.take() {
+            return Some(Err(err));
+        }
         while self.next_idx <= self.end_idx {
             let idx = self.end_idx;
             if self.end_idx == 0 {
@@ -292,6 +299,7 @@ impl CandyStore {
         queue: &[u8],
         value: &[u8],
     ) -> Result<u64> {
+        self.validate_queue_item_sizes(queue, value)?;
         let _lock = self.list_write_guard(ns.meta, queue);
         self._queue_push_tail_with_ns(ns, queue, value)
     }
@@ -321,6 +329,7 @@ impl CandyStore {
         queue: &[u8],
         value: &[u8],
     ) -> Result<u64> {
+        self.validate_queue_item_sizes(queue, value)?;
         let _lock = self.list_write_guard(ns.meta, queue);
         let mut meta = get_queue_meta(self, ns, queue)?;
         let new_head = meta.head - 1;
@@ -492,11 +501,15 @@ impl CandyStore {
         ns: QueueNamespaces,
         queue: &[u8],
     ) -> QueueIterator<'a> {
-        let meta = get_queue_meta(self, ns, queue).unwrap_or_else(|_| QueueMetadata::new());
+        let (meta, initial_error) = match get_queue_meta(self, ns, queue) {
+            Ok(meta) => (meta, None),
+            Err(err) => (QueueMetadata::new(), Some(err)),
+        };
         QueueIterator {
             store: self,
             queue: queue.to_vec(),
             ns,
+            initial_error,
             next_idx: meta.head,
             end_idx: meta.tail,
             initial_next_idx: meta.head,
@@ -522,10 +535,10 @@ impl CandyStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<bool> {
+        self.validate_queue_metadata_key(key)?;
+        let max_chunk_len = self.max_big_chunk_len(key)?;
         let _lock = self.list_write_guard(ns.meta, key);
         let existed = self._queue_discard_with_ns(ns, key)?;
-
-        let max_chunk_len = self.max_big_chunk_len(key)?;
 
         for chunk in value.chunks(max_chunk_len) {
             self._queue_push_tail_with_ns(ns, key, chunk)?;
@@ -600,13 +613,32 @@ impl CandyStore {
 
         Ok(max_chunk_len)
     }
+
+    fn validate_queue_metadata_key(&self, queue: &[u8]) -> Result<()> {
+        validate_internal_entry(self, queue.len(), size_of::<u64>() * 3)
+    }
+
+    fn validate_queue_item_sizes(&self, queue: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_queue_metadata_key(queue)?;
+        validate_internal_entry(self, make_queue_data_key(queue, 0).len(), value.len())
+    }
+}
+
+fn validate_internal_entry(store: &CandyStore, key_len: usize, value_len: usize) -> Result<()> {
+    let entry_size = aligned_data_entry_size(key_len, value_len) as usize;
+    if key_len > MAX_USER_KEY_SIZE
+        || value_len > MAX_USER_VALUE_SIZE
+        || entry_size > store.inner.config.max_data_file_size as usize
+    {
+        return Err(Error::PayloadTooLarge(entry_size));
+    }
+    Ok(())
 }
 
 fn get_queue_meta(store: &CandyStore, ns: QueueNamespaces, queue: &[u8]) -> Result<QueueMetadata> {
-    if let Some(value) = store.get_ns(ns.meta, queue)?
-        && let Some(meta) = QueueMetadata::from_bytes(&value)
-    {
-        return Ok(meta);
+    if let Some(value) = store.get_ns(ns.meta, queue)? {
+        return QueueMetadata::from_bytes(&value)
+            .ok_or_else(|| invalid_data_error("invalid queue metadata"));
     }
     Ok(QueueMetadata::new())
 }
@@ -634,4 +666,29 @@ fn make_queue_data_key(queue: &[u8], seq: u64) -> [u8; 16] {
     key[..8].copy_from_slice(&hash.to_le_bytes());
     key[8..].copy_from_slice(&seq.to_be_bytes());
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::Config;
+
+    #[test]
+    fn queue_iterator_surfaces_invalid_metadata() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), Config::default())?;
+        db.set_ns(KeyNamespace::QueueMeta, b"broken-queue", b"bad")?;
+
+        let err = db
+            .iter_queue(b"broken-queue")
+            .next()
+            .expect("invalid metadata should produce an iterator item")
+            .expect_err("invalid metadata should be reported");
+        assert!(matches!(
+            err,
+            Error::IOError(ref io_err) if io_err.kind() == std::io::ErrorKind::InvalidData
+        ));
+        Ok(())
+    }
 }

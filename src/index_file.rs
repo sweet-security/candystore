@@ -384,12 +384,9 @@ pub(crate) struct IndexFile {
     row_locks: Vec<RwLock<()>>,
     row_locks_mask: usize,
     config: Arc<Config>,
-    /// Cached checkpoint state so concurrent readers (e.g. compaction candidate
-    /// selection) always see a consistent snapshot without going through the
-    /// double-buffer slot protocol.
-    cached_checkpoint_generation: AtomicU64,
-    cached_checkpoint_ordinal: AtomicU64,
-    cached_checkpoint_offset: AtomicU64,
+    /// Cached checkpoint state for runtime readers. The persisted slots remain
+    /// atomic because recovery validates them independently with checksums.
+    cached_checkpoint: RwLock<Option<CheckpointCursor>>,
 }
 
 impl IndexFile {
@@ -422,24 +419,33 @@ impl IndexFile {
     }
 
     pub(crate) fn checkpoint_cursor(&self) -> (u64, u64) {
-        let generation = self.cached_checkpoint_generation.load(Ordering::Acquire);
-        if generation == 0 {
-            return (0, 0);
-        }
-        let ordinal = self.cached_checkpoint_ordinal.load(Ordering::Relaxed);
-        let offset = self.cached_checkpoint_offset.load(Ordering::Relaxed);
-        (ordinal, offset)
+        self.cached_checkpoint
+            .read()
+            .map_or((0, 0), |cursor| (cursor.file_ordinal, cursor.offset))
     }
 
     pub(crate) fn checkpoint_generation(&self) -> u64 {
-        self.cached_checkpoint_generation.load(Ordering::Acquire)
+        self.cached_checkpoint
+            .read()
+            .map_or(0, |cursor| cursor.generation)
     }
 
-    pub(crate) fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) {
-        let current_gen = self.cached_checkpoint_generation.load(Ordering::Relaxed);
+    pub(crate) fn restore_checkpoint_cache(&self, generation: u64, ordinal: u64, offset: u64) {
+        *self.cached_checkpoint.write() = (generation != 0).then_some(CheckpointCursor {
+            generation,
+            file_ordinal: ordinal,
+            offset,
+        });
+    }
+
+    pub(crate) fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) -> Result<()> {
+        let current_gen = self
+            .cached_checkpoint
+            .read()
+            .map_or(0, |cursor| cursor.generation);
         let next_generation = current_gen
             .checked_add(1)
-            .expect("checkpoint generation overflow");
+            .ok_or(Error::PersistentSequenceExhausted("checkpoint generation"))?;
         let slot =
             &self.header_ref().checkpoint_slots[next_generation as usize % CHECKPOINT_SLOT_COUNT];
 
@@ -452,13 +458,12 @@ impl IndexFile {
             Ordering::Release,
         );
 
-        // Update the cache so concurrent readers see the new values immediately.
-        self.cached_checkpoint_ordinal
-            .store(ordinal, Ordering::Relaxed);
-        self.cached_checkpoint_offset
-            .store(offset, Ordering::Relaxed);
-        self.cached_checkpoint_generation
-            .store(next_generation, Ordering::Release);
+        *self.cached_checkpoint.write() = Some(CheckpointCursor {
+            generation: next_generation,
+            file_ordinal: ordinal,
+            offset,
+        });
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -629,30 +634,32 @@ impl IndexFile {
             row_locks,
             row_locks_mask,
             config,
-            cached_checkpoint_generation: AtomicU64::new(0),
-            cached_checkpoint_ordinal: AtomicU64::new(0),
-            cached_checkpoint_offset: AtomicU64::new(0),
+            cached_checkpoint: RwLock::new(None),
         };
 
         if new_file {
             let rows_table = inst.rows_table_mut();
             inst.init_header_and_rows(rows_table, hash_key)?;
         } else if let Some(cursor) = inst.durable_checkpoint() {
-            inst.cached_checkpoint_generation
-                .store(cursor.generation, Ordering::Relaxed);
-            inst.cached_checkpoint_ordinal
-                .store(cursor.file_ordinal, Ordering::Relaxed);
-            inst.cached_checkpoint_offset
-                .store(cursor.offset, Ordering::Relaxed);
+            *inst.cached_checkpoint.write() = Some(cursor);
         }
 
         Ok(inst)
     }
 
     pub(crate) fn sync_all(&self) -> Result<()> {
-        // Persist row updates before any header state that claims those rows are durable.
-        self.rows_mmap.write().flush().map_err(Error::IOError)?;
+        let rows_table = self.rows_table_mut();
+        self.sync_rows(rows_table)?;
+        self.sync_header()
+    }
+
+    pub(crate) fn sync_rows(&self, rows_table: RowsTableWriteGuard<'_>) -> Result<()> {
+        rows_table.row_guard.flush().map_err(Error::IOError)?;
         self.rows_file.sync_all().map_err(Error::IOError)?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_header(&self) -> Result<()> {
         self.header_mmap.flush().map_err(Error::IOError)?;
         #[cfg(windows)]
         self.header_file.sync_all().map_err(Error::IOError)?;

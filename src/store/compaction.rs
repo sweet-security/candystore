@@ -224,6 +224,19 @@ impl StoreInner {
             row_idx += 1;
         }
 
+        // Block pointer publication and rotation while making every possible
+        // compaction destination durable. Rewrites may span multiple active
+        // files, so syncing only the final active file is insufficient.
+        let rows_table = self.index_file.rows_table_mut();
+        let _rotation_lock = self.rotation_lock.lock();
+        {
+            let files = self.data_files.read();
+            for data_file in files.values() {
+                data_file.sync_to_current()?;
+            }
+        }
+        self.index_file.sync_rows(rows_table)?;
+
         let removed = {
             let mut files = self.data_files.write();
             sources
@@ -237,18 +250,6 @@ impl StoreInner {
         };
         let compacted_files = removed.len() as u64;
         drop(sources);
-
-        // Durability barrier: ensure all moved entries are durable in the active
-        // file and the updated index pointers are persisted before we delete the
-        // source files.  Without this, a crash after deletion could leave the
-        // persisted index pointing at files that no longer exist.
-        if !removed.is_empty() {
-            let active_idx = self.active_file_idx.load(Ordering::Acquire);
-            if let Some(active_file) = self.data_files.read().get(&active_idx).cloned() {
-                let _ = active_file.sync_to_current();
-            }
-            let _ = self.index_file.sync_all();
-        }
 
         let mut reclaimed_bytes = 0u64;
         for (file_idx, data_file) in removed {
@@ -267,7 +268,7 @@ impl StoreInner {
             }
         }
 
-        let _ = self.index_file.flush_header();
+        self.index_file.flush_header()?;
 
         Ok(CompactionOutcome {
             compacted_files,
@@ -645,6 +646,9 @@ mod tests {
         assert_eq!(db.stats().num_read_ops - before_read_ops, live_entries);
         for (file_idx, _) in targets {
             assert_eq!(count_live_entries_in_file(&db, file_idx), 0);
+        }
+        for data_file in db.inner.data_files.read().values() {
+            assert!(!data_file.is_dirty());
         }
 
         Ok(())

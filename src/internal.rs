@@ -98,50 +98,6 @@ pub(crate) fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn sync_file_range(file: &File, offset: u64, len: u64) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
-    if len == 0 {
-        return Ok(());
-    }
-
-    let sync_offset = i64::try_from(offset)
-        .map_err(|_| Error::IOError(std::io::Error::other("sync offset overflow")))?;
-    let sync_len = i64::try_from(len)
-        .map_err(|_| Error::IOError(std::io::Error::other("sync length overflow")))?;
-
-    let rc = unsafe {
-        libc::sync_file_range(
-            file.as_raw_fd(),
-            sync_offset,
-            sync_len,
-            libc::SYNC_FILE_RANGE_WAIT_BEFORE
-                | libc::SYNC_FILE_RANGE_WRITE
-                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => {
-            file.sync_data().map_err(Error::IOError)
-        }
-        _ => Err(Error::IOError(err)),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn sync_file_range(file: &File, _offset: u64, len: u64) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
-    file.sync_data().map_err(Error::IOError)
-}
-
 pub fn parse_data_file_idx(path: &Path) -> Option<u16> {
     let name = path.file_name()?.to_str()?;
     let suffix = name.strip_prefix("data_")?;
@@ -151,7 +107,7 @@ pub fn parse_data_file_idx(path: &Path) -> Option<u16> {
     suffix.parse().ok()
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RangeMetadata {
     pub(crate) head: u64,
     pub(crate) tail: u64,

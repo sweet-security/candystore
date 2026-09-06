@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use candystore::{CandyStore, Config, Error};
+use candystore::{CandyStore, Config, Error, MAX_KEY_LEN};
 use tempfile::tempdir;
 
 #[test]
@@ -270,6 +270,22 @@ fn test_multiple_queues() -> Result<(), Error> {
     assert_eq!(db.pop_queue_head(&b"q1"[..])?, Some(b"v1".to_vec()));
     assert_eq!(db.pop_queue_head(&b"q2"[..])?, Some(b"v2".to_vec()));
 
+    Ok(())
+}
+
+#[test]
+fn test_oversized_queue_key_does_not_partially_insert() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default())?;
+    let queue = vec![b'x'; MAX_KEY_LEN + 1];
+    let initial_idx = 1usize << 63;
+
+    assert!(matches!(
+        db.push_to_queue_tail(&queue, b"value"),
+        Err(Error::PayloadTooLarge(_))
+    ));
+    assert_eq!(db.queue_len(&queue)?, 0);
+    assert_eq!(db.remove_from_queue(&queue, initial_idx)?, None);
     Ok(())
 }
 

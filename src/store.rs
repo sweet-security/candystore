@@ -80,8 +80,6 @@ struct CheckpointSnapshot {
     checkpoint_ordinal: u64,
     checkpoint_offset: u64,
     checkpointed_delta: i64,
-    last_commit_ordinal: u64,
-    last_commit_offset: u64,
 }
 
 #[derive(Default)]
@@ -442,8 +440,8 @@ impl StoreInner {
             .fetch_add(-actual, Ordering::Relaxed);
     }
 
-    fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) {
-        self.index_file.persist_checkpoint_cursor(ordinal, offset);
+    fn persist_checkpoint_cursor(&self, ordinal: u64, offset: u64) -> Result<()> {
+        self.index_file.persist_checkpoint_cursor(ordinal, offset)
     }
 
     fn perform_checkpoint(&self) -> Result<()> {
@@ -465,32 +463,57 @@ impl StoreInner {
             .get(&active_idx)
             .cloned()
             .ok_or(Error::MissingDataFile(active_idx))?;
-        let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta) =
+        let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta, _) =
             self.inflight_tracker.checkpoint_progress(&active_file);
-        let (last_commit_ordinal, last_commit_offset) = self.index_file.checkpoint_cursor();
         Ok(CheckpointSnapshot {
             checkpoint_ordinal,
             checkpoint_offset,
             checkpointed_delta,
-            last_commit_ordinal,
-            last_commit_offset,
         })
     }
 
-    fn sync_checkpoint(&self, snap: CheckpointSnapshot) -> Result<()> {
-        let files = self.data_files.read();
-        for data_file in files.values() {
-            if data_file.file_ordinal > snap.last_commit_ordinal {
-                data_file.sync_to_current()?;
-            } else if data_file.file_ordinal == snap.last_commit_ordinal {
-                data_file.sync_data(snap.last_commit_offset, data_file.used_bytes())?;
-            }
+    fn sync_checkpoint(&self, _snap: CheckpointSnapshot) -> Result<()> {
+        // Bulk sync without blocking writers; the quiescent pass below only
+        // has to cover whatever landed since.
+        for data_file in self.data_files.read().values() {
+            data_file.sync_to_current()?;
         }
-        drop(files);
 
-        self.fold_checkpointed_num_entries(snap.checkpointed_delta);
-        self.persist_checkpoint_cursor(snap.checkpoint_ordinal, snap.checkpoint_offset);
-        self.index_file.sync_all()?;
+        // Holding the rows write lock blocks every append/publish, so after this
+        // point used_bytes is a true durable frontier once synced.
+        let rows_table = self.index_file.rows_table_mut();
+        let _rotation_lock = self.rotation_lock.lock();
+        let files = self.data_files.read();
+        let active_idx = self.active_file_idx.load(Ordering::Acquire);
+        let active_file = files
+            .get(&active_idx)
+            .ok_or(Error::MissingDataFile(active_idx))?;
+
+        for data_file in files.values() {
+            data_file.sync_to_current()?;
+        }
+
+        let (checkpoint_ordinal, checkpoint_offset, _, completed_before_seq) =
+            self.inflight_tracker.checkpoint_progress(active_file);
+        let drained_delta = self
+            .inflight_tracker
+            .drain_completed_before(completed_before_seq);
+        self.fold_checkpointed_num_entries(drained_delta);
+
+        drop(files);
+        self.index_file.sync_rows(rows_table)?;
+
+        let previous_generation = self.index_file.checkpoint_generation();
+        let previous_cursor = self.index_file.checkpoint_cursor();
+        self.persist_checkpoint_cursor(checkpoint_ordinal, checkpoint_offset)?;
+        if let Err(err) = self.index_file.sync_header() {
+            self.index_file.restore_checkpoint_cache(
+                previous_generation,
+                previous_cursor.0,
+                previous_cursor.1,
+            );
+            return Err(err);
+        }
         sync_dir(&self.base_path)
     }
 
@@ -646,7 +669,11 @@ impl StoreInner {
                 }
             }
 
-            let ordinal = self.active_file_ordinal.fetch_add(1, Ordering::Relaxed) + 1;
+            let ordinal = self
+                .active_file_ordinal
+                .load(Ordering::Relaxed)
+                .checked_add(1)
+                .ok_or(Error::PersistentSequenceExhausted("data-file ordinal"))?;
             let data_file = Arc::new(DataFile::create(
                 self.base_path.as_path(),
                 self.config.clone(),
@@ -657,6 +684,7 @@ impl StoreInner {
             active_file.seal_for_rotation();
 
             self.data_files.write().insert(next_idx, data_file);
+            self.active_file_ordinal.store(ordinal, Ordering::Release);
             self.active_file_idx.store(next_idx, Ordering::Release);
 
             if active_ordinal != 0
@@ -1411,10 +1439,10 @@ impl CandyStore {
         };
         let waste_bytes = self.inner.index_file.total_waste();
         let s = &self.inner.stats;
+        let uncheckpointed_bytes = self.inner.approx_uncheckpointed_bytes();
         let checkpoint_state = self.inner.checkpoint_state.lock();
         let checkpoint_generation = self.inner.index_file.checkpoint_generation();
         let checkpoint_epoch = checkpoint_state.completed_epoch;
-        let uncheckpointed_bytes = self.inner.approx_uncheckpointed_bytes();
         let last_checkpoint_dur = Duration::from_millis(checkpoint_state.last_checkpoint_dur_ms);
 
         Stats {
@@ -1585,7 +1613,7 @@ mod tests {
             .get(&active_idx)
             .expect("active data file should exist")
             .file_ordinal;
-        db.inner.persist_checkpoint_cursor(active_ordinal, 0);
+        db.inner.persist_checkpoint_cursor(active_ordinal, 0)?;
 
         {
             let mut checkpoint_state = db.inner.checkpoint_state.lock();

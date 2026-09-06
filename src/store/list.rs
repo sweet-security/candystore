@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use std::{hash::Hasher, ops::Range};
 
 use crate::{
-    internal::{KeyNamespace, RangeMetadata, aligned_data_entry_size},
+    internal::{KeyNamespace, RangeMetadata, aligned_data_entry_size, invalid_data_error},
     store::CandyStore,
     types::{
         Error, GetOrCreateStatus, ListCompactionParams, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE,
@@ -33,6 +33,7 @@ pub struct ListIterator<'a> {
     store: &'a CandyStore,
     list: Vec<u8>,
     ns: ListNamespaces,
+    initial_error: Option<Error>,
     next_idx: u64,
     end_idx: u64,
     initial_next_idx: u64,
@@ -69,6 +70,9 @@ impl Iterator for ListIterator<'_> {
     type Item = Result<KVPair>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(err) = self.initial_error.take() {
+            return Some(Err(err));
+        }
         while self.next_idx <= self.end_idx {
             let idx = self.next_idx;
             self.next_idx += 1;
@@ -101,6 +105,9 @@ impl Iterator for ListIterator<'_> {
 
 impl DoubleEndedIterator for ListIterator<'_> {
     fn next_back(&mut self) -> Option<<Self as Iterator>::Item> {
+        if let Some(err) = self.initial_error.take() {
+            return Some(Err(err));
+        }
         while self.next_idx <= self.end_idx {
             let idx = self.end_idx;
             if self.end_idx == 0 {
@@ -296,37 +303,65 @@ impl CandyStore {
         list_key: &[u8],
         mut func: impl FnMut(&[u8], &[u8]) -> Result<bool>,
     ) -> Result<()> {
-        let _lock = self.list_write_guard(ns.meta, list_key);
-        let mut meta = get_list_meta(self, ns, list_key)?;
-        if meta.count == 0 {
-            return Ok(());
+        let (original_meta, items, stale_indexes) = {
+            let _lock = self.list_write_guard(ns.meta, list_key);
+            let meta = get_list_meta(self, ns, list_key)?;
+            if meta.count == 0 {
+                return Ok(());
+            }
+
+            let mut items = Vec::with_capacity(meta.count as usize);
+            let mut stale_indexes = Vec::new();
+            for idx in meta.head..=meta.tail {
+                let idx_key = make_list_index_key(list_key, idx);
+                let Some(key) = self.get_ns(ns.index, &idx_key)? else {
+                    continue;
+                };
+                let data_key = make_list_data_key(list_key, &key);
+                let Some(value_with_idx) = self.get_ns(ns.data, &data_key)? else {
+                    stale_indexes.push(idx);
+                    continue;
+                };
+                let value = strip_idx_suffix(value_with_idx.clone());
+                items.push((idx, key, value_with_idx, value));
+            }
+            (meta, items, stale_indexes)
+        };
+
+        let mut retain = Vec::with_capacity(items.len());
+        for (_, key, _, value) in &items {
+            retain.push(func(key, value)?);
         }
 
-        let original_head = meta.head;
+        let _lock = self.list_write_guard(ns.meta, list_key);
+        if get_list_meta(self, ns, list_key)? != original_meta {
+            return Err(Error::ConcurrentModification);
+        }
+        for (idx, key, value_with_idx, _) in &items {
+            let idx_key = make_list_index_key(list_key, *idx);
+            let data_key = make_list_data_key(list_key, key);
+            if self.get_ns(ns.index, &idx_key)?.as_deref() != Some(key)
+                || self.get_ns(ns.data, &data_key)?.as_deref() != Some(value_with_idx)
+            {
+                return Err(Error::ConcurrentModification);
+            }
+        }
+
+        for idx in stale_indexes {
+            let idx_key = make_list_index_key(list_key, idx);
+            self.remove_ns(ns.index, &idx_key)?;
+        }
+
+        let mut meta = original_meta;
         let original_tail = meta.tail;
         let mut new_tail = meta.tail;
         let mut retained_count = 0u64;
-
-        for idx in original_head..=original_tail {
+        for ((idx, key, _, value), retain) in items.into_iter().zip(retain) {
             let idx_key = make_list_index_key(list_key, idx);
-            let key = match self.get_ns(ns.index, &idx_key)? {
-                Some(key) => key,
-                None => continue,
-            };
-
             let data_key = make_list_data_key(list_key, &key);
-            let val_with_idx = match self.get_ns(ns.data, &data_key)? {
-                Some(value) => value,
-                None => {
-                    self.remove_ns(ns.index, &idx_key)?;
-                    continue;
-                }
-            };
-            let value = strip_idx_suffix(val_with_idx);
-
             self.remove_ns(ns.index, &idx_key)?;
 
-            if func(&key, &value)? {
+            if retain {
                 new_tail += 1;
                 let new_value = append_idx_suffix(&value, new_tail);
                 self.set_ns(ns.data, &data_key, &new_value)?;
@@ -749,11 +784,15 @@ impl CandyStore {
         ns: ListNamespaces,
         list: &[u8],
     ) -> ListIterator<'a> {
-        let meta = get_list_meta(self, ns, list).unwrap_or_else(|_| ListMetadata::new());
+        let (meta, initial_error) = match get_list_meta(self, ns, list) {
+            Ok(meta) => (meta, None),
+            Err(err) => (ListMetadata::new(), Some(err)),
+        };
         ListIterator {
             store: self,
             list: list.to_vec(),
             ns,
+            initial_error,
             next_idx: meta.head,
             end_idx: meta.tail,
             initial_next_idx: meta.head,
@@ -778,6 +817,8 @@ impl CandyStore {
     }
 
     fn validate_list_item_sizes(&self, list: &[u8], key: &[u8], value: &[u8]) -> Result<()> {
+        validate_internal_entry(self, list.len(), size_of::<u64>() * 3)?;
+
         let data_key_len = make_list_data_key(list, key).len();
         let data_value_len = value.len() + size_of::<u64>();
         validate_internal_entry(self, data_key_len, data_value_len)?;
@@ -799,10 +840,9 @@ fn validate_internal_entry(store: &CandyStore, key_len: usize, value_len: usize)
 }
 
 fn get_list_meta(store: &CandyStore, ns: ListNamespaces, list: &[u8]) -> Result<ListMetadata> {
-    if let Some(value) = store.get_ns(ns.meta, list)?
-        && let Some(meta) = ListMetadata::from_bytes(&value)
-    {
-        return Ok(meta);
+    if let Some(value) = store.get_ns(ns.meta, list)? {
+        return ListMetadata::from_bytes(&value)
+            .ok_or_else(|| invalid_data_error("invalid list metadata"));
     }
     Ok(ListMetadata::new())
 }
@@ -859,4 +899,29 @@ fn extract_idx_suffix(value: &[u8]) -> u64 {
         return 0;
     }
     u64::from_le_bytes(value[n - size_of::<u64>()..n].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::Config;
+
+    #[test]
+    fn list_iterator_surfaces_invalid_metadata() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), Config::default())?;
+        db.set_ns(KeyNamespace::ListMeta, b"broken-list", b"bad")?;
+
+        let err = db
+            .iter_list(b"broken-list")
+            .next()
+            .expect("invalid metadata should produce an iterator item")
+            .expect_err("invalid metadata should be reported");
+        assert!(matches!(
+            err,
+            Error::IOError(ref io_err) if io_err.kind() == std::io::ErrorKind::InvalidData
+        ));
+        Ok(())
+    }
 }

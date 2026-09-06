@@ -165,7 +165,7 @@ fn write_commit_cursor_for_ordinal(
     let generation = next_checkpoint_generation(&mut file)?;
     let checksum = candystore::internal::checkpoint_slot_checksum(generation, ordinal, offset);
     let slot_offset =
-        INDEX_CHECKPOINT_SLOT_0_OFFSET + (generation as u64 % 2) * INDEX_CHECKPOINT_SLOT_STRIDE;
+        INDEX_CHECKPOINT_SLOT_0_OFFSET + (generation % 2) * INDEX_CHECKPOINT_SLOT_STRIDE;
 
     file.seek(SeekFrom::Start(slot_offset))
         .map_err(Error::IOError)?;
@@ -1223,6 +1223,76 @@ fn test_checkpoint_advances_recovery_cursor() -> Result<(), Error> {
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_num_items_survives_unclean_shutdown_without_checkpoint() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), "v")?;
+        }
+        assert_eq!(db.num_items(), 100);
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.iter_items().count(), 100);
+    assert_eq!(db.num_items(), 100);
+    assert_eq!(db.stats().num_items, 100);
+    Ok(())
+}
+
+#[test]
+fn test_num_items_survives_unclean_shutdown_after_mixed_mutations() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    // No rotation, so no rotation-triggered checkpoints can mask the drift.
+    let config = Config {
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for i in 0..100 {
+            db.set(format!("key{i:04}"), "v")?;
+        }
+        db.checkpoint()?;
+        for i in 100..150 {
+            db.set(format!("key{i:04}"), "v")?;
+        }
+        for i in 0..50 {
+            db.set(format!("key{i:04}"), "updated")?;
+        }
+        for i in 0..20 {
+            db.remove(format!("key{i:04}"))?;
+        }
+        assert_eq!(db.num_items(), 130);
+        db._abort_for_testing();
+    }
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.iter_items().count(), 130);
+    assert_eq!(db.num_items(), 130);
+
+    // The recounted total must keep tracking further mutations.
+    db.set("after-recovery", "v")?;
+    db.remove("key0020")?;
+    assert_eq!(db.num_items(), 130);
+    drop(db);
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.num_items(), 130);
     Ok(())
 }
 

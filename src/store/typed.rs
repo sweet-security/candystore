@@ -124,11 +124,11 @@ where
         }
     }
 
-    fn make_key<Q: ?Sized + Serialize>(key: &Q) -> InlineBytes
+    fn make_key<Q: ?Sized + Serialize>(key: &Q) -> Result<InlineBytes>
     where
         K: Borrow<Q>,
     {
-        append_type_id(encode_to_smallvec(key), K::TYPE_ID)
+        Ok(append_type_id(encode_to_smallvec(key)?, K::TYPE_ID))
     }
 
     /// Returns the decoded value for `key`, if present.
@@ -136,7 +136,7 @@ where
     where
         K: Borrow<Q>,
     {
-        let key_bytes = Self::make_key(key);
+        let key_bytes = Self::make_key(key)?;
         self.store
             .get_ns(KeyNamespace::Typed, &key_bytes)?
             .map(|bytes| decode_from_bytes::<V>(&bytes))
@@ -153,8 +153,8 @@ where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let key_bytes = Self::make_key(key);
-        let value_bytes = encode_to_smallvec(val);
+        let key_bytes = Self::make_key(key)?;
+        let value_bytes = encode_to_smallvec(val)?;
         self.store
             .set_ns(KeyNamespace::Typed, &key_bytes, &value_bytes)?
             .map(|prev| decode_from_bytes::<V>(&prev))
@@ -166,7 +166,7 @@ where
     where
         K: Borrow<Q>,
     {
-        let key_bytes = Self::make_key(key);
+        let key_bytes = Self::make_key(key)?;
         self.store
             .remove_ns(KeyNamespace::Typed, &key_bytes)?
             .map(|prev| decode_from_bytes::<V>(&prev))
@@ -178,7 +178,7 @@ where
     where
         K: Borrow<Q>,
     {
-        let key_bytes = Self::make_key(key);
+        let key_bytes = Self::make_key(key)?;
         self.store
             .get_ns(KeyNamespace::Typed, &key_bytes)
             .map(|value| value.is_some())
@@ -194,8 +194,8 @@ where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let key_bytes = Self::make_key(key);
-        let value_bytes = encode_to_smallvec(val);
+        let key_bytes = Self::make_key(key)?;
+        let value_bytes = encode_to_smallvec(val)?;
         let status = self
             .store
             .get_or_create_ns(KeyNamespace::Typed, &key_bytes, &value_bytes)?;
@@ -216,9 +216,9 @@ where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let key_bytes = Self::make_key(key);
-        let value_bytes = encode_to_smallvec(val);
-        let expected_bytes = expected_val.map(encode_to_smallvec);
+        let key_bytes = Self::make_key(key)?;
+        let value_bytes = encode_to_smallvec(val)?;
+        let expected_bytes = expected_val.map(encode_to_smallvec).transpose()?;
         match self.store.replace_ns(
             KeyNamespace::Typed,
             &key_bytes,
@@ -240,8 +240,8 @@ where
         K: Borrow<Q1>,
         V: Borrow<Q2>,
     {
-        let key_bytes = Self::make_key(key);
-        let value_bytes = encode_to_smallvec(val);
+        let key_bytes = Self::make_key(key)?;
+        let value_bytes = encode_to_smallvec(val)?;
         self.store.queue_set_big_with_ns(
             super::queue::QueueNamespaces {
                 meta: TYPED_BIG_NS.meta,
@@ -257,7 +257,7 @@ where
     where
         K: Borrow<Q>,
     {
-        let key_bytes = Self::make_key(key);
+        let key_bytes = Self::make_key(key)?;
         self.store
             .queue_get_big_with_ns(
                 super::queue::QueueNamespaces {
@@ -275,7 +275,7 @@ where
     where
         K: Borrow<Q>,
     {
-        let key_bytes = Self::make_key(key);
+        let key_bytes = Self::make_key(key)?;
         self.store.queue_discard_with_ns(
             super::queue::QueueNamespaces {
                 meta: TYPED_BIG_NS.meta,
@@ -299,11 +299,11 @@ where
         }
     }
 
-    fn make_queue_key<Q: ?Sized + Serialize>(queue_key: &Q) -> InlineBytes
+    fn make_queue_key<Q: ?Sized + Serialize>(queue_key: &Q) -> Result<InlineBytes>
     where
         L: Borrow<Q>,
     {
-        append_type_id(encode_to_smallvec(queue_key), L::TYPE_ID)
+        Ok(append_type_id(encode_to_smallvec(queue_key)?, L::TYPE_ID))
     }
 
     /// Pushes `val` to the tail of `queue_key`.
@@ -316,8 +316,8 @@ where
         L: Borrow<Q>,
         V: Borrow<QV>,
     {
-        let qkey = Self::make_queue_key(queue_key);
-        let vbytes = encode_to_smallvec(val);
+        let qkey = Self::make_queue_key(queue_key)?;
+        let vbytes = encode_to_smallvec(val)?;
         self.store
             .queue_push_tail_with_ns(TYPED_QUEUE_NS, &qkey, &vbytes)
             .map(|_| ())
@@ -333,8 +333,8 @@ where
         L: Borrow<Q>,
         V: Borrow<QV>,
     {
-        let qkey = Self::make_queue_key(queue_key);
-        let vbytes = encode_to_smallvec(val);
+        let qkey = Self::make_queue_key(queue_key)?;
+        let vbytes = encode_to_smallvec(val)?;
         self.store
             .queue_push_head_with_ns(TYPED_QUEUE_NS, &qkey, &vbytes)
             .map(|_| ())
@@ -348,7 +348,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         match self.store.queue_pop_head_with_ns(TYPED_QUEUE_NS, &qkey)? {
             Some((idx, value)) => {
                 decode_from_bytes::<V>(&value).map(|value| Some((idx as usize, value)))
@@ -373,7 +373,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         match self.store.queue_pop_tail_with_ns(TYPED_QUEUE_NS, &qkey)? {
             Some((idx, value)) => {
                 decode_from_bytes::<V>(&value).map(|value| Some((idx as usize, value)))
@@ -398,7 +398,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         match self.store.queue_peek_head_with_ns(TYPED_QUEUE_NS, &qkey)? {
             Some((idx, value)) => {
                 decode_from_bytes::<V>(&value).map(|value| Some((idx as usize, value)))
@@ -423,7 +423,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         match self.store.queue_peek_tail_with_ns(TYPED_QUEUE_NS, &qkey)? {
             Some((idx, value)) => {
                 decode_from_bytes::<V>(&value).map(|value| Some((idx as usize, value)))
@@ -445,7 +445,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         self.store
             .queue_len_with_ns(TYPED_QUEUE_NS, &qkey)
             .map(|len| len as usize)
@@ -456,7 +456,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         self.store.queue_range_with_ns(TYPED_QUEUE_NS, &qkey)
     }
 
@@ -465,7 +465,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         self.store
             .queue_len_with_ns(TYPED_QUEUE_NS, &qkey)
             .map(|len| len == 0)
@@ -476,7 +476,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
+        let qkey = Self::make_queue_key(queue_key)?;
         self.store.queue_discard_with_ns(TYPED_QUEUE_NS, &qkey)
     }
 
@@ -488,14 +488,21 @@ where
     where
         L: Borrow<Q>,
     {
-        let qkey = Self::make_queue_key(queue_key);
-        self.store
-            .queue_iter_with_ns(TYPED_QUEUE_NS, &qkey)
-            .map(|res| {
-                res.and_then(|(idx, value)| {
-                    decode_from_bytes::<V>(&value).map(|value| (idx, value))
-                })
-            })
+        let (qkey, initial_error) = match Self::make_queue_key(queue_key) {
+            Ok(qkey) => (qkey, None),
+            Err(err) => (InlineBytes::new(), Some(err)),
+        };
+        let emit_items = initial_error.is_none();
+        initial_error.into_iter().map(Err).chain(
+            self.store
+                .queue_iter_with_ns(TYPED_QUEUE_NS, &qkey)
+                .filter_map(move |result| emit_items.then_some(result))
+                .map(|res| {
+                    res.and_then(|(idx, value)| {
+                        decode_from_bytes::<V>(&value).map(|value| (idx, value))
+                    })
+                }),
+        )
     }
 }
 
@@ -513,14 +520,14 @@ where
         }
     }
 
-    fn make_list_key<Q: ?Sized + Serialize>(list_key: &Q) -> InlineBytes
+    fn make_list_key<Q: ?Sized + Serialize>(list_key: &Q) -> Result<InlineBytes>
     where
         L: Borrow<Q>,
     {
-        append_type_id(encode_to_smallvec(list_key), L::TYPE_ID)
+        Ok(append_type_id(encode_to_smallvec(list_key)?, L::TYPE_ID))
     }
 
-    fn make_item_key<Q: ?Sized + Serialize>(item_key: &Q) -> InlineBytes
+    fn make_item_key<Q: ?Sized + Serialize>(item_key: &Q) -> Result<InlineBytes>
     where
         K: Borrow<Q>,
     {
@@ -552,9 +559,9 @@ where
         K: Borrow<Q2>,
         V: Borrow<Q3>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
-        let vbytes = encode_to_smallvec(val);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
+        let vbytes = encode_to_smallvec(val)?;
         self.store
             .list_set_at_tail_with_ns(TYPED_LIST_NS, &lkey, &ikey, &vbytes)?
             .map(|prev| decode_from_bytes::<V>(&prev))
@@ -572,9 +579,9 @@ where
         L: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
-        let vbytes = encode_to_smallvec(default_val);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
+        let vbytes = encode_to_smallvec(default_val)?;
         match self
             .store
             .list_get_or_create_with_ns(TYPED_LIST_NS, &lkey, &ikey, &vbytes)?
@@ -602,10 +609,10 @@ where
         K: Borrow<Q2>,
         V: Borrow<Q3>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
-        let vbytes = encode_to_smallvec(val);
-        let expected_bytes = expected_val.map(encode_to_smallvec);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
+        let vbytes = encode_to_smallvec(val)?;
+        let expected_bytes = expected_val.map(encode_to_smallvec).transpose()?;
         match self.store.list_replace_with_ns(
             TYPED_LIST_NS,
             &lkey,
@@ -628,8 +635,8 @@ where
         L: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
         self.store
             .list_get_with_ns(TYPED_LIST_NS, &lkey, &ikey)?
             .map(|value| decode_from_bytes::<V>(&value))
@@ -646,8 +653,8 @@ where
         L: Borrow<Q1>,
         K: Borrow<Q2>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
         self.store
             .list_remove_with_ns(TYPED_LIST_NS, &lkey, &ikey)?
             .map(|value| decode_from_bytes::<V>(&value))
@@ -659,7 +666,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         self.store.list_len_with_ns(TYPED_LIST_NS, &lkey)
     }
 
@@ -668,7 +675,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         self.store.list_range_with_ns(TYPED_LIST_NS, &lkey)
     }
 
@@ -685,7 +692,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         self.store.list_discard_with_ns(TYPED_LIST_NS, &lkey)
     }
 
@@ -698,7 +705,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         self.store
             .list_compact_with_ns(TYPED_LIST_NS, &lkey, params)
     }
@@ -715,9 +722,9 @@ where
         K: Borrow<Q2>,
         V: Borrow<Q3>,
     {
-        let lkey = Self::make_list_key(list_key);
-        let ikey = Self::make_item_key(item_key);
-        let vbytes = encode_to_smallvec(value);
+        let lkey = Self::make_list_key(list_key)?;
+        let ikey = Self::make_item_key(item_key)?;
+        let vbytes = encode_to_smallvec(value)?;
         self.store
             .list_promote_with_ns(TYPED_LIST_NS, &lkey, &ikey, &vbytes)?
             .map(|prev| decode_from_bytes::<V>(&prev))
@@ -732,17 +739,24 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
-        self.store
-            .list_iter_with_ns(TYPED_LIST_NS, &lkey)
-            .map(|res| {
-                res.and_then(|(key, value)| {
-                    Ok((
-                        decode_from_bytes::<K>(&key)?,
-                        decode_from_bytes::<V>(&value)?,
-                    ))
-                })
-            })
+        let (lkey, initial_error) = match Self::make_list_key(list_key) {
+            Ok(lkey) => (lkey, None),
+            Err(err) => (InlineBytes::new(), Some(err)),
+        };
+        let emit_items = initial_error.is_none();
+        initial_error.into_iter().map(Err).chain(
+            self.store
+                .list_iter_with_ns(TYPED_LIST_NS, &lkey)
+                .filter_map(move |result| emit_items.then_some(result))
+                .map(|res| {
+                    res.and_then(|(key, value)| {
+                        Ok((
+                            decode_from_bytes::<K>(&key)?,
+                            decode_from_bytes::<V>(&value)?,
+                        ))
+                    })
+                }),
+        )
     }
 
     /// Removes and returns the tail item of `list_key`.
@@ -750,7 +764,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         match self.store.pop_list_tail_with_ns(TYPED_LIST_NS, &lkey)? {
             Some((key, value)) => Ok(Some((
                 decode_from_bytes::<K>(&key)?,
@@ -765,7 +779,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         match self.store.pop_list_head_with_ns(TYPED_LIST_NS, &lkey)? {
             Some((key, value)) => Ok(Some((
                 decode_from_bytes::<K>(&key)?,
@@ -809,7 +823,7 @@ where
     where
         L: Borrow<Q>,
     {
-        let lkey = Self::make_list_key(list_key);
+        let lkey = Self::make_list_key(list_key)?;
         self.store
             .list_retain_with_ns(TYPED_LIST_NS, &lkey, |k_bytes, v_bytes| {
                 let key = decode_from_bytes::<K>(k_bytes)?;
@@ -823,10 +837,10 @@ fn decode_from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     postcard::from_bytes(bytes).map_err(Error::PostcardError)
 }
 
-fn encode_to_smallvec<T: ?Sized + Serialize>(value: &T) -> InlineBytes {
+fn encode_to_smallvec<T: ?Sized + Serialize>(value: &T) -> Result<InlineBytes> {
     let mut buf = InlineBytes::new();
-    postcard::to_io(value, &mut buf).unwrap();
-    buf
+    postcard::to_io(value, &mut buf).map_err(Error::PostcardError)?;
+    Ok(buf)
 }
 
 fn append_type_id(mut bytes: InlineBytes, type_id: u32) -> InlineBytes {

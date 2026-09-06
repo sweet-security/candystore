@@ -17,7 +17,7 @@ use crate::internal::{
     DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION, EntryType,
     FILE_OFFSET_ALIGNMENT, KEY_NAMESPACE_BITS, KVBuf, KVRef, KeyNamespace, MAX_KEY_NAMESPACE,
     PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, data_file_path, entry_magic_offset,
-    invalid_data_error, read_available_at, read_into_at, sync_dir, sync_file_range, write_all_at,
+    invalid_data_error, read_available_at, read_into_at, sync_dir, write_all_at,
 };
 use crate::types::{Config, Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result};
 
@@ -100,10 +100,11 @@ impl InflightTracker {
         ))
     }
 
-    pub(crate) fn checkpoint_progress(&self, active_file: &DataFile) -> (u64, u64, i64) {
+    pub(crate) fn checkpoint_progress(&self, active_file: &DataFile) -> (u64, u64, i64, u64) {
         let _barrier = self.snapshot_barrier.write();
 
-        let mut min_slot: Option<(u64, u64, u64)> = None;
+        let mut checkpoint = None::<(u64, u64)>;
+        let mut earliest_active_seq = None::<u64>;
         for slot in &self.slots {
             let seq = slot.seq.load(Ordering::Acquire);
             if seq == 0 {
@@ -111,14 +112,35 @@ impl InflightTracker {
             }
             let ordinal = slot.ordinal.load(Ordering::Relaxed);
             let offset = slot.offset.load(Ordering::Relaxed);
-            let current = (seq, ordinal, offset);
-            min_slot = Some(min_slot.map_or(current, |min_current| min_current.min(current)));
+            let position = (ordinal, offset);
+            checkpoint = Some(checkpoint.map_or(position, |current| current.min(position)));
+            earliest_active_seq = Some(earliest_active_seq.map_or(seq, |current| current.min(seq)));
         }
 
-        let checkpoint = min_slot
-            .map(|(_, ordinal, offset)| (ordinal, offset))
-            .unwrap_or_else(|| (active_file.file_ordinal, active_file.used_bytes()));
-        let completed_before_seq = min_slot.map_or(u64::MAX, |(seq, _, _)| seq);
+        let checkpoint =
+            checkpoint.unwrap_or_else(|| (active_file.file_ordinal, active_file.used_bytes()));
+        let completed_before_seq = earliest_active_seq.unwrap_or(u64::MAX);
+        let mut committed_delta = 0i64;
+        for queue in &self.completed_deltas {
+            let queue = queue.lock();
+            for &(seq, delta) in queue.iter() {
+                if seq >= completed_before_seq {
+                    break;
+                }
+                committed_delta += delta;
+            }
+        }
+
+        (
+            checkpoint.0,
+            checkpoint.1,
+            committed_delta,
+            completed_before_seq,
+        )
+    }
+
+    pub(crate) fn drain_completed_before(&self, completed_before_seq: u64) -> i64 {
+        let _barrier = self.snapshot_barrier.write();
         let mut committed_delta = 0i64;
         for queue in &self.completed_deltas {
             let mut queue = queue.lock();
@@ -130,8 +152,7 @@ impl InflightTracker {
                 committed_delta += delta;
             }
         }
-
-        (checkpoint.0, checkpoint.1, committed_delta)
+        committed_delta
     }
 
     pub(crate) fn clear_all(&self) {
@@ -197,7 +218,8 @@ impl Drop for InflightGuard<'_> {
 pub(crate) struct DataFile {
     pub(crate) file: File,
     file_offset: AtomicU64,
-    last_synced_offset: AtomicU64,
+    dirty: AtomicBool,
+    sync_lock: Mutex<()>,
     sealed_for_rotation: AtomicBool,
     config: Arc<Config>,
     pub(crate) file_idx: u16,
@@ -245,35 +267,31 @@ impl DataFile {
         self.file_offset.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     pub(crate) fn recovery_tail_upper_bound(&self) -> u64 {
         self.recovery_tail_upper_bound
     }
 
-    pub(crate) fn sync_data(&self, start_offset: u64, end_offset: u64) -> Result<()> {
-        let used_bytes = self.used_bytes();
-        let start_offset = start_offset.min(used_bytes);
-        let end_offset = end_offset.min(used_bytes);
-        if end_offset <= start_offset {
-            return Ok(());
-        }
-
-        if !self.preallocated {
-            self.file.sync_data().map_err(Error::IOError)?;
-        } else {
-            sync_file_range(
-                &self.file,
-                size_of::<DataFileHeader>() as u64 + start_offset,
-                end_offset - start_offset,
-            )?;
-        }
-        self.last_synced_offset
-            .fetch_max(end_offset, Ordering::Release);
-        Ok(())
+    /// Syncs if any write completed since the last successful sync. The flag is
+    /// cleared before the fdatasync so a write landing concurrently re-dirties it.
+    pub(crate) fn sync_to_current(&self) -> Result<()> {
+        self.sync_to_current_with(|file| file.sync_data())
     }
 
-    pub(crate) fn sync_to_current(&self) -> Result<()> {
-        let start = self.last_synced_offset.load(Ordering::Acquire);
-        self.sync_data(start, self.used_bytes())
+    fn sync_to_current_with(&self, sync: impl FnOnce(&File) -> std::io::Result<()>) -> Result<()> {
+        let _sync_guard = self.sync_lock.lock();
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(err) = sync(&self.file) {
+            self.dirty.store(true, Ordering::Release);
+            return Err(Error::IOError(err));
+        }
+        Ok(())
     }
 
     pub(crate) fn truncate_to_offset(&self, file_offset: u64) -> Result<()> {
@@ -296,8 +314,7 @@ impl DataFile {
         }
         self.file_offset.store(file_offset, Ordering::Release);
         self.file.sync_all().map_err(Error::IOError)?;
-        self.last_synced_offset
-            .store(file_offset, Ordering::Release);
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -426,7 +443,8 @@ impl DataFile {
         let inst = Self {
             file,
             file_offset: AtomicU64::new(physical_data_len),
-            last_synced_offset: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            sync_lock: Mutex::new(()),
             sealed_for_rotation: AtomicBool::new(false),
             config,
             file_idx,
@@ -440,7 +458,6 @@ impl DataFile {
             recovery_tail_upper_bound
         };
         inst.file_offset.store(used_bytes, Ordering::Release);
-        inst.last_synced_offset.store(used_bytes, Ordering::Release);
 
         Ok(inst)
     }
@@ -473,7 +490,8 @@ impl DataFile {
         Ok(Self {
             file,
             file_offset: AtomicU64::new(0),
-            last_synced_offset: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            sync_lock: Mutex::new(()),
             sealed_for_rotation: AtomicBool::new(false),
             config,
             file_idx,
@@ -566,6 +584,8 @@ impl DataFile {
             size_of::<DataFileHeader>() as u64 + file_offset,
         )
         .map_err(Error::IOError);
+        // Set after the pwrite (even a failed one) so no sync can miss these pages.
+        self.dirty.store(true, Ordering::Release);
         res?;
 
         Ok((file_offset, aligned_len, inflight_guard))
@@ -800,5 +820,157 @@ impl DataFile {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use crate::types::INITIAL_DATA_FILE_ORDINAL;
+
+    #[test]
+    fn concurrent_sync_waits_for_in_progress_sync() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let data_file = Arc::new(DataFile::create(
+            dir.path(),
+            Arc::new(Config::default()),
+            0,
+            INITIAL_DATA_FILE_ORDINAL,
+        )?);
+        data_file.dirty.store(true, Ordering::Release);
+
+        let (sync_started_tx, sync_started_rx) = mpsc::channel();
+        let (release_sync_tx, release_sync_rx) = mpsc::channel();
+        let first_file = Arc::clone(&data_file);
+        let first = thread::spawn(move || {
+            first_file.sync_to_current_with(|_| {
+                sync_started_tx.send(()).unwrap();
+                release_sync_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        sync_started_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_file = Arc::clone(&data_file);
+        let second = thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let result = second_file
+                .sync_to_current_with(|_| panic!("clean file should not be synced twice"));
+            second_done_tx.send(()).unwrap();
+            result
+        });
+
+        second_started_rx.recv().unwrap();
+        assert!(
+            second_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a concurrent caller returned before the active sync completed"
+        );
+        release_sync_tx.send(()).unwrap();
+        first.join().unwrap()?;
+        second.join().unwrap()?;
+        second_done_rx.recv().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn write_after_sync_redirties_file() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let data_file = DataFile::create(
+            dir.path(),
+            Arc::new(Config::default()),
+            0,
+            INITIAL_DATA_FILE_ORDINAL,
+        )?;
+        let tracker = InflightTracker::new(1);
+        assert!(!data_file.is_dirty());
+
+        let (_, _, guard) = data_file.append_kv(
+            EntryType::Insert,
+            KeyNamespace::User,
+            b"k",
+            b"v",
+            0,
+            &tracker,
+        )?;
+        guard.complete();
+        assert!(data_file.is_dirty());
+
+        data_file.sync_to_current()?;
+        assert!(!data_file.is_dirty());
+
+        // A write that lands after a sync must not be masked by any offset watermark.
+        let (_, _, guard) = data_file.append_kv(
+            EntryType::Insert,
+            KeyNamespace::User,
+            b"k2",
+            b"v",
+            0,
+            &tracker,
+        )?;
+        guard.complete();
+        assert!(data_file.is_dirty());
+        data_file.sync_to_current()?;
+        assert!(!data_file.is_dirty());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_progress_uses_earliest_file_position() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let data_file = DataFile::create(
+            dir.path(),
+            Arc::new(Config::default()),
+            0,
+            INITIAL_DATA_FILE_ORDINAL,
+        )?;
+        let tracker = InflightTracker::new(2);
+
+        tracker.slots[0]
+            .ordinal
+            .store(INITIAL_DATA_FILE_ORDINAL, Ordering::Relaxed);
+        tracker.slots[0].offset.store(128, Ordering::Relaxed);
+        tracker.slots[0].seq.store(1, Ordering::Release);
+
+        tracker.slots[1]
+            .ordinal
+            .store(INITIAL_DATA_FILE_ORDINAL, Ordering::Relaxed);
+        tracker.slots[1].offset.store(64, Ordering::Relaxed);
+        tracker.slots[1].seq.store(2, Ordering::Release);
+
+        assert_eq!(
+            tracker.checkpoint_progress(&data_file),
+            (INITIAL_DATA_FILE_ORDINAL, 64, 0, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_progress_does_not_drain_completed_deltas() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let data_file = DataFile::create(
+            dir.path(),
+            Arc::new(Config::default()),
+            0,
+            INITIAL_DATA_FILE_ORDINAL,
+        )?;
+        let tracker = InflightTracker::new(1);
+        tracker.completed_deltas[0].lock().push_back((1, 1));
+        tracker.completed_deltas[0].lock().push_back((2, -1));
+
+        assert_eq!(
+            tracker.checkpoint_progress(&data_file),
+            (INITIAL_DATA_FILE_ORDINAL, 0, 0, u64::MAX)
+        );
+        assert_eq!(tracker.completed_deltas[0].lock().len(), 2);
+        assert_eq!(tracker.drain_completed_before(u64::MAX), 0);
+        assert!(tracker.completed_deltas[0].lock().is_empty());
+        Ok(())
     }
 }

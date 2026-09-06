@@ -1,7 +1,22 @@
 use std::sync::Arc;
 
-use candystore::{CandyStore, CandyTypedStore, Config, MAX_USER_VALUE_SIZE, Result};
+use candystore::{CandyStore, CandyTypedStore, Config, Error, MAX_USER_VALUE_SIZE, Result};
+use serde::{Deserialize, Serialize, Serializer};
 use tempfile::TempDir;
+
+#[derive(Deserialize)]
+struct FailingSerialize;
+
+impl Serialize for FailingSerialize {
+    fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Err(serde::ser::Error::custom(
+            "intentional serialization failure",
+        ))
+    }
+}
 
 #[test]
 fn test_typed_kv_store() -> Result<()> {
@@ -72,5 +87,18 @@ fn test_typed_big_value_round_trip() -> Result<()> {
     assert!(kv.get_big(&key)?.is_none());
     assert!(!kv.remove_big(&key)?);
 
+    Ok(())
+}
+
+#[test]
+fn test_typed_serialization_error_is_returned() -> Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let store = Arc::new(CandyStore::open(temp_dir.path(), Config::default())?);
+    let kv = CandyTypedStore::<u32, FailingSerialize>::new(store);
+
+    assert!(matches!(
+        kv.set(&1u32, &FailingSerialize),
+        Err(Error::PostcardError(_))
+    ));
     Ok(())
 }

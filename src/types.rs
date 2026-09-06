@@ -64,6 +64,7 @@ impl Default for Config {
 }
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 /// Errors returned by store operations and open/recovery flows.
 pub enum Error {
     #[error("IO error: {0}")]
@@ -95,6 +96,12 @@ pub enum Error {
 
     #[error("Postcard error: {0}")]
     PostcardError(postcard::Error),
+
+    #[error("Collection changed during operation")]
+    ConcurrentModification,
+
+    #[error("Persistent {0} exhausted")]
+    PersistentSequenceExhausted(&'static str),
 }
 
 /// Convenience result type used by the crate.

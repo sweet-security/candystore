@@ -67,7 +67,10 @@ impl CandyStore {
             final_cursor = (data_file.file_ordinal, durable_extent);
         }
 
-        self.persist_rebuild_checkpoint(final_cursor.0, final_cursor.1, pending_committed_delta)?;
+        // The header count and the rows mmap are flushed independently, so after
+        // a crash they can disagree; the rebuilt rows are the only source of truth.
+        self.reset_live_count_from_rows();
+        self.persist_rebuild_checkpoint(final_cursor.0, final_cursor.1, 0)?;
         debug_assert_eq!(
             self.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
             0
@@ -113,12 +116,9 @@ impl CandyStore {
         let mut read_buf = Vec::new();
         let mut buf_file_offset = 0u64;
         let mut last_durable_offset = start_offset;
-        loop {
-            let Some((kv, entry_offset, next_offset)) =
-                data_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
-            else {
-                break;
-            };
+        while let Some((kv, entry_offset, next_offset)) =
+            data_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
+        {
             let entry_bytes = next_offset - offset;
             offset = next_offset;
 
@@ -201,9 +201,46 @@ impl CandyStore {
         let resume_offset = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
         self.inner.fold_checkpointed_num_entries(delta);
-        self.inner.persist_checkpoint_cursor(ordinal, resume_offset);
+        self.inner
+            .persist_checkpoint_cursor(ordinal, resume_offset)?;
 
         self.inner.index_file.sync_all()
+    }
+
+    /// Counts pointers that are live (published row, matching selector bits,
+    /// backing file present) and makes that the authoritative entry count.
+    fn reset_live_count_from_rows(&self) {
+        let files = self.inner.data_files.read();
+        let row_table = self.inner.index_file.rows_table();
+        let num_rows = self.inner.index_file.num_rows();
+        let mut live = 0u64;
+
+        for row_idx in 0..num_rows {
+            let row = row_table.row(row_idx);
+            let sl = row.split_level.load(Ordering::Acquire);
+            if sl == 0 {
+                continue;
+            }
+            for col in 0..ROW_WIDTH {
+                let ptr = row.pointers[col];
+                if row.signatures[col] != HashCoord::INVALID_SIG
+                    && ptr.is_valid()
+                    && row.entry_belongs_to_row(col, row_idx, sl)
+                    && files.contains_key(&ptr.file_idx())
+                {
+                    live += 1;
+                }
+            }
+        }
+
+        self.inner
+            .index_file
+            .header_ref()
+            .committed_num_entries
+            .store(live, Ordering::Relaxed);
+        self.inner
+            .uncommitted_entries_delta
+            .store(0, Ordering::Relaxed);
     }
 
     /// Remove index entries pointing to the active file at or beyond `durable_extent`.

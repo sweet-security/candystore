@@ -1,5 +1,6 @@
 use candystore::{
-    CandyStore, Config, GetOrCreateStatus, ListCompactionParams, ReplaceStatus, SetStatus,
+    CandyStore, Config, Error, GetOrCreateStatus, ListCompactionParams, MAX_KEY_LEN, ReplaceStatus,
+    SetStatus,
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -275,6 +276,81 @@ fn test_list_pop_peek_and_retain() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn test_list_retain_error_does_not_mutate_list() {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default()).unwrap();
+    let list = b"retain-error";
+    db.set_in_list(list, b"a", b"1").unwrap();
+    db.set_in_list(list, b"b", b"2").unwrap();
+
+    let result = db.retain_in_list(list, |key, _| {
+        if key == b"b" {
+            Err(Error::IOError(std::io::Error::other("predicate failed")))
+        } else {
+            Ok(true)
+        }
+    });
+
+    assert!(result.is_err());
+    assert_eq!(db.list_len(list).unwrap(), 2);
+    assert_eq!(
+        db.iter_list(list)
+            .collect::<candystore::Result<Vec<_>>>()
+            .unwrap(),
+        vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn test_list_retain_callback_can_reenter_store() {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default()).unwrap();
+    let list = b"retain-reentrant";
+    db.set_in_list(list, b"a", b"1").unwrap();
+
+    db.retain_in_list(list, |key, _| {
+        assert_eq!(db.get_from_list(list, key)?, Some(b"1".to_vec()));
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(db.list_len(list).unwrap(), 1);
+}
+
+#[test]
+fn test_list_retain_detects_reentrant_mutation() {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default()).unwrap();
+    let list = b"retain-mutating";
+    db.set_in_list(list, b"a", b"1").unwrap();
+
+    let result = db.retain_in_list(list, |_, _| {
+        db.set_in_list(list, b"b", b"2")?;
+        Ok(true)
+    });
+
+    assert!(matches!(result, Err(Error::ConcurrentModification)));
+    assert_eq!(db.get_from_list(list, b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get_from_list(list, b"b").unwrap(), Some(b"2".to_vec()));
+}
+
+#[test]
+fn test_oversized_list_key_does_not_partially_insert() {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default()).unwrap();
+    let list = vec![b'x'; MAX_KEY_LEN + 1];
+
+    assert!(matches!(
+        db.set_in_list(&list, b"item", b"value"),
+        Err(Error::PayloadTooLarge(_))
+    ));
+    assert_eq!(db.get_from_list(&list, b"item").unwrap(), None);
+    assert_eq!(db.list_len(&list).unwrap(), 0);
 }
 
 #[test]
