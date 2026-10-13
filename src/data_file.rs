@@ -155,6 +155,14 @@ impl InflightTracker {
         committed_delta
     }
 
+    pub(crate) fn record_index_delta(&self, shard_idx: usize, delta: i8) {
+        let _barrier = self.snapshot_barrier.read();
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.completed_deltas[shard_idx]
+            .lock()
+            .push_back((seq, i64::from(delta)));
+    }
+
     pub(crate) fn clear_all(&self) {
         let _barrier = self.snapshot_barrier.write();
         for slot in &self.slots {
@@ -198,10 +206,15 @@ pub(crate) struct InflightGuard<'a> {
 }
 
 impl InflightGuard<'_> {
-    pub(crate) fn complete(mut self) {
+    pub(crate) fn complete(self) {
+        let delta = self.delta;
+        self.complete_with_delta(delta);
+    }
+
+    pub(crate) fn complete_with_delta(mut self, delta: i8) {
         if self.armed {
             self.tracker
-                .complete_matching(self.shard_idx, self.seq, self.delta);
+                .complete_matching(self.shard_idx, self.seq, delta);
             self.armed = false;
         }
     }

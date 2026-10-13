@@ -79,6 +79,24 @@ fn test_iter_items_after_updates_and_removes() -> Result<(), Error> {
 }
 
 #[test]
+fn test_iter_items_skips_empty_rows_before_later_entries() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let db = CandyStore::open(dir.path(), Config::default())?;
+
+    db.set("alpha", "one")?;
+    db.set("bravo", "two")?;
+    db.set("charlie", "three")?;
+
+    let items: HashMap<Vec<u8>, Vec<u8>> = db.iter_items().collect::<Result<_, _>>()?;
+    assert_eq!(items.len(), 3);
+    assert_eq!(items.get(b"alpha".as_slice()), Some(&b"one".to_vec()));
+    assert_eq!(items.get(b"bravo".as_slice()), Some(&b"two".to_vec()));
+    assert_eq!(items.get(b"charlie".as_slice()), Some(&b"three".to_vec()));
+
+    Ok(())
+}
+
+#[test]
 fn test_iter_items_with_splits_and_rotation() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let db = CandyStore::open(dir.path(), common::small_file_config())?;

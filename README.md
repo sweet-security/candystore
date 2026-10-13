@@ -1,6 +1,9 @@
 <div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=main"></div>
 
 > [!NOTE]
+> v1.2 adds corrupt-entry cleanup and failure-tolerant compaction, and fixes concurrency bugs;
+> file format is unchanged.
+>
 > v1.1 fixes durability issues in checkpointing (data files are now `fdatasync`ed) and some (very
 > rare) concurrency issues; file format is unchanged.
 >

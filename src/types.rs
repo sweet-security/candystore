@@ -38,6 +38,8 @@ pub struct Config {
     pub reset_on_invalid_data: bool,
     /// Target background compaction throughput in bytes per second.
     pub compaction_throughput_bytes_per_sec: usize,
+    /// Compaction passes that may fail reading the same data-file entry before that entry is dropped (lost) so its file can be reclaimed.
+    pub compaction_max_read_failures: u32,
     /// perform a checkpoint (for crash-consistency) every this much time (`None` to disable)
     pub checkpoint_interval: Option<Duration>,
     /// perform a checkpoint (for crash-consistency) every this many bytes written (`None` to disable)
@@ -57,6 +59,7 @@ impl Default for Config {
             port_to_current_format: true,
             reset_on_invalid_data: false,
             compaction_throughput_bytes_per_sec: 4 * 1024 * 1024,
+            compaction_max_read_failures: 3,
             checkpoint_interval: Some(Duration::from_secs(5)),
             checkpoint_delta_bytes: Some(128 * 1024),
         }
@@ -270,6 +273,8 @@ pub struct Stats {
     pub num_rebuilt_entries: u64,
     /// Number of trailing data-file bytes discarded during the most recent recovery rebuild.
     pub num_rebuild_purged_bytes: u64,
+    /// Number of index entries dropped since open because their data-file entry was corrupt or unreadable.
+    pub num_corrupt_entries_dropped: u64,
 
     /// Total bytes currently occupied by the data files (including waste)
     pub total_bytes: u64,

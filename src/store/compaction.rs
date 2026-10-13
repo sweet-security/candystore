@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 use crate::{
     data_file::DataFile,
     index_file::EntryPointer,
-    internal::{KeyNamespace, data_file_path, invalid_data_error, sync_dir},
+    internal::{KeyNamespace, data_file_path, is_corrupt_entry_error, sync_dir},
     pacer::Pacer,
     types::{Error, Result},
 };
@@ -174,29 +174,71 @@ impl StoreInner {
         self.record_read(task.entry.size_hint() as u64);
         pacer.consume(task.entry.size_hint() as u64);
 
-        let kv = task.source_file.read_kv_into(
+        let kv = match task.source_file.read_kv_into(
             task.entry.file_offset(),
             task.entry.size_hint(),
             read_buf,
-        )?;
+        ) {
+            Ok(kv) => kv,
+            Err(err) if is_corrupt_entry_error(&err) => {
+                self.drop_corrupt_compaction_entry(&task);
+                return Ok(());
+            }
+            Err(err) => {
+                if self.read_failure_limit_reached(&task) {
+                    self.drop_corrupt_compaction_entry(&task);
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
 
         let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
-            return Err(invalid_data_error("unknown key namespace in data file"));
+            self.drop_corrupt_compaction_entry(&task);
+            return Ok(());
         };
 
         self.rewrite_compacted_entry(&task, ns, kv.key(), kv.value(), moved_bytes)
+    }
+
+    /// Counts a failed read per entry (not per file), so a disk-wide outage loses at most one entry per limit.
+    fn read_failure_limit_reached(&self, task: &CompactionEntry) -> bool {
+        let mut failures = self.compaction_read_failures.lock();
+        let count = failures
+            .entry((
+                task.source_file.file_idx,
+                task.source_file.file_ordinal,
+                task.entry.file_offset(),
+            ))
+            .or_insert(0);
+        if *count >= self.config.compaction_max_read_failures {
+            return true;
+        }
+        *count += 1;
+        false
+    }
+
+    fn drop_corrupt_compaction_entry(&self, task: &CompactionEntry) {
+        let rows = self.index_file.rows_table();
+        if task.row_idx >= self.index_file.num_rows() {
+            return;
+        }
+        let mut row = rows.row_mut(task.row_idx);
+        if row.pointers[task.col] == task.entry {
+            self.drop_corrupt_entry(&mut row, task.col);
+        }
     }
 
     pub(super) fn compact_files(
         &self,
         candidates: &[(u16, u64)],
         pacer: &mut Pacer,
-        #[cfg(windows)] pending_deletions: &mut Vec<std::path::PathBuf>,
     ) -> Result<CompactionOutcome> {
         if candidates.is_empty() {
             return Ok(Self::empty_compaction_outcome());
         }
 
+        let _compaction_guard = self.compaction_lock.lock();
         let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
         let sources = self.collect_compaction_sources(candidates, active_file_idx);
 
@@ -237,35 +279,26 @@ impl StoreInner {
         }
         self.index_file.sync_rows(rows_table)?;
 
-        let removed = {
-            let mut files = self.data_files.write();
-            sources
-                .iter()
-                .filter_map(|(file_idx, _)| {
-                    files
-                        .remove(file_idx)
-                        .map(|data_file| (*file_idx, data_file))
-                })
-                .collect::<Vec<_>>()
-        };
-        let compacted_files = removed.len() as u64;
-        drop(sources);
-
+        let mut compacted_files = 0u64;
         let mut reclaimed_bytes = 0u64;
-        for (file_idx, data_file) in removed {
-            drop(data_file);
-
-            reclaimed_bytes =
-                reclaimed_bytes.saturating_add(self.index_file.take_file_waste(file_idx) as u64);
-
+        for (file_idx, data_file) in sources {
             let file_path = data_file_path(self.base_path.as_path(), file_idx);
             match std::fs::remove_file(&file_path) {
-                Ok(()) => sync_dir(self.base_path.as_path())?,
-                #[cfg(windows)]
-                Err(_) => pending_deletions.push(file_path),
-                #[cfg(not(windows))]
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(Error::IOError(err)),
             }
+            sync_dir(self.base_path.as_path())?;
+
+            self.data_files.write().remove(&file_idx);
+            self.compaction_read_failures
+                .lock()
+                .retain(|&(idx, ordinal, _), _| {
+                    (idx, ordinal) != (file_idx, data_file.file_ordinal)
+                });
+            reclaimed_bytes =
+                reclaimed_bytes.saturating_add(self.index_file.take_file_waste(file_idx) as u64);
+            compacted_files += 1;
         }
 
         self.index_file.flush_header()?;
@@ -290,15 +323,6 @@ impl CandyStore {
         }
         if let Some(thd) = self.compaction_thd.lock().take() {
             let _ = thd.join();
-        }
-    }
-
-    #[cfg(windows)]
-    fn retry_pending_deletions(ctx: &StoreInner, pending: &mut Vec<std::path::PathBuf>) {
-        let before = pending.len();
-        pending.retain(|path| std::fs::remove_file(path).is_err());
-        if pending.len() < before {
-            let _ = sync_dir(ctx.base_path.as_path());
         }
     }
 
@@ -334,8 +358,6 @@ impl CandyStore {
                     burst_size,
                 );
 
-                #[cfg(windows)]
-                let mut pending_deletions = Vec::<std::path::PathBuf>::new();
                 loop {
                     {
                         let mut state = ctx.compaction_state.lock();
@@ -359,15 +381,8 @@ impl CandyStore {
                         if ctx.compaction_shutting_down.load(Ordering::Acquire) {
                             return;
                         }
-                        #[cfg(windows)]
-                        Self::retry_pending_deletions(&ctx, &mut pending_deletions);
                         let t0 = std::time::Instant::now();
-                        let res = ctx.compact_files(
-                            &candidates,
-                            &mut pacer,
-                            #[cfg(windows)]
-                            &mut pending_deletions,
-                        );
+                        let res = ctx.compact_files(&candidates, &mut pacer);
                         let compaction_millis =
                             u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
                         match res {
@@ -387,11 +402,11 @@ impl CandyStore {
                             }
                             Err(_e) => {
                                 ctx.stats.compaction_errors.fetch_add(1, Ordering::Relaxed);
+                                // retrying immediately would just spin; wait for the next wake-up
+                                break;
                             }
                         }
                     }
-                    #[cfg(windows)]
-                    Self::retry_pending_deletions(&ctx, &mut pending_deletions);
                 }
             })
             .unwrap();
@@ -522,6 +537,168 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_drops_corrupt_entries() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 8192,
+                compaction_min_threshold: u32::MAX,
+                ..Default::default()
+            },
+        )?;
+        db.stop_compaction();
+
+        let mut num_keys = 0u32;
+        while db.inner.data_files.read().len() == 1 {
+            db.set(format!("key-{num_keys}"), format!("value-{num_keys}"))?;
+            num_keys += 1;
+        }
+
+        let victim = crate::store::tests::corrupt_entry(&db, b"key-0");
+        let target_idx = victim.file_idx();
+        assert_ne!(target_idx, db.inner.active_file_idx.load(Ordering::Acquire));
+        let target_ordinal = db.inner.data_files.read()[&target_idx].file_ordinal;
+        let items_before = db.num_items();
+
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        let outcome = db
+            .inner
+            .compact_files(&[(target_idx, target_ordinal)], &mut pacer)?;
+
+        assert_eq!(outcome.compacted_files, 1);
+        assert!(!db.inner.data_files.read().contains_key(&target_idx));
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+        assert_eq!(db.num_items(), items_before - 1);
+        assert_eq!(db.get("key-0")?, None);
+        for idx in 1..num_keys {
+            assert_eq!(
+                db.get(format!("key-{idx}"))?,
+                Some(format!("value-{idx}").into_bytes())
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_background_compaction_reclaims_file_with_corrupt_entry() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 8192,
+                compaction_min_threshold: 0,
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                ..Default::default()
+            },
+        )?;
+
+        // no overwrites yet, so no file has waste and compaction has nothing to pick
+        let mut num_keys = 0u32;
+        while db.inner.data_files.read().len() == 1 {
+            db.set(format!("key-{num_keys}"), format!("value-{num_keys}"))?;
+            num_keys += 1;
+        }
+
+        let victim = crate::store::tests::corrupt_entry(&db, b"key-0");
+        let target_idx = victim.file_idx();
+        let target_ordinal = db.inner.data_files.read()[&target_idx].file_ordinal;
+
+        db.set("key-1", "value-1-updated")?;
+        db.checkpoint()?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while db
+            .inner
+            .data_files
+            .read()
+            .get(&target_idx)
+            .is_some_and(|file| file.file_ordinal == target_ordinal)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compaction never reclaimed the file with the corrupt entry"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(db.compaction_errors(), 0);
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+        assert_eq!(db.get("key-0")?, None);
+        assert_eq!(db.get("key-1")?, Some(b"value-1-updated".to_vec()));
+        for idx in 2..num_keys {
+            assert_eq!(
+                db.get(format!("key-{idx}"))?,
+                Some(format!("value-{idx}").into_bytes())
+            );
+        }
+        assert_eq!(db.num_items(), num_keys as usize - 1);
+        assert_eq!(db.iter_items().count(), db.num_items());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_compaction_survives_concurrent_shrink() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Config {
+            initial_capacity: 16,
+            max_data_file_size: 8192,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            ..Default::default()
+        };
+        let db = Arc::new(CandyStore::open(dir.path(), config)?);
+        db.stop_compaction();
+        let key = (0u64..)
+            .map(|number| format!("shrink-compaction-{number}"))
+            .find(|key| {
+                HashCoord::new(KeyNamespace::User, key.as_bytes(), db.inner.config.hash_key)
+                    .row_index(MIN_SPLIT_LEVEL as u64 + 1)
+                    == 1usize << MIN_SPLIT_LEVEL
+            })
+            .unwrap();
+        let coord = HashCoord::new(KeyNamespace::User, key.as_bytes(), db.inner.config.hash_key);
+        db.set(&key, "healthy")?;
+        db.inner
+            ._split_row(coord, MIN_SPLIT_LEVEL as u64, MIN_SPLIT_LEVEL as u64)?;
+        let target_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let target_ordinal = db.inner.data_files.read()[&target_idx].file_ordinal;
+        db.inner._rotate_data_file(target_idx)?;
+        db.checkpoint()?;
+
+        let before_reads = db.stats().num_read_ops;
+        let worker_db = Arc::clone(&db);
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        let worker = thread::spawn(move || {
+            let mut pacer = Pacer::new(256, Duration::from_secs(1), 256);
+            pacer.consume(256);
+            worker_db
+                .inner
+                .compact_files(&[(target_idx, target_ordinal)], &mut pacer)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while db.stats().num_read_ops == before_reads {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(db.shrink_to_fit_blocking(0.0)?, 1usize << MIN_SPLIT_LEVEL);
+        assert_eq!(worker.join().unwrap()?.compacted_files, 1);
+        assert_eq!(db.get(&key)?, Some(b"healthy".to_vec()));
+        drop(db);
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(db.get(&key)?, Some(b"healthy".to_vec()));
+        Ok(())
+    }
+
+    #[test]
     fn test_compaction_reads_only_live_entries_for_target_file() -> Result<()> {
         let dir = tempfile::tempdir().map_err(Error::IOError)?;
         let db = CandyStore::open(
@@ -568,12 +745,9 @@ mod tests {
         db.inner
             .compaction_shutting_down
             .store(false, Ordering::Release);
-        let outcome = db.inner.compact_files(
-            &[(target_idx, target_ordinal)],
-            &mut pacer,
-            #[cfg(windows)]
-            &mut Vec::new(),
-        )?;
+        let outcome = db
+            .inner
+            .compact_files(&[(target_idx, target_ordinal)], &mut pacer)?;
 
         assert_eq!(outcome.compacted_files, 1);
         assert_eq!(db.stats().num_read_ops - before_read_ops, live_entries);
@@ -635,12 +809,7 @@ mod tests {
         db.inner
             .compaction_shutting_down
             .store(false, Ordering::Release);
-        let outcome = db.inner.compact_files(
-            &targets,
-            &mut pacer,
-            #[cfg(windows)]
-            &mut Vec::new(),
-        )?;
+        let outcome = db.inner.compact_files(&targets, &mut pacer)?;
 
         assert_eq!(outcome.compacted_files, 4);
         assert_eq!(db.stats().num_read_ops - before_read_ops, live_entries);
@@ -651,6 +820,276 @@ mod tests {
             assert!(!data_file.is_dirty());
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_compaction_retries_after_transient_read_error() -> Result<()> {
+        for periodic in [false, true] {
+            let dir = tempfile::tempdir().map_err(Error::IOError)?;
+            let db = CandyStore::open(
+                dir.path(),
+                Config {
+                    max_data_file_size: 8192,
+                    compaction_min_threshold: 0,
+                    checkpoint_interval: periodic.then_some(Duration::from_millis(20)),
+                    checkpoint_delta_bytes: None,
+                    compaction_max_read_failures: u32::MAX,
+                    ..Default::default()
+                },
+            )?;
+            db.stop_compaction();
+            db.set("key", "old")?;
+            db.set("key", "new")?;
+            let target_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+            db.inner._rotate_data_file(target_idx)?;
+            db.checkpoint()?;
+            let mut unreadable =
+                DataFile::open(dir.path(), db.inner.config.clone(), target_idx, false)?;
+            unreadable.file = std::fs::File::options()
+                .write(true)
+                .open(data_file_path(dir.path(), target_idx))
+                .map_err(Error::IOError)?;
+            let original = db
+                .inner
+                .data_files
+                .write()
+                .insert(target_idx, Arc::new(unreadable))
+                .unwrap();
+            db.start_compaction();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.compaction_errors() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "expected an injected read error"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            db.inner.data_files.write().insert(target_idx, original);
+            if !periodic {
+                db.checkpoint()?;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.inner.data_files.read().contains_key(&target_idx) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "idle checkpoint did not retry compaction; periodic={periodic}"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            db.stop_compaction();
+            assert_eq!(db.stats().num_compactions, 1);
+            assert_eq!(db.stats().num_corrupt_entries_dropped, 0);
+            assert_eq!(db.get("key")?, Some(b"new".to_vec()));
+            assert_eq!(db.num_items(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_compaction_drops_permanently_unreadable_entries() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 8192,
+                compaction_min_threshold: 0,
+                compaction_max_read_failures: 2,
+                checkpoint_interval: Some(Duration::from_millis(20)),
+                checkpoint_delta_bytes: None,
+                ..Default::default()
+            },
+        )?;
+        db.stop_compaction();
+
+        let mut sources = Vec::new();
+        for key in ["broken", "healthy"] {
+            db.set(key, "old")?;
+            db.set(key, "new")?;
+            let file_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+            db.inner._rotate_data_file(file_idx)?;
+            sources.push(file_idx);
+        }
+        db.checkpoint()?;
+
+        let broken_idx = sources[0];
+        let mut unreadable =
+            DataFile::open(dir.path(), db.inner.config.clone(), broken_idx, false)?;
+        unreadable.file = std::fs::File::options()
+            .write(true)
+            .open(data_file_path(dir.path(), broken_idx))
+            .map_err(Error::IOError)?;
+        db.inner
+            .data_files
+            .write()
+            .insert(broken_idx, Arc::new(unreadable));
+        db.start_compaction();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sources
+            .iter()
+            .any(|idx| db.inner.data_files.read().contains_key(idx))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compaction stayed stuck on a permanently unreadable file"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        db.stop_compaction();
+
+        assert_eq!(db.compaction_errors(), 2);
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+        assert!(db.inner.compaction_read_failures.lock().is_empty());
+        assert_eq!(db.get("broken")?, None);
+        assert_eq!(db.get("healthy")?, Some(b"new".to_vec()));
+        assert_eq!(db.num_items(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_outage_drops_at_most_one_entry_per_limit() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 8192,
+                compaction_max_read_failures: 2,
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                ..Default::default()
+            },
+        )?;
+        db.stop_compaction();
+
+        let keys = ["a", "b", "c"];
+        for key in keys {
+            db.set(key, "old")?;
+            db.set(key, "new")?;
+        }
+        let source_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let source_ordinal = db.inner.data_files.read()[&source_idx].file_ordinal;
+        db.inner._rotate_data_file(source_idx)?;
+        db.checkpoint()?;
+
+        let mut unreadable =
+            DataFile::open(dir.path(), db.inner.config.clone(), source_idx, false)?;
+        unreadable.file = std::fs::File::options()
+            .write(true)
+            .open(data_file_path(dir.path(), source_idx))
+            .map_err(Error::IOError)?;
+        let original = db
+            .inner
+            .data_files
+            .write()
+            .insert(source_idx, Arc::new(unreadable))
+            .unwrap();
+
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        // the limit is spent on the first entry, then the next entry starts its own count
+        for _ in 0..3 {
+            assert!(
+                db.inner
+                    .compact_files(&[(source_idx, source_ordinal)], &mut pacer)
+                    .is_err()
+            );
+        }
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+
+        db.inner.data_files.write().insert(source_idx, original);
+        let outcome = db
+            .inner
+            .compact_files(&[(source_idx, source_ordinal)], &mut pacer)?;
+        assert_eq!(outcome.compacted_files, 1);
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+        assert!(db.inner.compaction_read_failures.lock().is_empty());
+        let survivors = keys
+            .iter()
+            .filter(|key| db.get(key).unwrap() == Some(b"new".to_vec()))
+            .count();
+        assert_eq!(survivors, 2);
+        assert_eq!(db.num_items(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compaction_retries_failed_file_deletions() -> Result<()> {
+        for failed_position in [0, 1] {
+            for already_deleted in [false, true] {
+                let dir = tempfile::tempdir().map_err(Error::IOError)?;
+                let db = CandyStore::open(
+                    dir.path(),
+                    Config {
+                        max_data_file_size: 8192,
+                        checkpoint_interval: None,
+                        checkpoint_delta_bytes: None,
+                        compaction_min_threshold: 0,
+                        ..Default::default()
+                    },
+                )?;
+                db.stop_compaction();
+                let mut sources = Vec::new();
+                for key in ["first", "second"] {
+                    db.set(key, "old")?;
+                    db.set(key, "new")?;
+                    let file_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+                    let ordinal = db.inner.data_files.read()[&file_idx].file_ordinal;
+                    sources.push((file_idx, ordinal));
+                    db.inner._rotate_data_file(file_idx)?;
+                }
+                db.checkpoint()?;
+                let path = data_file_path(dir.path(), sources[failed_position].0);
+                let backup = dir.path().join("source-backup");
+                std::fs::rename(&path, &backup).map_err(Error::IOError)?;
+                std::fs::create_dir(&path).map_err(Error::IOError)?;
+                db.inner
+                    .compaction_shutting_down
+                    .store(false, Ordering::Release);
+                let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+                let result = db.inner.compact_files(&sources, &mut pacer);
+                std::fs::remove_dir(&path).map_err(Error::IOError)?;
+                if already_deleted {
+                    std::fs::remove_file(&backup).map_err(Error::IOError)?;
+                } else {
+                    std::fs::rename(&backup, &path).map_err(Error::IOError)?;
+                }
+                assert!(matches!(result, Err(Error::IOError(_))));
+                let candidates = db.inner.next_compaction_candidates(4);
+                for (position, &(file_idx, ordinal)) in sources.iter().enumerate() {
+                    if position < failed_position {
+                        assert!(!db.inner.data_files.read().contains_key(&file_idx));
+                    } else {
+                        assert!(db.inner.data_files.read().contains_key(&file_idx));
+                        assert!(db.inner.index_file.file_waste(file_idx) > 0);
+                        assert!(candidates.contains(&(file_idx, ordinal)));
+                    }
+                }
+                db.start_compaction();
+                db.checkpoint()?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while sources
+                    .iter()
+                    .any(|(file_idx, _)| db.inner.data_files.read().contains_key(file_idx))
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "failed file deletion was not retried"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                db.stop_compaction();
+                for (file_idx, _) in sources {
+                    assert!(!data_file_path(dir.path(), file_idx).exists());
+                    assert_eq!(db.inner.index_file.file_waste(file_idx), 0);
+                }
+                assert_eq!(db.get("first")?, Some(b"new".to_vec()));
+                assert_eq!(db.get("second")?, Some(b"new".to_vec()));
+                assert_eq!(db.num_items(), 2);
+            }
+        }
         Ok(())
     }
 
@@ -701,12 +1140,9 @@ mod tests {
                 .inner
                 .compaction_shutting_down
                 .store(false, Ordering::Release);
-            db_for_compaction.inner.compact_files(
-                &[(target_idx, target_ordinal)],
-                &mut pacer,
-                #[cfg(windows)]
-                &mut Vec::new(),
-            )
+            db_for_compaction
+                .inner
+                .compact_files(&[(target_idx, target_ordinal)], &mut pacer)
         });
 
         let mut grew = false;

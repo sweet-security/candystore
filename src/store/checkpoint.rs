@@ -168,12 +168,20 @@ impl StoreInner {
     }
 
     fn prepare_checkpoint_run(&self, interval_elapsed: bool) -> CheckpointRun {
+        self.prepare_checkpoint_run_with(interval_elapsed, || self.snapshot_checkpoint_progress())
+    }
+
+    fn prepare_checkpoint_run_with(
+        &self,
+        interval_elapsed: bool,
+        snapshot: impl FnOnce() -> Result<CheckpointSnapshot>,
+    ) -> CheckpointRun {
         let _logical_guards = self
             .list_meta_locks
             .iter()
             .map(|lock| lock.write())
             .collect::<Vec<_>>();
-        let mut state = self.checkpoint_state.lock();
+        let state = self.checkpoint_state.lock();
         if self.checkpoint_shutting_down.load(Ordering::Acquire) {
             self.checkpoint_condvar.notify_all();
             return CheckpointRun::Shutdown;
@@ -184,15 +192,25 @@ impl StoreInner {
         if target_epoch.is_none() && !interval_elapsed {
             return CheckpointRun::Idle { reset_timer: false };
         }
+        drop(state);
 
         let current_cursor = self.index_file.checkpoint_cursor();
-        match self.snapshot_checkpoint_progress() {
+        let snapshot = snapshot();
+        let mut state = self.checkpoint_state.lock();
+        if self.checkpoint_shutting_down.load(Ordering::Acquire) {
+            self.checkpoint_condvar.notify_all();
+            return CheckpointRun::Shutdown;
+        }
+        match snapshot {
             Ok(snapshot)
                 if snapshot.checkpoint_ordinal == current_cursor.0
                     && snapshot.checkpoint_offset == current_cursor.1
-                    && snapshot.checkpointed_delta == 0 =>
+                    && snapshot.checkpointed_delta == 0
+                    && !self.checkpoint_retry_needed.load(Ordering::Acquire) =>
             {
                 self.complete_checkpoint_noop(&mut state, target_epoch);
+                drop(state);
+                self.signal_compaction_scan();
                 CheckpointRun::Idle { reset_timer: true }
             }
             Ok(snapshot) => CheckpointRun::Ready {
@@ -246,16 +264,6 @@ impl StoreInner {
                     state.last_failure_epoch = 0;
                     state.last_failure = None;
                 }
-
-                let should_request_follow_up = match (threshold, snapshot_for_follow_up) {
-                    (Some(threshold), Some(snapshot)) => {
-                        self.checkpoint_needs_follow_up(threshold, snapshot)
-                    }
-                    _ => false,
-                };
-                if should_request_follow_up && state.handled_epoch >= state.requested_epoch {
-                    Self::request_checkpoint_epoch_locked(&mut state);
-                }
             }
             Err(err) => {
                 self.stats.checkpoint_errors.fetch_add(1, Ordering::Relaxed);
@@ -270,6 +278,18 @@ impl StoreInner {
         drop(state);
 
         if should_signal_compaction {
+            let should_request_follow_up = match (threshold, snapshot_for_follow_up) {
+                (Some(threshold), Some(snapshot)) => {
+                    self.checkpoint_needs_follow_up(threshold, snapshot)
+                }
+                _ => false,
+            };
+            if should_request_follow_up {
+                let mut state = self.checkpoint_state.lock();
+                if state.handled_epoch >= state.requested_epoch {
+                    Self::request_checkpoint_epoch_locked(&mut state);
+                }
+            }
             self.signal_compaction_scan();
         }
     }
@@ -339,5 +359,74 @@ impl CandyStore {
         if let Some(thd) = self.checkpoint_thd.lock().take() {
             let _ = thd.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Config;
+    use std::{sync::mpsc, thread};
+
+    #[test]
+    fn test_checkpoint_snapshot_releases_state_and_preserves_new_requests() -> Result<()> {
+        for shutdown in [false, true] {
+            let dir = tempfile::tempdir().map_err(Error::IOError)?;
+            let db = CandyStore::open(
+                dir.path(),
+                Config {
+                    checkpoint_interval: None,
+                    checkpoint_delta_bytes: None,
+                    compaction_throughput_bytes_per_sec: 0,
+                    ..Default::default()
+                },
+            )?;
+            db.stop_checkpoint_worker();
+            db.inner
+                .checkpoint_shutting_down
+                .store(false, Ordering::Release);
+            let epoch = db.inner.request_checkpoint_epoch();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let ctx = Arc::clone(&db.inner);
+            let worker = thread::spawn(move || {
+                ctx.prepare_checkpoint_run_with(false, || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    ctx.snapshot_checkpoint_progress()
+                })
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut state = db
+                .inner
+                .checkpoint_state
+                .try_lock_for(Duration::from_millis(100));
+            let next_epoch = state.as_mut().map(|state| {
+                if shutdown {
+                    db.inner
+                        .checkpoint_shutting_down
+                        .store(true, Ordering::Release);
+                }
+                StoreInner::request_checkpoint_epoch_locked(state)
+            });
+            drop(state);
+            release_tx.send(()).unwrap();
+            let run = worker.join().unwrap();
+            assert!(
+                next_epoch.is_some(),
+                "snapshot held the checkpoint mutex while collecting file state"
+            );
+            let state = db.inner.checkpoint_state.lock();
+            if shutdown {
+                assert!(matches!(run, CheckpointRun::Shutdown));
+                assert!(state.completed_epoch < epoch);
+            } else {
+                assert!(matches!(run, CheckpointRun::Idle { .. }));
+                assert_eq!(state.completed_epoch, epoch);
+            }
+            assert_eq!(state.requested_epoch, next_epoch.unwrap());
+            assert!(state.handled_epoch < state.requested_epoch);
+        }
+        Ok(())
     }
 }

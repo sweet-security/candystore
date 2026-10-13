@@ -3,10 +3,11 @@ use std::sync::{Arc, atomic::Ordering};
 use crate::{
     crash_point,
     data_file::DataFile,
-    index_file::EntryPointer,
+    index_file::{EntryPointer, RowWriteGuard},
     internal::{
         EntryType, FILE_OFFSET_ALIGNMENT, HashCoord, KVRef, KeyNamespace, ROW_WIDTH,
         aligned_data_entry_size, aligned_tombstone_entry_waste, invalid_data_error,
+        is_corrupt_entry_error,
     },
     types::{Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result},
 };
@@ -320,37 +321,63 @@ impl CandyStore {
         );
 
         self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
-            let files = self.inner.data_files.read();
-            for (col, entry) in row.iter_matches(hc) {
-                let file = files
-                    .get(&entry.file_idx())
-                    .ok_or(Error::MissingDataFile(entry.file_idx()))?;
-                let existing_kv =
-                    file.read_kv_into(entry.file_offset(), entry.size_hint(), match_scratch)?;
-                if existing_kv.key() == key {
-                    if entry == ptr {
-                        // Already points at this entry — nothing to fix.
-                        return Ok(0);
-                    }
-                    if entry.file_idx() == data_file.file_idx
-                        && entry.file_offset() > ptr.file_offset()
-                    {
-                        // A newer active-file entry already exists — skip.
-                        return Ok(0);
-                    }
-                    // Older pointer — replace with this newer one.
-                    row.replace_pointer(col, ptr);
-                    return Ok(0);
+            let (existing, mut delta) =
+                self.find_recovery_match(&mut row, hc, key, match_scratch)?;
+            if let Some((col, entry)) = existing {
+                if entry == ptr {
+                    // Already points at this entry — nothing to fix.
+                    return Ok(delta);
                 }
+                if entry.file_idx() == data_file.file_idx && entry.file_offset() > ptr.file_offset()
+                {
+                    // A newer active-file entry already exists — skip.
+                    return Ok(delta);
+                }
+                // Older pointer — replace with this newer one.
+                row.replace_pointer(col, ptr);
+                return Ok(delta);
             }
             // Key not in index — insert it.
             if let Some(col) = row.find_free_slot() {
                 row.insert(col, hc.sig, ptr);
-                Ok(1)
+                delta += 1;
+                Ok(delta)
             } else {
                 Err(Error::SplitRow(row.split_level.load(Ordering::Relaxed)))
             }
         })
+    }
+
+    /// Finds `key`'s slot in `row`, unlinking corrupt candidates; returns the live-entry delta of those unlinks.
+    fn find_recovery_match(
+        &self,
+        row: &mut RowWriteGuard<'_>,
+        hc: HashCoord,
+        key: &[u8],
+        match_scratch: &mut Vec<u8>,
+    ) -> Result<(Option<(usize, EntryPointer)>, i64)> {
+        let files = self.inner.data_files.read();
+        let mut corrupt_cols = Vec::new();
+        let mut existing = None;
+        for (col, entry) in row.iter_matches(hc) {
+            let file = files
+                .get(&entry.file_idx())
+                .ok_or(Error::MissingDataFile(entry.file_idx()))?;
+            match file.read_kv_into(entry.file_offset(), entry.size_hint(), match_scratch) {
+                Ok(kv) if kv.key() == key => {
+                    existing = Some((col, entry));
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if is_corrupt_entry_error(&err) => corrupt_cols.push(col),
+                Err(err) => return Err(err),
+            }
+        }
+        let delta = -(corrupt_cols.len() as i64);
+        for col in corrupt_cols {
+            self.inner.unlink_corrupt_entry(row, col);
+        }
+        Ok((existing, delta))
     }
 
     /// Fix index pointers for a tombstone entry and return its live-entry delta.
@@ -365,19 +392,13 @@ impl CandyStore {
         self.validate_recovered_tombstone_entry(key)?;
 
         self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
-            let files = self.inner.data_files.read();
-            for (col, entry) in row.iter_matches(hc) {
-                let file = files
-                    .get(&entry.file_idx())
-                    .ok_or(Error::MissingDataFile(entry.file_idx()))?;
-                let existing_kv =
-                    file.read_kv_into(entry.file_offset(), entry.size_hint(), match_scratch)?;
-                if existing_kv.key() == key {
-                    row.remove(col);
-                    return Ok(-1);
-                }
+            let (existing, mut delta) =
+                self.find_recovery_match(&mut row, hc, key, match_scratch)?;
+            if let Some((col, _)) = existing {
+                row.remove(col);
+                delta -= 1;
             }
-            Ok(0)
+            Ok(delta)
         })
     }
 

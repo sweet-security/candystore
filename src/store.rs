@@ -24,10 +24,10 @@ use crate::{
     data_file::{DataFile, InflightTracker},
     index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
     internal::{
-        EntryType, HashCoord, KeyNamespace, MASKED_ROW_SELECTOR_BITS, MAX_DATA_FILE_IDX,
+        EntryType, HashCoord, KVBuf, KeyNamespace, MASKED_ROW_SELECTOR_BITS, MAX_DATA_FILE_IDX,
         MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH, RangeMetadata, aligned_data_entry_size,
-        aligned_data_entry_waste, aligned_tombstone_entry_waste, index_file_path,
-        index_rows_file_path, invalid_data_error, sync_dir,
+        aligned_data_entry_waste, aligned_tombstone_entry_waste, data_file_path, index_file_path,
+        index_rows_file_path, invalid_data_error, is_corrupt_entry_error, sync_dir,
     },
     types::{
         Config, Error, GetOrCreateStatus, INITIAL_DATA_FILE_ORDINAL, ReplaceStatus, Result, Stats,
@@ -103,6 +103,7 @@ struct InnerStats {
     num_removed: AtomicU64,
     num_rebuilt_entries: AtomicU64,
     num_rebuild_purged_bytes: AtomicU64,
+    num_corrupt_entries_dropped: AtomicU64,
     size_histogram: [AtomicU64; 6],
 }
 
@@ -128,6 +129,7 @@ impl InnerStats {
         self.num_updated.store(0, Ordering::Relaxed);
         self.num_rebuilt_entries.store(0, Ordering::Relaxed);
         self.num_rebuild_purged_bytes.store(0, Ordering::Relaxed);
+        self.num_corrupt_entries_dropped.store(0, Ordering::Relaxed);
         for bucket in &self.size_histogram {
             bucket.store(0, Ordering::Relaxed);
         }
@@ -148,7 +150,10 @@ struct StoreInner {
     checkpoint_state: Mutex<CheckpointState>,
     checkpoint_condvar: Condvar,
     checkpoint_shutting_down: AtomicBool,
+    checkpoint_retry_needed: AtomicBool,
     rotation_lock: Mutex<()>,
+    compaction_lock: Mutex<()>,
+    compaction_read_failures: Mutex<HashMap<(u16, u64, u64), u32>>,
     compaction_state: Mutex<CompactionState>,
     compaction_condvar: Condvar,
     compaction_shutting_down: AtomicBool,
@@ -210,7 +215,10 @@ impl StoreInner {
             checkpoint_state: Mutex::new(CheckpointState::default()),
             checkpoint_condvar: Condvar::new(),
             checkpoint_shutting_down: AtomicBool::new(false),
+            checkpoint_retry_needed: AtomicBool::new(false),
             rotation_lock: Mutex::new(()),
+            compaction_lock: Mutex::new(()),
+            compaction_read_failures: Mutex::new(HashMap::new()),
             compaction_state: Mutex::new(CompactionState::default()),
             compaction_condvar: Condvar::new(),
             compaction_shutting_down: AtomicBool::new(false),
@@ -272,6 +280,8 @@ impl StoreInner {
         self.active_file_ordinal
             .store(active_file_ordinal, Ordering::Release);
         self.uncommitted_entries_delta.store(0, Ordering::Relaxed);
+        self.checkpoint_retry_needed.store(false, Ordering::Relaxed);
+        self.compaction_read_failures.lock().clear();
         *self.checkpoint_state.lock() = CheckpointState::default();
         self.stats.reset();
 
@@ -397,6 +407,77 @@ impl StoreInner {
             .fetch_add(delta, Ordering::Relaxed);
     }
 
+    /// Unlinks an index slot whose data-file entry can no longer be parsed.
+    fn drop_corrupt_entry(&self, row: &mut RowWriteGuard<'_>, col: usize) {
+        self.unlink_corrupt_entry(row, col);
+        self.add_uncommitted_num_entries(-1);
+        self.inflight_tracker.record_index_delta(row.shard_idx, -1);
+    }
+
+    /// Like `drop_corrupt_entry`, but leaves live-count accounting to the caller.
+    fn unlink_corrupt_entry(&self, row: &mut RowWriteGuard<'_>, col: usize) {
+        let ptr = row.pointers[col];
+        row.remove(col);
+        let waste = ptr.size_hint() as u32;
+        let new_waste = self.index_file.add_file_waste(ptr.file_idx(), waste);
+        self.maybe_signal_compaction_threshold_crossing(
+            ptr.file_idx(),
+            new_waste.saturating_sub(waste),
+            new_waste,
+        );
+        self.stats
+            .num_corrupt_entries_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Finds the live entry for `key` in `row`, dropping any corrupt candidates on the way.
+    fn find_existing_entry(
+        &self,
+        row: &mut RowWriteGuard<'_>,
+        files: &HashMap<u16, Arc<DataFile>>,
+        hc: HashCoord,
+        key: &[u8],
+        ns: KeyNamespace,
+    ) -> Result<Option<(usize, u16, KVBuf)>> {
+        let mut corrupt_cols = Vec::new();
+        let mut found = None;
+        for (col, entry) in row.iter_matches(hc) {
+            let Some(file) = files.get(&entry.file_idx()) else {
+                continue;
+            };
+            self.record_read(entry.size_hint() as u64);
+            let kv = match file.read_kv(entry.file_offset(), entry.size_hint()) {
+                Ok(kv) => kv,
+                Err(err) if is_corrupt_entry_error(&err) => {
+                    corrupt_cols.push(col);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if kv.key() == key {
+                found = Some((col, entry.file_idx(), kv));
+                break;
+            }
+            self.stats.num_collisions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if found.is_none() && !corrupt_cols.is_empty() {
+            let active_idx = self.active_file_idx.load(Ordering::Acquire);
+            let active_file = files
+                .get(&active_idx)
+                .ok_or(Error::MissingDataFile(active_idx))?;
+            let (offset, size, guard) =
+                active_file.append_tombstone(ns, key, row.shard_idx, &self.inflight_tracker)?;
+            self.record_write(offset, size as u64);
+            self.index_file.add_file_waste(active_idx, size as u32);
+            guard.complete_with_delta(0);
+        }
+        for col in corrupt_cols {
+            self.drop_corrupt_entry(row, col);
+        }
+        Ok(found)
+    }
+
     /// Applies `delta` to the persisted committed entry count, clamping at
     /// zero.  Returns the actual change applied (which may differ from `delta`
     /// when the count would underflow).
@@ -450,6 +531,7 @@ impl StoreInner {
         if snapshot.checkpoint_ordinal == current_cursor.0
             && snapshot.checkpoint_offset == current_cursor.1
             && snapshot.checkpointed_delta == 0
+            && !self.checkpoint_retry_needed.load(Ordering::Acquire)
         {
             return Ok(());
         }
@@ -473,6 +555,13 @@ impl StoreInner {
     }
 
     fn sync_checkpoint(&self, _snap: CheckpointSnapshot) -> Result<()> {
+        let result = self.sync_checkpoint_data();
+        self.checkpoint_retry_needed
+            .store(result.is_err(), Ordering::Release);
+        result
+    }
+
+    fn sync_checkpoint_data(&self) -> Result<()> {
         // Bulk sync without blocking writers; the quiescent pass below only
         // has to cover whatever landed since.
         for data_file in self.data_files.read().values() {
@@ -660,7 +749,13 @@ impl StoreInner {
             let mut attempts = 0;
             {
                 let files = self.data_files.read();
-                while files.contains_key(&next_idx) {
+                // a deleted file can linger on disk (e.g. delete-pending on Windows), so skip its index too
+                while files.contains_key(&next_idx)
+                    || !matches!(
+                        data_file_path(&self.base_path, next_idx).try_exists(),
+                        Ok(false)
+                    )
+                {
                     next_idx = (next_idx + 1) & MAX_DATA_FILE_IDX;
                     attempts += 1;
                     if attempts > MAX_DATA_FILES {
@@ -912,15 +1007,11 @@ impl CandyStore {
         self.inner
             ._mut_op(ns, key, default_val, |hc, mut row, key, val| {
                 let files = self.inner.data_files.read();
-                for (_, entry) in row.iter_matches(hc) {
-                    let Some(file) = files.get(&entry.file_idx()) else {
-                        continue;
-                    };
-                    self.inner.record_read(entry.size_hint() as u64);
-                    let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
-                    if kv.key() == key {
-                        return Ok(GetOrCreateStatus::ExistingValue(kv.into_value()));
-                    }
+                if let Some((_, _, kv)) = self
+                    .inner
+                    .find_existing_entry(&mut row, &files, hc, key, ns)?
+                {
+                    return Ok(GetOrCreateStatus::ExistingValue(kv.into_value()));
                 }
 
                 if let Some(col) = row.find_free_slot() {
@@ -1027,46 +1118,36 @@ impl CandyStore {
     fn set_ns(&self, ns: KeyNamespace, key: &[u8], val: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner._mut_op(ns, key, val, |hc, mut row, key, val| {
             let files = self.inner.data_files.read();
-            for (col, entry) in row.iter_matches(hc) {
-                let Some(file) = files.get(&entry.file_idx()) else {
-                    continue;
-                };
-                self.inner.record_read(entry.size_hint() as u64);
-                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
-                if kv.key() == key {
-                    // optimization
-                    if kv.value() == val {
-                        return Ok(Some(kv.into_value()));
-                    }
-                    let klen = kv.key().len();
-                    let vlen = kv.value().len();
-                    let old_val = kv.into_value();
-                    let src_file_idx = file.file_idx;
-
-                    let shard_idx = row.shard_idx;
-                    self.apply_update_to_existing_entry(
-                        &mut row,
-                        ExistingEntryUpdate {
-                            files: &files,
-                            ns,
-                            key,
-                            val,
-                            hc,
-                            col,
-                            shard_idx,
-                            src_file_idx,
-                            old_klen: klen,
-                            old_vlen: vlen,
-                            crash_point_name: Some("set_after_write_before_update"),
-                        },
-                    )?;
-                    return Ok(Some(old_val));
-                } else {
-                    self.inner
-                        .stats
-                        .num_collisions
-                        .fetch_add(1, Ordering::Relaxed);
+            if let Some((col, src_file_idx, kv)) = self
+                .inner
+                .find_existing_entry(&mut row, &files, hc, key, ns)?
+            {
+                // optimization
+                if kv.value() == val {
+                    return Ok(Some(kv.into_value()));
                 }
+                let klen = kv.key().len();
+                let vlen = kv.value().len();
+                let old_val = kv.into_value();
+
+                let shard_idx = row.shard_idx;
+                self.apply_update_to_existing_entry(
+                    &mut row,
+                    ExistingEntryUpdate {
+                        files: &files,
+                        ns,
+                        key,
+                        val,
+                        hc,
+                        col,
+                        shard_idx,
+                        src_file_idx,
+                        old_klen: klen,
+                        old_vlen: vlen,
+                        crash_point_name: Some("set_after_write_before_update"),
+                    },
+                )?;
+                return Ok(Some(old_val));
             }
 
             if let Some(col) = row.find_free_slot() {
@@ -1117,49 +1198,44 @@ impl CandyStore {
     ) -> Result<ReplaceStatus> {
         self.inner._mut_op(ns, key, val, |hc, mut row, key, val| {
             let files = self.inner.data_files.read();
-            for (col, entry) in row.iter_matches(hc) {
-                let Some(file) = files.get(&entry.file_idx()) else {
-                    continue;
-                };
-                self.inner.record_read(entry.size_hint() as u64);
-                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
-                if kv.key() == key {
-                    if let Some(expected) = expected_val
-                        && kv.value() != expected
-                    {
-                        return Ok(ReplaceStatus::WrongValue(kv.into_value()));
-                    }
-                    // optimization
-                    if kv.value() == val {
-                        return Ok(ReplaceStatus::PrevValue(kv.into_value()));
-                    }
-
-                    let klen = kv.key().len();
-                    let vlen = kv.value().len();
-                    let old_val = kv.into_value();
-                    let src_file_idx = file.file_idx;
-
-                    let shard_idx = row.shard_idx;
-                    self.apply_update_to_existing_entry(
-                        &mut row,
-                        ExistingEntryUpdate {
-                            files: &files,
-                            ns,
-                            key,
-                            val,
-                            hc,
-                            col,
-                            shard_idx,
-                            src_file_idx,
-                            old_klen: klen,
-                            old_vlen: vlen,
-                            crash_point_name: None,
-                        },
-                    )?;
-                    return Ok(ReplaceStatus::PrevValue(old_val));
-                }
+            let Some((col, src_file_idx, kv)) = self
+                .inner
+                .find_existing_entry(&mut row, &files, hc, key, ns)?
+            else {
+                return Ok(ReplaceStatus::DoesNotExist);
+            };
+            if let Some(expected) = expected_val
+                && kv.value() != expected
+            {
+                return Ok(ReplaceStatus::WrongValue(kv.into_value()));
             }
-            Ok(ReplaceStatus::DoesNotExist)
+            // optimization
+            if kv.value() == val {
+                return Ok(ReplaceStatus::PrevValue(kv.into_value()));
+            }
+
+            let klen = kv.key().len();
+            let vlen = kv.value().len();
+            let old_val = kv.into_value();
+
+            let shard_idx = row.shard_idx;
+            self.apply_update_to_existing_entry(
+                &mut row,
+                ExistingEntryUpdate {
+                    files: &files,
+                    ns,
+                    key,
+                    val,
+                    hc,
+                    col,
+                    shard_idx,
+                    src_file_idx,
+                    old_klen: klen,
+                    old_vlen: vlen,
+                    crash_point_name: None,
+                },
+            )?;
+            Ok(ReplaceStatus::PrevValue(old_val))
         })
     }
 
@@ -1205,40 +1281,33 @@ impl CandyStore {
     fn remove_ns(&self, ns: KeyNamespace, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner._mut_op(ns, key, &[], |hc, mut row, key, _| {
             let files = self.inner.data_files.read();
-            for (col, entry) in row.iter_matches(hc) {
-                let Some(file) = files.get(&entry.file_idx()) else {
-                    continue;
-                };
-                self.inner.record_read(entry.size_hint() as u64);
-                let kv = file.read_kv(entry.file_offset(), entry.size_hint())?;
+            let Some((col, src_file_idx, kv)) = self
+                .inner
+                .find_existing_entry(&mut row, &files, hc, key, ns)?
+            else {
+                return Ok(None);
+            };
+            let klen = kv.key().len();
+            let vlen = kv.value().len();
+            let old_val = kv.into_value();
 
-                if kv.key() == key {
-                    let klen = kv.key().len();
-                    let vlen = kv.value().len();
-                    let old_val = kv.into_value();
-                    let src_file_idx = file.file_idx;
+            let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
+            let active_file = files
+                .get(&active_idx)
+                .ok_or(Error::MissingDataFile(active_idx))?;
+            let (file_off, tombstone_size, inflight_guard) = active_file.append_tombstone(
+                ns,
+                key,
+                row.shard_idx,
+                &self.inner.inflight_tracker,
+            )?;
+            self.inner.record_write(file_off, tombstone_size as u64);
 
-                    let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
-                    let active_file = files
-                        .get(&active_idx)
-                        .ok_or(Error::MissingDataFile(active_idx))?;
-                    let (file_off, tombstone_size, inflight_guard) = active_file.append_tombstone(
-                        ns,
-                        key,
-                        row.shard_idx,
-                        &self.inner.inflight_tracker,
-                    )?;
-                    self.inner.record_write(file_off, tombstone_size as u64);
-
-                    row.remove(col);
-                    self.track_tombstone_waste(src_file_idx, klen, vlen);
-                    self.record_remove_stats();
-                    inflight_guard.complete();
-                    return Ok(Some(old_val));
-                }
-            }
-
-            Ok(None)
+            row.remove(col);
+            self.track_tombstone_waste(src_file_idx, klen, vlen);
+            self.record_remove_stats();
+            inflight_guard.complete();
+            Ok(Some(old_val))
         })
     }
 
@@ -1323,6 +1392,9 @@ impl CandyStore {
                             row_entries.push(row.pointers[col]);
                         }
                     }
+                    if row_entries.is_empty() {
+                        continue;
+                    }
                     batch_files = Some(self.inner.data_files.read());
                     break;
                 }
@@ -1392,6 +1464,7 @@ impl CandyStore {
 
     /// Shrinks the index when the reclaimable row ratio is at least `min_wasted_ratio`.
     pub fn shrink_to_fit_blocking(&self, min_wasted_ratio: f64) -> Result<usize> {
+        let _compaction_guard = self.inner.compaction_lock.lock();
         let _logical_guards = self
             .inner
             .list_meta_locks
@@ -1484,6 +1557,7 @@ impl CandyStore {
 
             num_rebuilt_entries: s.num_rebuilt_entries.load(Ordering::Relaxed),
             num_rebuild_purged_bytes: s.num_rebuild_purged_bytes.load(Ordering::Relaxed),
+            num_corrupt_entries_dropped: s.num_corrupt_entries_dropped.load(Ordering::Relaxed),
 
             entries_under_64: s.size_histogram[0].load(Ordering::Relaxed),
             entries_under_256: s.size_histogram[1].load(Ordering::Relaxed),
@@ -1508,6 +1582,377 @@ mod tests {
     use std::{thread, time::Instant};
 
     use tempfile::tempdir;
+
+    fn find_entry_pointer(db: &CandyStore, key: &[u8]) -> EntryPointer {
+        let rows = db.inner.index_file.rows_table();
+        let files = db.inner.data_files.read();
+        (0..db.inner.index_file.num_rows())
+            .flat_map(|row_idx| rows.row(row_idx).pointers)
+            .filter(|ptr| ptr.is_valid())
+            .find(|ptr| {
+                files.get(&ptr.file_idx()).is_some_and(|file| {
+                    file.read_kv(ptr.file_offset(), ptr.size_hint())
+                        .is_ok_and(|kv| kv.ns == KeyNamespace::User as u8 && kv.key() == key)
+                })
+            })
+            .expect("key should be present in the index")
+    }
+
+    /// Flips a payload byte of `key`'s on-disk entry so its checksum no longer matches.
+    pub(super) fn corrupt_entry(db: &CandyStore, key: &[u8]) -> EntryPointer {
+        let ptr = find_entry_pointer(db, key);
+        corrupt_pointer(db, ptr);
+        ptr
+    }
+
+    fn corrupt_pointer(db: &CandyStore, ptr: EntryPointer) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = crate::internal::data_file_path(&db.inner.base_path, ptr.file_idx());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let pos = crate::internal::PAGE_SIZE as u64 + ptr.file_offset() + 8;
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        file.write_all(&byte).unwrap();
+    }
+
+    fn point_key_at(db: &CandyStore, key: &[u8], ptr: EntryPointer) -> Result<()> {
+        db.inner
+            ._mut_op(KeyNamespace::User, key, b"", |coord, mut row, _, _| {
+                let existing = row.iter_matches(coord).next().map(|(col, _)| col);
+                match existing {
+                    Some(col) => row.replace_pointer(col, ptr),
+                    None => {
+                        let col = row.find_free_slot().unwrap();
+                        row.insert(col, coord.sig, ptr);
+                    }
+                }
+                Ok(())
+            })
+    }
+
+    #[test]
+    fn test_rotation_skips_index_still_present_on_disk() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+        db.set("key", "value")?;
+        let active_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let blocked_idx = (active_idx + 1) & MAX_DATA_FILE_IDX;
+        let blocked_path = data_file_path(dir.path(), blocked_idx);
+        std::fs::create_dir(&blocked_path).map_err(Error::IOError)?;
+
+        let result = db.inner._rotate_data_file(active_idx);
+        let new_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        std::fs::remove_dir(&blocked_path).map_err(Error::IOError)?;
+        result?;
+
+        assert_ne!(new_idx, active_idx);
+        assert_ne!(new_idx, blocked_idx);
+        db.set("after", "rotation")?;
+        assert_eq!(db.get("key")?, Some(b"value".to_vec()));
+        assert_eq!(db.get("after")?, Some(b"rotation".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_recovery_drops_corrupt_index_entries() -> Result<()> {
+        for remove in [false, true] {
+            let dir = tempdir().unwrap();
+            let config = Config {
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Default::default()
+            };
+            let db = CandyStore::open(dir.path(), config)?;
+            db.set("victim", "v1")?;
+            db.set("keeper", "good")?;
+            db.checkpoint()?;
+            let stale = find_entry_pointer(&db, b"victim");
+            if remove {
+                db.remove("victim")?;
+            } else {
+                db.set("victim", "v2")?;
+            }
+            // simulate a power loss that rolled the index back past the last (replayable) write
+            point_key_at(&db, b"victim", stale)?;
+            corrupt_pointer(&db, stale);
+            db._abort_for_testing();
+
+            let db = CandyStore::open(dir.path(), config)?;
+            let expected = (!remove).then(|| b"v2".to_vec());
+            assert_eq!(db.get("victim")?, expected, "remove={remove}");
+            assert_eq!(db.get("keeper")?, Some(b"good".to_vec()));
+            assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+            assert_eq!(db.num_items(), if remove { 1 } else { 2 });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_mutations_drop_corrupt_entries() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(dir.path(), Config::default())?;
+
+        for key in ["set", "remove", "replace", "get_or_create", "intact"] {
+            db.set(key, format!("{key}-old"))?;
+        }
+        for key in ["set", "remove", "replace", "get_or_create"] {
+            corrupt_entry(&db, key.as_bytes());
+        }
+        assert_eq!(db.num_items(), 5);
+
+        assert!(db.set("set", "set-new")?.was_created());
+        assert_eq!(db.get("set")?, Some(b"set-new".to_vec()));
+
+        assert_eq!(db.remove("remove")?, None);
+        assert_eq!(db.get("remove")?, None);
+
+        assert!(
+            db.replace("replace", "replace-new", None::<&[u8]>)?
+                .is_key_missing()
+        );
+        assert_eq!(db.get("replace")?, None);
+
+        assert!(db.get_or_create("get_or_create", "goc-new")?.was_created());
+        assert_eq!(db.get("get_or_create")?, Some(b"goc-new".to_vec()));
+
+        assert_eq!(db.get("intact")?, Some(b"intact-old".to_vec()));
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 4);
+        assert_eq!(db.num_items(), 3);
+        assert_eq!(db.iter_items().count(), 3);
+
+        // healed slots no longer trip over the corruption
+        db.set("remove", "remove-new")?;
+        assert_eq!(db.get("remove")?, Some(b"remove-new".to_vec()));
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupt_key_does_not_resurrect_on_reopen() -> Result<()> {
+        for file_size in [64, 8192] {
+            for replace in [false, true] {
+                for checkpoint in [false, true] {
+                    let dir = tempdir().unwrap();
+                    let config = Config {
+                        max_data_file_size: file_size,
+                        checkpoint_interval: None,
+                        checkpoint_delta_bytes: None,
+                        compaction_throughput_bytes_per_sec: 0,
+                        ..Default::default()
+                    };
+                    let db = CandyStore::open(dir.path(), config)?;
+                    db.set("victim", "old")?;
+                    db.set("victim", "latest")?;
+                    db.checkpoint()?;
+                    corrupt_entry(&db, b"victim");
+                    if replace {
+                        assert!(db.replace("victim", "new", None::<&[u8]>)?.is_key_missing());
+                    } else {
+                        assert_eq!(db.remove("victim")?, None);
+                    }
+                    assert_eq!(db.num_items(), 0);
+                    assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+                    if checkpoint {
+                        db.checkpoint()?;
+                        assert_eq!(
+                            db.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
+                            0
+                        );
+                        drop(db);
+                    } else {
+                        db._abort_for_testing();
+                    }
+                    let db = CandyStore::open(dir.path(), config)?;
+                    assert_eq!(
+                        db.get("victim")?,
+                        None,
+                        "file_size={file_size}, replace={replace}, checkpoint={checkpoint}"
+                    );
+                    assert_eq!(db.num_items(), 0);
+                    assert!(db.set("victim", "rebuilt")?.was_created());
+                    assert_eq!(db.get("victim")?, Some(b"rebuilt".to_vec()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_corrupt_index_only_removal_is_checkpointed() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Default::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("victim", "original")?;
+        db.set("keeper", "good")?;
+        db.checkpoint()?;
+        let generation = db.stats().checkpoint_generation;
+        let cursor = db.inner.index_file.checkpoint_cursor();
+        corrupt_entry(&db, b"victim");
+        db.inner._mut_op(
+            KeyNamespace::User,
+            b"victim",
+            b"",
+            |coord, mut row, _, _| {
+                let (col, _) = row.iter_matches(coord).next().unwrap();
+                db.inner.drop_corrupt_entry(&mut row, col);
+                Ok(())
+            },
+        )?;
+        db.checkpoint()?;
+        assert_eq!(db.inner.index_file.checkpoint_cursor(), cursor);
+        assert!(db.stats().checkpoint_generation > generation);
+        assert_eq!(db.num_items(), 1);
+        assert_eq!(
+            db.inner
+                .index_file
+                .header_ref()
+                .committed_num_entries
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            db.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
+            0
+        );
+        let generation = db.stats().checkpoint_generation;
+        db.checkpoint()?;
+        assert_eq!(db.stats().checkpoint_generation, generation);
+        drop(db);
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(db.get("victim")?, None);
+        assert_eq!(db.get("keeper")?, Some(b"good".to_vec()));
+        assert_eq!(db.num_items(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_failed_corrupt_tombstone_keeps_index_entry() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                max_data_file_size: 8192,
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Default::default()
+            },
+        )?;
+        db.set("victim", "old")?;
+        db.set("victim", "latest")?;
+        db.checkpoint()?;
+        let pointer = corrupt_entry(&db, b"victim");
+        let mut readonly = DataFile::open(
+            dir.path(),
+            db.inner.config.clone(),
+            pointer.file_idx(),
+            false,
+        )?;
+        readonly.file = std::fs::File::open(crate::internal::data_file_path(
+            dir.path(),
+            pointer.file_idx(),
+        ))
+        .map_err(Error::IOError)?;
+        let original = db
+            .inner
+            .data_files
+            .write()
+            .insert(pointer.file_idx(), Arc::new(readonly))
+            .unwrap();
+        let err = db.remove("victim").unwrap_err();
+        assert!(matches!(err, Error::IOError(_)));
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 0);
+        assert_eq!(db.num_items(), 1);
+        db.inner
+            .data_files
+            .write()
+            .insert(pointer.file_idx(), original);
+        assert_eq!(db.remove("victim")?, None);
+        db.checkpoint()?;
+        assert_eq!(db.stats().num_corrupt_entries_dropped, 1);
+        assert_eq!(db.num_items(), 0);
+        assert_eq!(
+            db.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
+            0
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_index_only_checkpoint_retries_after_sync_error() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db");
+        let moved_path = dir.path().join("moved-db");
+        let db = CandyStore::open(
+            &path,
+            Config {
+                max_data_file_size: 8192,
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Default::default()
+            },
+        )?;
+        db.set("victim", "original")?;
+        db.set("keeper", "good")?;
+        db.checkpoint()?;
+        corrupt_entry(&db, b"victim");
+        db.inner._mut_op(
+            KeyNamespace::User,
+            b"victim",
+            b"",
+            |coord, mut row, _, _| {
+                let (col, _) = row.iter_matches(coord).next().unwrap();
+                db.inner.drop_corrupt_entry(&mut row, col);
+                Ok(())
+            },
+        )?;
+        std::fs::rename(&path, &moved_path).map_err(Error::IOError)?;
+        let result = db.checkpoint();
+        std::fs::rename(&moved_path, &path).map_err(Error::IOError)?;
+        assert!(
+            matches!(result, Err(Error::IOError(ref err)) if err.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(db.inner.checkpoint_retry_needed.load(Ordering::Acquire));
+        assert_eq!(
+            db.inner.snapshot_checkpoint_progress()?.checkpointed_delta,
+            0
+        );
+        let generation = db.stats().checkpoint_generation;
+        db.checkpoint()?;
+        assert!(db.stats().checkpoint_generation > generation);
+        assert!(!db.inner.checkpoint_retry_needed.load(Ordering::Acquire));
+        assert_eq!(db.num_items(), 1);
+        assert_eq!(
+            db.inner
+                .index_file
+                .header_ref()
+                .committed_num_entries
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            db.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
+            0
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_compaction_errors_reports_counter() -> Result<()> {

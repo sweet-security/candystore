@@ -167,6 +167,17 @@ pub(crate) fn unexpected_eof_error(message: &'static str) -> Error {
     ))
 }
 
+pub(crate) fn is_corrupt_entry_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::IOError(io_err)
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+            )
+    )
+}
+
 pub(crate) fn is_resettable_open_error(err: &Error) -> bool {
     matches!(
         err,
