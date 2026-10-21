@@ -206,6 +206,275 @@ fn run_split_row_resume_test(crash_point: &'static std::ffi::CStr) -> Result<(),
 // Tests
 // -----------------------------------------------------------------------
 
+#[cfg(unix)]
+fn mutation_crash_config() -> Config {
+    Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    }
+}
+
+#[cfg(unix)]
+fn run_crashing_mutation(path: &Path, mode: &str, point: &str, after: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mutation_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CANDYSTORE_TEST_PATH", path)
+        .env("CANDYSTORE_TEST_MUTATION", mode)
+        .env("CANDYSTORE_CRASH_POINT", point)
+        .env("CANDYSTORE_CRASH_AFTER", after)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGABRT),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn mutation_crash_child() {
+    let db = CandyStore::open(
+        std::env::var("CANDYSTORE_TEST_PATH").unwrap(),
+        mutation_crash_config(),
+    )
+    .unwrap();
+    match std::env::var("CANDYSTORE_TEST_MUTATION").unwrap().as_str() {
+        "shrink" => {
+            db.shrink_to_fit_blocking(0.0).unwrap();
+        }
+        "retain" => {
+            db.retain_in_list("list", |_, _| Ok(true)).unwrap();
+        }
+        "promote" => {
+            db.set_in_list_promoting("list", "a", "promoted").unwrap();
+        }
+        "compact" => {
+            db.compact_list_if_needed(
+                "list",
+                candystore::ListCompactionParams {
+                    min_length: 1,
+                    min_holes_ratio: 0.0,
+                },
+            )
+            .unwrap();
+        }
+        _ => panic!("unknown mutation"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_list_move_crash_preserves_visibility() -> Result<(), Error> {
+    let cases = [
+        ("promote", "set_after_write_before_insert", "0"),
+        ("promote", "set_after_write_before_update", "0"),
+        ("promote", "set_after_write_before_update", "1"),
+        ("compact", "set_after_write_before_insert", "0"),
+        ("compact", "set_after_write_before_update", "0"),
+        ("compact", "set_after_write_before_update", "1"),
+        ("compact", "set_after_write_before_insert", "1"),
+        ("compact", "set_after_write_before_update", "2"),
+        ("compact", "set_after_write_before_update", "3"),
+        ("compact", "set_after_write_before_update", "4"),
+    ];
+    for (mode, point, after) in cases {
+        let dir = tempdir().unwrap();
+        let config = mutation_crash_config();
+        let db = CandyStore::open(dir.path(), config)?;
+        for key in ["a", "hole", "b"] {
+            db.set_in_list("list", key, key)?;
+        }
+        db.remove_from_list("list", "hole")?;
+        db.checkpoint()?;
+        drop(db);
+        run_crashing_mutation(dir.path(), mode, point, after);
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut keys = db
+            .iter_list("list")
+            .map(|item| item.map(|(key, _)| key))
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "{mode} {point} {after}"
+        );
+        let mut reversed = db
+            .iter_list("list")
+            .rev()
+            .map(|item| item.map(|(key, _)| key))
+            .collect::<Result<Vec<_>, _>>()?;
+        reversed.sort();
+        assert_eq!(reversed, keys, "{mode} {point} {after}");
+        assert_eq!(db.list_len("list")?, 2, "{mode} {point} {after}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_shrink_crash_then_regrowth_discards_stale_rows() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = mutation_crash_config();
+    let keys = colliding_user_keys(config.hash_key, 0, ROW_WIDTH * 3);
+    let keep = keys[..=ROW_WIDTH]
+        .iter()
+        .filter(|key| {
+            HashCoord::new(KeyNamespace::User, key.as_bytes(), config.hash_key)
+                .row_index(MIN_SPLIT_LEVEL as u64 + 1)
+                == 1 << MIN_SPLIT_LEVEL
+        })
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(keep.len(), 2);
+    let db = CandyStore::open(dir.path(), config)?;
+    for key in &keys[..=ROW_WIDTH] {
+        db.set(key, "old")?;
+    }
+    for key in &keys[..=ROW_WIDTH] {
+        if !keep.contains(key) {
+            db.remove(key)?;
+        }
+    }
+    db.checkpoint()?;
+    drop(db);
+    run_crashing_mutation(
+        dir.path(),
+        "shrink",
+        "shrink_after_publish_before_row_levels",
+        "0",
+    );
+
+    let db = CandyStore::open(dir.path(), config)?;
+    db.remove(&keep[0])?;
+    db.set(&keep[1], "new")?;
+    let fresh = &keys[ROW_WIDTH + 1..];
+    for key in fresh {
+        db.set(key, "fresh")?;
+    }
+    assert_eq!(db.get(&keep[0])?, None);
+    assert_eq!(db.get(&keep[1])?, Some(b"new".to_vec()));
+    for key in fresh {
+        assert_eq!(db.get(key)?, Some(b"fresh".to_vec()), "{key}");
+    }
+    assert_eq!(db.num_items(), fresh.len() + 1);
+    drop(db);
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get(&keep[0])?, None);
+    assert_eq!(db.iter_items().count(), fresh.len() + 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_retain_crash_preserves_list_visibility() -> Result<(), Error> {
+    for (point, after) in [
+        ("set_after_write_before_update", "0"),
+        ("retain_after_index_before_data", "1"),
+        ("retain_after_data_before_unlink", "1"),
+    ] {
+        let dir = tempdir().unwrap();
+        let config = mutation_crash_config();
+        let db = CandyStore::open(dir.path(), config)?;
+        for key in ["first", "hole", "last"] {
+            db.set_in_list("list", key, "value")?;
+        }
+        db.remove_from_list("list", "hole")?;
+        db.checkpoint()?;
+        drop(db);
+        run_crashing_mutation(dir.path(), "retain", point, after);
+        let db = CandyStore::open(dir.path(), config)?;
+        let expected = vec![
+            (b"first".to_vec(), b"value".to_vec()),
+            (b"last".to_vec(), b"value".to_vec()),
+        ];
+        assert_eq!(
+            db.iter_list("list").collect::<Result<Vec<_>, _>>()?,
+            expected,
+            "{point}"
+        );
+        assert_eq!(
+            db.iter_list("list").rev().collect::<Result<Vec<_>, _>>()?,
+            expected.iter().rev().cloned().collect::<Vec<_>>(),
+            "{point}"
+        );
+        assert_eq!(db.list_len("list")?, 2);
+        db.retain_in_list("list", |_, _| Ok(true))?;
+        assert_eq!(db.pop_list_head("list")?, Some(expected[0].clone()));
+        assert_eq!(db.pop_list_tail("list")?, Some(expected[1].clone()));
+        assert_eq!(db.list_len("list")?, 0);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_shrink_crash_preserves_checkpointed_keys() -> Result<(), Error> {
+    for (point, after) in [
+        ("insert_after_sig", "1"),
+        ("shrink_after_copy_before_publish", "0"),
+        ("shrink_after_publish_before_row_levels", "0"),
+    ] {
+        let dir = tempdir().unwrap();
+        let config = mutation_crash_config();
+        let keys = colliding_user_keys(config.hash_key, 0, ROW_WIDTH + 1);
+        let keep = keys
+            .iter()
+            .filter(|key| {
+                HashCoord::new(KeyNamespace::User, key.as_bytes(), config.hash_key)
+                    .row_index(MIN_SPLIT_LEVEL as u64 + 1)
+                    == 1 << MIN_SPLIT_LEVEL
+            })
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keep.len(), 2);
+        let db = CandyStore::open(dir.path(), config)?;
+        for key in &keys {
+            db.set(key, "value")?;
+        }
+        for key in &keys {
+            if !keep.contains(key) {
+                db.remove(key)?;
+            }
+        }
+        db.checkpoint()?;
+        drop(db);
+        run_crashing_mutation(dir.path(), "shrink", point, after);
+        let db = CandyStore::open(dir.path(), config)?;
+        for key in &keep {
+            assert_eq!(db.get(key)?, Some(b"value".to_vec()), "{point}: {key}");
+        }
+        assert_eq!(db.num_items(), 2, "{point}");
+        assert_eq!(
+            db.iter_items().collect::<Result<Vec<_>, _>>()?.len(),
+            2,
+            "{point}"
+        );
+        db.shrink_to_fit_blocking(0.0)?;
+        drop(db);
+        let db = CandyStore::open(dir.path(), config)?;
+        for key in &keep {
+            assert_eq!(db.get(key)?, Some(b"value".to_vec()), "{point}: {key}");
+        }
+        assert_eq!(db.num_items(), 2);
+    }
+    Ok(())
+}
+
 /// Inject phantom index entries pointing past the durable extent of the
 /// active data file. Rebuild should purge them.
 #[test]

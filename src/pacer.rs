@@ -90,7 +90,19 @@ impl Pacer {
     }
 
     /// Consumes `tokens`, sleeping through the provided callback while waiting for refills.
-    pub fn consume_with_sleep_fn(&mut self, mut tokens: u64, mut sleep: impl FnMut(Duration)) {
+    #[cfg(test)]
+    pub fn consume_with_sleep_fn(&mut self, tokens: u64, mut sleep: impl FnMut(Duration)) {
+        self.consume_with_wait_fn(tokens, |duration| {
+            sleep(duration);
+            true
+        });
+    }
+
+    fn consume_with_wait_fn(
+        &mut self,
+        mut tokens: u64,
+        mut wait: impl FnMut(Duration) -> bool,
+    ) -> bool {
         while tokens > 0 {
             let now = Instant::now();
             self.refill(now);
@@ -105,11 +117,38 @@ impl Pacer {
             }
 
             let tokens_to_wait = tokens.min(self.max_tokens);
-            sleep(self.time_until_tokens(now, tokens_to_wait));
+            if !wait(self.time_until_tokens(now, tokens_to_wait)) {
+                return false;
+            }
         }
+        true
+    }
+
+    pub(crate) fn consume_interruptibly(
+        &mut self,
+        tokens: u64,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> bool {
+        if should_stop() {
+            return false;
+        }
+        self.consume_with_wait_fn(tokens, |duration| {
+            let started = Instant::now();
+            loop {
+                if should_stop() {
+                    return false;
+                }
+                let remaining = duration.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return true;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        })
     }
 
     /// Consumes `tokens`, blocking the current thread until enough tokens are available.
+    #[cfg(test)]
     pub fn consume(&mut self, tokens: u64) {
         self.consume_with_sleep_fn(tokens, std::thread::sleep);
     }
@@ -119,6 +158,26 @@ impl Pacer {
 mod tests {
     use super::Pacer;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_cancel_before_consuming() {
+        let mut pacer = Pacer::new(1, Duration::from_secs(1), 1);
+        assert!(!pacer.consume_interruptibly(u64::MAX, || true));
+        pacer.consume_with_sleep_fn(1, |_| unreachable!());
+    }
+
+    #[test]
+    fn test_cancel_during_refill_wait() {
+        let mut pacer = Pacer::new(1, Duration::from_secs(1), 1);
+        let mut checks = 0;
+        let started = Instant::now();
+        assert!(!pacer.consume_interruptibly(2, || {
+            checks += 1;
+            checks > 2
+        }));
+        assert_eq!(checks, 3);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
 
     #[test]
     fn test_consume_zero() {

@@ -76,6 +76,66 @@ fn test_list_remove_and_iteration() {
 }
 
 #[test]
+fn test_large_list_iteration_preserves_metadata() {
+    for reverse in [false, true] {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            max_data_file_size: 1024 * 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config).unwrap();
+        let mut expected = Vec::new();
+        for number in 0..1002u32 {
+            let key = number.to_le_bytes().to_vec();
+            let value = format!("value-{number}").into_bytes();
+            db.set_in_list("large", &key, &value).unwrap();
+            expected.push((key, value));
+        }
+        let original_writes = db.stats().num_write_ops;
+        let expected_order = if reverse {
+            expected.iter().rev().cloned().collect::<Vec<_>>()
+        } else {
+            expected.clone()
+        };
+
+        for _ in 0..2 {
+            let actual: Vec<_> = if reverse {
+                db.iter_list("large")
+                    .rev()
+                    .map(|entry| entry.unwrap())
+                    .collect()
+            } else {
+                db.iter_list("large").map(|entry| entry.unwrap()).collect()
+            };
+            assert_eq!(actual, expected_order);
+            assert_eq!(db.list_len("large").unwrap(), expected.len());
+            assert_eq!(
+                db.peek_list_head("large").unwrap(),
+                expected.first().cloned()
+            );
+            assert_eq!(
+                db.peek_list_tail("large").unwrap(),
+                expected.last().cloned()
+            );
+            assert_eq!(db.stats().num_write_ops, original_writes);
+        }
+
+        drop(db);
+        let db = CandyStore::open(dir.path(), config).unwrap();
+        let actual: Vec<_> = db.iter_list("large").map(|entry| entry.unwrap()).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            db.pop_list_head("large").unwrap(),
+            expected.first().cloned()
+        );
+        assert_eq!(db.pop_list_tail("large").unwrap(), expected.last().cloned());
+    }
+}
+
+#[test]
 fn test_list_iteration_skips_holes_and_reverse() {
     let dir = tempdir().unwrap();
     let db = CandyStore::open(dir.path(), Config::default()).unwrap();

@@ -38,7 +38,8 @@ pub struct Config {
     pub reset_on_invalid_data: bool,
     /// Target background compaction throughput in bytes per second.
     pub compaction_throughput_bytes_per_sec: usize,
-    /// Compaction passes that may fail reading the same data-file entry before that entry is dropped (lost) so its file can be reclaimed.
+    /// Failed compaction reads of the same entry before attempting corruption cleanup.
+    /// If matching history cannot be read and protected with tombstones, the file is retained.
     pub compaction_max_read_failures: u32,
     /// perform a checkpoint (for crash-consistency) every this much time (`None` to disable)
     pub checkpoint_interval: Option<Duration>,

@@ -231,6 +231,117 @@ fn test_queue_persistence() -> Result<(), Error> {
 }
 
 #[test]
+fn test_queue_iteration_heals_boundary_holes() -> Result<(), Error> {
+    for reverse in [false, true] {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            max_data_file_size: 1024 * 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut indices = Vec::new();
+        for _ in 0..1003 {
+            indices.push(db.push_to_queue_tail("holes", "value")?);
+        }
+        for &index in &indices[1..1002] {
+            db.remove_from_queue("holes", index)?;
+        }
+        let (removed, remaining) = if reverse {
+            (indices[1002], indices[0])
+        } else {
+            (indices[0], indices[1002])
+        };
+        db.remove_from_queue("holes", removed)?;
+        assert!(db.queue_range("holes")?.len() > 1000);
+
+        let item = if reverse {
+            db.iter_queue("holes").next_back().transpose()?
+        } else {
+            db.iter_queue("holes").next().transpose()?
+        };
+        assert_eq!(item, Some((remaining, b"value".to_vec())));
+        assert_eq!(db.queue_range("holes")?, remaining..remaining + 1);
+        assert_eq!(db.queue_len("holes")?, 1);
+
+        drop(db);
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(db.queue_range("holes")?, remaining..remaining + 1);
+        assert_eq!(db.pop_queue_head_with_idx("holes")?, item);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_large_queue_iteration_preserves_metadata() -> Result<(), Error> {
+    for reverse in [false, true] {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            max_data_file_size: 1024 * 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        let mut expected = Vec::new();
+        for value in 0..1002u32 {
+            let value = value.to_le_bytes().to_vec();
+            let index = db.push_to_queue_tail("large", &value)?;
+            expected.push((index, value));
+        }
+        let original_range = db.queue_range("large")?;
+        let original_writes = db.stats().num_write_ops;
+        let expected_order = if reverse {
+            expected.iter().rev().cloned().collect::<Vec<_>>()
+        } else {
+            expected.clone()
+        };
+
+        for _ in 0..2 {
+            let actual = if reverse {
+                db.iter_queue("large")
+                    .rev()
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                db.iter_queue("large").collect::<Result<Vec<_>, _>>()?
+            };
+            assert_eq!(actual, expected_order);
+            assert_eq!(db.queue_range("large")?, original_range);
+            assert_eq!(db.queue_len("large")?, expected.len());
+            assert_eq!(
+                db.peek_queue_head_with_idx("large")?,
+                expected.first().cloned()
+            );
+            assert_eq!(
+                db.peek_queue_tail_with_idx("large")?,
+                expected.last().cloned()
+            );
+            assert_eq!(db.stats().num_write_ops, original_writes);
+        }
+
+        drop(db);
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(
+            db.iter_queue("large").collect::<Result<Vec<_>, _>>()?,
+            expected
+        );
+        assert_eq!(db.queue_range("large")?, original_range);
+        assert_eq!(
+            db.pop_queue_head_with_idx("large")?,
+            expected.first().cloned()
+        );
+        assert_eq!(
+            db.pop_queue_tail_with_idx("large")?,
+            expected.last().cloned()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_queue_reverse_iteration_skips_holes() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let db = CandyStore::open(dir.path(), Config::default())?;

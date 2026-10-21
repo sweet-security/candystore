@@ -38,26 +38,34 @@ pub struct QueueIterator<'a> {
 
 type QueueMetadata = RangeMetadata;
 
-impl<'a> QueueIterator<'a> {
-    fn try_heal_head(&self, new_head: u64) -> Result<()> {
+impl QueueIterator<'_> {
+    fn try_heal_head(&self, through_idx: u64) -> Result<()> {
         self.store.try_heal_range_head(
             self.ns.meta,
             &self.queue,
-            self.initial_next_idx,
-            new_head,
+            through_idx,
             |store, queue| get_queue_meta(store, self.ns, queue),
             |store, queue, meta| set_queue_meta(store, self.ns, queue, meta),
+            |store, queue, idx| {
+                Ok(store
+                    .get_ns(self.ns.data, &make_queue_data_key(queue, idx))?
+                    .is_some())
+            },
         )
     }
 
-    fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
+    fn try_heal_tail(&self, through_idx: u64) -> Result<()> {
         self.store.try_heal_range_tail(
             self.ns.meta,
             &self.queue,
-            self.initial_end_idx,
-            new_tail,
+            through_idx,
             |store, queue| get_queue_meta(store, self.ns, queue),
             |store, queue, meta| set_queue_meta(store, self.ns, queue, meta),
+            |store, queue, idx| {
+                Ok(store
+                    .get_ns(self.ns.data, &make_queue_data_key(queue, idx))?
+                    .is_some())
+            },
         )
     }
 }
@@ -73,7 +81,7 @@ impl Iterator for QueueIterator<'_> {
             let idx = self.next_idx;
             self.next_idx += 1;
 
-            if idx > self.initial_next_idx + 1000 {
+            if idx.saturating_sub(self.initial_next_idx) > 1000 {
                 let _ = self.try_heal_head(idx);
                 self.initial_next_idx = idx;
             }
@@ -102,7 +110,7 @@ impl DoubleEndedIterator for QueueIterator<'_> {
                 self.end_idx -= 1;
             }
 
-            if idx + 1000 < self.initial_end_idx {
+            if self.initial_end_idx.saturating_sub(idx) > 1000 {
                 let _ = self.try_heal_tail(idx);
                 self.initial_end_idx = idx;
             }
@@ -673,6 +681,120 @@ mod tests {
     use super::*;
 
     use crate::Config;
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    fn healing_config() -> Config {
+        Config {
+            max_data_file_size: 1024 * 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn queue_healing_revalidates_restored_items() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), healing_config())?;
+        let queue = b"restored";
+        let middle = db.push_to_queue_tail(queue, "middle")? as u64;
+        let mut meta = get_queue_meta(&db, QUEUE_NS, queue)?;
+        meta.head -= 1002;
+        meta.tail += 1002;
+        set_queue_meta(&db, QUEUE_NS, queue, meta)?;
+        let iterator = db.iter_queue(queue);
+        let restored_head = middle - 500;
+        let restored_tail = middle + 500;
+        let head_key = make_queue_data_key(queue, restored_head);
+        let tail_key = make_queue_data_key(queue, restored_tail);
+        assert_eq!(db.get_ns(QUEUE_NS.data, &head_key)?, None);
+        assert_eq!(db.get_ns(QUEUE_NS.data, &tail_key)?, None);
+
+        db.set_ns(QUEUE_NS.data, &head_key, b"head")?;
+        db.set_ns(QUEUE_NS.data, &tail_key, b"tail")?;
+        meta.count = 3;
+        set_queue_meta(&db, QUEUE_NS, queue, meta)?;
+
+        iterator.try_heal_head(middle)?;
+        iterator.try_heal_tail(middle)?;
+        let healed = get_queue_meta(&db, QUEUE_NS, queue)?;
+        assert_eq!(healed.head, restored_head);
+        assert_eq!(healed.tail, restored_tail);
+        assert_eq!(healed.count, 3);
+        assert_eq!(db.peek_queue_head(queue)?, Some(b"head".to_vec()));
+        assert_eq!(db.peek_queue_tail(queue)?, Some(b"tail".to_vec()));
+        assert_eq!(db.iter_queue(queue).collect::<Result<Vec<_>>>()?.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn queue_healing_skips_a_held_logical_lock() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = Arc::new(CandyStore::open(dir.path(), healing_config())?);
+        let queue = b"locked";
+        let middle = db.push_to_queue_tail(queue, "middle")? as u64;
+        let mut meta = get_queue_meta(&db, QUEUE_NS, queue)?;
+        meta.head -= 1002;
+        meta.tail += 1002;
+        set_queue_meta(&db, QUEUE_NS, queue, meta)?;
+
+        for reverse in [false, true] {
+            let guard = db.list_write_guard(QUEUE_NS.meta, queue);
+            let worker_db = Arc::clone(&db);
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let iterator = worker_db.iter_queue(queue);
+                let result = if reverse {
+                    iterator.try_heal_tail(middle)
+                } else {
+                    iterator.try_heal_head(middle)
+                };
+                done_tx.send(()).unwrap();
+                result
+            });
+            let completed_while_locked = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            drop(guard);
+            worker.join().unwrap()?;
+            assert!(
+                completed_while_locked,
+                "healing waited on an existing logical lock"
+            );
+            assert_eq!(get_queue_meta(&db, QUEUE_NS, queue)?, meta);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn queue_iteration_heals_fully_missing_ranges() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), healing_config())?;
+        let queue = b"missing";
+        for reverse in [false, true] {
+            set_queue_meta(
+                &db,
+                QUEUE_NS,
+                queue,
+                QueueMetadata {
+                    head: 0,
+                    tail: 1001,
+                    count: 1002,
+                },
+            )?;
+            let items = if reverse {
+                db.iter_queue(queue).rev().collect::<Result<Vec<_>>>()?
+            } else {
+                db.iter_queue(queue).collect::<Result<Vec<_>>>()?
+            };
+            assert!(items.is_empty());
+            assert_eq!(get_queue_meta(&db, QUEUE_NS, queue)?, QueueMetadata::new());
+        }
+        Ok(())
+    }
 
     #[test]
     fn queue_iterator_surfaces_invalid_metadata() -> Result<()> {

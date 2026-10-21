@@ -6,6 +6,45 @@ use candystore::{CandyStore, Config, Error};
 use tempfile::tempdir;
 
 #[test]
+fn test_iter_items_allows_rotation_while_paused() -> Result<(), Error> {
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+    let dir = tempdir().unwrap();
+    let db = Arc::new(CandyStore::open(
+        dir.path(),
+        Config {
+            max_data_file_size: 128,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        },
+    )?);
+    db.set("seed", vec![1; 64])?;
+    let mut iterator = db.iter_items();
+    assert!(iterator.next().unwrap().is_ok());
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer_db = db.clone();
+    let writer = thread::spawn(move || {
+        let result = writer_db.set("next", vec![2; 64]);
+        done_tx.send(()).unwrap();
+        result
+    });
+    let completed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    drop(iterator);
+    writer.join().unwrap()?;
+    assert!(
+        completed,
+        "rotation was blocked until the iterator was dropped"
+    );
+    assert_eq!(db.get("next")?, Some(vec![2; 64]));
+    Ok(())
+}
+
+#[test]
 fn test_iter_items_empty_db() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let db = CandyStore::open(dir.path(), Config::default())?;

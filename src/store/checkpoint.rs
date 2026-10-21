@@ -76,7 +76,7 @@ impl StoreInner {
         // this is not atomic but it's fine -- rotation triggers checkpointing so if the last checkpoint
         // happened before this file, we know a checkpoint is in progress. skip.
         let (ordinal, commit_offset) = self.index_file.checkpoint_cursor();
-        if self.active_file_ordinal.load(Ordering::Relaxed) != ordinal {
+        if ordinal != 0 && self.active_file_ordinal.load(Ordering::Relaxed) != ordinal {
             return;
         }
 
@@ -176,11 +176,6 @@ impl StoreInner {
         interval_elapsed: bool,
         snapshot: impl FnOnce() -> Result<CheckpointSnapshot>,
     ) -> CheckpointRun {
-        let _logical_guards = self
-            .list_meta_locks
-            .iter()
-            .map(|lock| lock.write())
-            .collect::<Vec<_>>();
         let state = self.checkpoint_state.lock();
         if self.checkpoint_shutting_down.load(Ordering::Acquire) {
             self.checkpoint_condvar.notify_all();
@@ -194,7 +189,6 @@ impl StoreInner {
         }
         drop(state);
 
-        let current_cursor = self.index_file.checkpoint_cursor();
         let snapshot = snapshot();
         let mut state = self.checkpoint_state.lock();
         if self.checkpoint_shutting_down.load(Ordering::Acquire) {
@@ -202,12 +196,7 @@ impl StoreInner {
             return CheckpointRun::Shutdown;
         }
         match snapshot {
-            Ok(snapshot)
-                if snapshot.checkpoint_ordinal == current_cursor.0
-                    && snapshot.checkpoint_offset == current_cursor.1
-                    && snapshot.checkpointed_delta == 0
-                    && !self.checkpoint_retry_needed.load(Ordering::Acquire) =>
-            {
+            Ok(snapshot) if self.is_checkpoint_noop(snapshot) => {
                 self.complete_checkpoint_noop(&mut state, target_epoch);
                 drop(state);
                 self.signal_compaction_scan();
@@ -247,7 +236,7 @@ impl StoreInner {
         started_at: Instant,
     ) {
         let snapshot_for_follow_up = snapshot.as_ref().ok().copied();
-        let result = snapshot.and_then(|snap| self.sync_checkpoint(snap));
+        let result = snapshot.and_then(|_| self.sync_checkpoint());
         let mut should_signal_compaction = false;
 
         let mut state = self.checkpoint_state.lock();
@@ -427,6 +416,88 @@ mod tests {
             assert_eq!(state.requested_epoch, next_epoch.unwrap());
             assert!(state.handled_epoch < state.requested_epoch);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_checkpoint_is_not_noop_when_inflight_write_masks_completed_delta() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = CandyStore::open(
+            dir.path(),
+            Config {
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Default::default()
+            },
+        )?;
+        db.set("seed", "v")?;
+        db.checkpoint()?;
+        db.stop_checkpoint_worker();
+        db.inner
+            .checkpoint_shutting_down
+            .store(false, Ordering::Release);
+
+        let (commit_ordinal, commit_offset) = db.inner.index_file.checkpoint_cursor();
+        let active_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let active_file = db.inner.data_files.read()[&active_idx].clone();
+
+        // Simulate a slow in-flight writer at the current checkpoint cursor on shard 0
+        // while a faster writer on shard 1 has already completed after it.
+        let (_, slow_guard) =
+            db.inner
+                .inflight_tracker
+                .reserve_for_test(&active_file, 0, commit_offset, 1)?;
+        db.set("completed-after-slow", "value")?;
+
+        let snap = db.inner.snapshot_checkpoint_progress()?;
+        assert_eq!(snap.checkpoint_ordinal, commit_ordinal);
+        assert_eq!(snap.checkpoint_offset, commit_offset);
+        assert_eq!(snap.checkpointed_delta, 0);
+        assert!(snap.has_pending_work);
+        assert!(!db.inner.is_checkpoint_noop(snap));
+
+        let _ = db.inner.request_checkpoint_epoch();
+        let run = db.inner.prepare_checkpoint_run(false);
+        assert!(matches!(run, CheckpointRun::Ready { .. }));
+
+        slow_guard.complete_with_delta(0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_checkpoint_waits_for_logical_list_locks() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let db = Arc::new(CandyStore::open(
+            dir.path(),
+            Config {
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Default::default()
+            },
+        )?);
+        db.stop_checkpoint_worker();
+
+        let guard = db.list_write_guard(crate::internal::KeyNamespace::ListMeta, b"locked-list");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_db = Arc::clone(&db);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let res = worker_db.inner.sync_checkpoint();
+            done_tx.send(()).unwrap();
+            res
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "sync_checkpoint completed while a logical list write lock was held"
+        );
+        drop(guard);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap()?;
         Ok(())
     }
 }

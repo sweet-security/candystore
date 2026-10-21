@@ -10,7 +10,7 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use siphasher::sip::SipHasher13;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hasher,
     path::{Path, PathBuf},
     sync::{
@@ -22,13 +22,16 @@ use std::{
 
 use crate::{
     data_file::{DataFile, InflightTracker},
-    index_file::{EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard},
+    index_file::{
+        EntryPointer, IndexFile, RowLayout, RowReadGuard, RowWriteGuard, RowsTableWriteGuard,
+    },
     internal::{
         EntryType, HashCoord, KVBuf, KeyNamespace, MASKED_ROW_SELECTOR_BITS, MAX_DATA_FILE_IDX,
         MAX_DATA_FILES, MIN_SPLIT_LEVEL, ROW_WIDTH, RangeMetadata, aligned_data_entry_size,
         aligned_data_entry_waste, aligned_tombstone_entry_waste, data_file_path, index_file_path,
         index_rows_file_path, invalid_data_error, is_corrupt_entry_error, sync_dir,
     },
+    pacer::Pacer,
     types::{
         Config, Error, GetOrCreateStatus, INITIAL_DATA_FILE_ORDINAL, ReplaceStatus, Result, Stats,
     },
@@ -80,6 +83,7 @@ struct CheckpointSnapshot {
     checkpoint_ordinal: u64,
     checkpoint_offset: u64,
     checkpointed_delta: i64,
+    has_pending_work: bool,
 }
 
 #[derive(Default)]
@@ -144,6 +148,8 @@ struct StoreInner {
     list_meta_locks_mask: usize,
     data_files: RwLock<HashMap<u16, Arc<DataFile>>>,
     inflight_tracker: InflightTracker,
+    pending_deletions: RwLock<HashMap<u64, HashCoord>>,
+    has_pending_deletions: AtomicBool,
     active_file_idx: AtomicU16,
     active_file_ordinal: AtomicU64,
     uncommitted_entries_delta: AtomicI64,
@@ -153,6 +159,7 @@ struct StoreInner {
     checkpoint_retry_needed: AtomicBool,
     rotation_lock: Mutex<()>,
     compaction_lock: Mutex<()>,
+    insert_generation: AtomicU64,
     compaction_read_failures: Mutex<HashMap<(u16, u64, u64), u32>>,
     compaction_state: Mutex<CompactionState>,
     compaction_condvar: Condvar,
@@ -209,6 +216,8 @@ impl StoreInner {
             list_meta_locks_mask: num_logical_locks - 1,
             data_files: RwLock::new(state.data_files),
             inflight_tracker: InflightTracker::new(num_shards),
+            pending_deletions: RwLock::new(HashMap::new()),
+            has_pending_deletions: AtomicBool::new(false),
             active_file_idx: AtomicU16::new(state.active_file_idx),
             active_file_ordinal: AtomicU64::new(state.active_file_ordinal),
             uncommitted_entries_delta: AtomicI64::new(0),
@@ -218,6 +227,7 @@ impl StoreInner {
             checkpoint_retry_needed: AtomicBool::new(false),
             rotation_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
+            insert_generation: AtomicU64::new(0),
             compaction_read_failures: Mutex::new(HashMap::new()),
             compaction_state: Mutex::new(CompactionState::default()),
             compaction_condvar: Condvar::new(),
@@ -237,6 +247,8 @@ impl StoreInner {
         let mut data_files = self.data_files.write();
 
         data_files.clear();
+        self.pending_deletions.write().clear();
+        self.has_pending_deletions.store(false, Ordering::Release);
         self.inflight_tracker.clear_all();
         self.index_file.reset(row_table)?;
 
@@ -344,20 +356,32 @@ impl StoreInner {
         let active_file_idx = self.active_file_idx.load(Ordering::Acquire);
         let commit_file_ordinal = self.index_file.checkpoint_cursor().0;
         let files = self.data_files.read();
+        let oldest_ordinal = files.values().map(|file| file.file_ordinal).min();
+        let insert_generation = self.insert_generation.load(Ordering::Acquire);
         let mut candidates = files
             .iter()
             .filter_map(|(&file_idx, data_file)| {
+                let retained =
+                    if oldest_ordinal.is_some_and(|ordinal| ordinal < data_file.file_ordinal) {
+                        data_file.retained_tombstone_bytes.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    };
+                let total_waste = u64::from(self.index_file.file_waste(file_idx));
+                let waste = total_waste.saturating_sub(retained);
+                let needs_rescan = data_file
+                    .tombstone_retention_generation
+                    .load(Ordering::Acquire)
+                    != insert_generation;
                 if file_idx == active_file_idx
                     || data_file.file_ordinal >= commit_file_ordinal
-                    || self.index_file.file_waste(file_idx) <= self.config.compaction_min_threshold
+                    || (waste <= u64::from(self.config.compaction_min_threshold)
+                        && (!needs_rescan
+                            || total_waste <= u64::from(self.config.compaction_min_threshold)))
                 {
                     return None;
                 }
-                Some((
-                    file_idx,
-                    data_file.file_ordinal,
-                    self.index_file.file_waste(file_idx),
-                ))
+                Some((file_idx, data_file.file_ordinal, waste))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -407,7 +431,88 @@ impl StoreInner {
             .fetch_add(delta, Ordering::Relaxed);
     }
 
+    fn is_pending_deletion(&self, entry: EntryPointer) -> bool {
+        self.has_pending_deletions.load(Ordering::Acquire)
+            && self.pending_deletions.read().contains_key(&entry.0)
+    }
+
+    fn pending_insert_slot(
+        &self,
+        row: &RowLayout,
+        files: &HashMap<u16, Arc<DataFile>>,
+        hc: HashCoord,
+        key: &[u8],
+    ) -> Result<Option<usize>> {
+        if !self.has_pending_deletions.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        for (col, entry) in row.iter_matches(hc) {
+            if self.is_pending_deletion(entry)
+                && let Some(file) = files.get(&entry.file_idx())
+            {
+                self.record_read(entry.size_hint() as u64);
+                match file.read_kv(entry.file_offset(), entry.size_hint()) {
+                    Ok(kv) if kv.key() == key => return Ok(Some(col)),
+                    Ok(_) => {}
+                    Err(err) if is_corrupt_entry_error(&err) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn purge_pending_deletions(&self, rows: &mut RowsTableWriteGuard<'_>) {
+        if !self.has_pending_deletions.load(Ordering::Acquire) {
+            return;
+        }
+        let mut pending = self.pending_deletions.write();
+        let global_level = self
+            .index_file
+            .header_ref()
+            .global_split_level
+            .load(Ordering::Acquire);
+        for (&pointer, &hc) in pending.iter() {
+            let mut previous_row = None;
+            for level in (MIN_SPLIT_LEVEL as u64..=global_level).rev() {
+                let row_idx = hc.row_index(level);
+                if previous_row == Some(row_idx) {
+                    continue;
+                }
+                previous_row = Some(row_idx);
+                let row = rows.row_mut(row_idx);
+                if row.split_level.load(Ordering::Acquire) == 0 {
+                    continue;
+                }
+                let col = row
+                    .iter_matches(hc)
+                    .find(|(_, entry)| entry.0 == pointer)
+                    .map(|(col, _)| col);
+                if let Some(col) = col {
+                    row.remove(col);
+                }
+            }
+        }
+        pending.clear();
+        self.has_pending_deletions.store(false, Ordering::Release);
+    }
+
+    fn purge_pending_row(&self, row: &mut RowLayout, row_idx: usize) {
+        let mut pending = self.pending_deletions.write();
+        let level = row.split_level.load(Ordering::Acquire);
+        for col in 0..ROW_WIDTH {
+            if row.entry_belongs_to_row(col, row_idx, level)
+                && pending.remove(&row.pointers[col].0).is_some()
+            {
+                row.remove(col);
+            }
+        }
+        self.has_pending_deletions
+            .store(!pending.is_empty(), Ordering::Release);
+    }
+
     /// Unlinks an index slot whose data-file entry can no longer be parsed.
+    #[cfg(test)]
     fn drop_corrupt_entry(&self, row: &mut RowWriteGuard<'_>, col: usize) {
         self.unlink_corrupt_entry(row, col);
         self.add_uncommitted_num_entries(-1);
@@ -418,6 +523,10 @@ impl StoreInner {
     fn unlink_corrupt_entry(&self, row: &mut RowWriteGuard<'_>, col: usize) {
         let ptr = row.pointers[col];
         row.remove(col);
+        self.record_corrupt_entry_drop(ptr);
+    }
+
+    fn record_corrupt_entry_drop(&self, ptr: EntryPointer) {
         let waste = ptr.size_hint() as u32;
         let new_waste = self.index_file.add_file_waste(ptr.file_idx(), waste);
         self.maybe_signal_compaction_threshold_crossing(
@@ -428,6 +537,112 @@ impl StoreInner {
         self.stats
             .num_corrupt_entries_dropped
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn retire_corrupt_entry(
+        &self,
+        row: &mut RowWriteGuard<'_>,
+        files: &HashMap<u16, Arc<DataFile>>,
+        col: usize,
+        hc: HashCoord,
+        protected_key: Option<(KeyNamespace, &[u8])>,
+        mut pacer: Option<&mut Pacer>,
+    ) -> Result<bool> {
+        let pointer = row.pointers[col];
+        let source = files
+            .get(&pointer.file_idx())
+            .ok_or(Error::MissingDataFile(pointer.file_idx()))?;
+        let level = row.split_level.load(Ordering::Acquire);
+        let mut keys = HashSet::new();
+        let mut read_buf = Vec::new();
+        for file in files
+            .values()
+            .filter(|file| file.file_ordinal <= source.file_ordinal)
+        {
+            if pacer.is_some() && self.compaction_shutting_down.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let mut offset = 0;
+            let mut buffer_offset = 0;
+            read_buf.clear();
+            while let Some((kv, _, next_offset)) =
+                file.read_next_entry_ref(offset, &mut read_buf, &mut buffer_offset)?
+            {
+                if let Some(pacer) = pacer.as_deref_mut()
+                    && !pacer.consume_interruptibly(next_offset - offset, || {
+                        self.compaction_shutting_down.load(Ordering::Acquire)
+                    })
+                {
+                    return Ok(false);
+                }
+                offset = next_offset;
+                let Some(ns) = KeyNamespace::from_u8(kv.ns) else {
+                    return Err(invalid_data_error(
+                        "unknown namespace during corruption cleanup",
+                    ));
+                };
+                let candidate = HashCoord::new(ns, kv.key(), self.config.hash_key);
+                if candidate.sig == row.signatures[col]
+                    && candidate.masked_row_selector() == pointer.masked_row_selector()
+                    && candidate.row_index(level) == hc.row_index(level)
+                {
+                    keys.insert((kv.ns, kv.key().to_vec()));
+                }
+            }
+        }
+        for (ns, key) in keys {
+            if pacer.is_some() && self.compaction_shutting_down.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let ns = KeyNamespace::from_u8(ns).unwrap();
+            if protected_key.is_some_and(|(protected_ns, protected)| {
+                protected_ns as u8 == ns as u8 && protected == key
+            }) {
+                continue;
+            }
+            let coordinate = HashCoord::new(ns, &key, self.config.hash_key);
+            let mut has_live_value = false;
+            for (other_col, entry) in row.iter_matches(coordinate) {
+                if other_col == col || self.is_pending_deletion(entry) {
+                    continue;
+                }
+                let file = files
+                    .get(&entry.file_idx())
+                    .ok_or(Error::MissingDataFile(entry.file_idx()))?;
+                match file.read_kv(entry.file_offset(), entry.size_hint()) {
+                    Ok(kv) if kv.key() == key => {
+                        has_live_value = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(err) if is_corrupt_entry_error(&err) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            if has_live_value {
+                continue;
+            }
+            let active_idx = self.active_file_idx.load(Ordering::Acquire);
+            let active = files
+                .get(&active_idx)
+                .ok_or(Error::MissingDataFile(active_idx))?;
+            let (offset, size, guard) =
+                active.append_tombstone(ns, &key, row.shard_idx, &self.inflight_tracker)?;
+            self.record_write(offset, size as u64);
+            self.index_file.add_file_waste(active_idx, size as u32);
+            guard.complete_with_delta(0);
+        }
+        let active_idx = self.active_file_idx.load(Ordering::Acquire);
+        files
+            .get(&active_idx)
+            .ok_or(Error::MissingDataFile(active_idx))?
+            .sync_to_current()?;
+        self.pending_deletions.write().insert(pointer.0, hc);
+        self.has_pending_deletions.store(true, Ordering::Release);
+        self.record_corrupt_entry_drop(pointer);
+        self.add_uncommitted_num_entries(-1);
+        self.inflight_tracker.record_index_delta(row.shard_idx, -1);
+        Ok(true)
     }
 
     /// Finds the live entry for `key` in `row`, dropping any corrupt candidates on the way.
@@ -442,6 +657,9 @@ impl StoreInner {
         let mut corrupt_cols = Vec::new();
         let mut found = None;
         for (col, entry) in row.iter_matches(hc) {
+            if self.is_pending_deletion(entry) {
+                continue;
+            }
             let Some(file) = files.get(&entry.file_idx()) else {
                 continue;
             };
@@ -473,7 +691,14 @@ impl StoreInner {
             guard.complete_with_delta(0);
         }
         for col in corrupt_cols {
-            self.drop_corrupt_entry(row, col);
+            self.retire_corrupt_entry(
+                row,
+                files,
+                col,
+                hc,
+                found.is_none().then_some((ns, key)),
+                None,
+            )?;
         }
         Ok(found)
     }
@@ -527,15 +752,19 @@ impl StoreInner {
 
     fn perform_checkpoint(&self) -> Result<()> {
         let snapshot = self.snapshot_checkpoint_progress()?;
-        let current_cursor = self.index_file.checkpoint_cursor();
-        if snapshot.checkpoint_ordinal == current_cursor.0
-            && snapshot.checkpoint_offset == current_cursor.1
-            && snapshot.checkpointed_delta == 0
-            && !self.checkpoint_retry_needed.load(Ordering::Acquire)
-        {
+        if self.is_checkpoint_noop(snapshot) {
             return Ok(());
         }
-        self.sync_checkpoint(snapshot)
+        self.sync_checkpoint()
+    }
+
+    fn is_checkpoint_noop(&self, snapshot: CheckpointSnapshot) -> bool {
+        let current_cursor = self.index_file.checkpoint_cursor();
+        snapshot.checkpoint_ordinal == current_cursor.0
+            && snapshot.checkpoint_offset == current_cursor.1
+            && snapshot.checkpointed_delta == 0
+            && !snapshot.has_pending_work
+            && !self.checkpoint_retry_needed.load(Ordering::Acquire)
     }
 
     fn snapshot_checkpoint_progress(&self) -> Result<CheckpointSnapshot> {
@@ -545,16 +774,17 @@ impl StoreInner {
             .get(&active_idx)
             .cloned()
             .ok_or(Error::MissingDataFile(active_idx))?;
-        let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta, _) =
+        let (checkpoint_ordinal, checkpoint_offset, checkpointed_delta, _, has_pending_work) =
             self.inflight_tracker.checkpoint_progress(&active_file);
         Ok(CheckpointSnapshot {
             checkpoint_ordinal,
             checkpoint_offset,
             checkpointed_delta,
+            has_pending_work,
         })
     }
 
-    fn sync_checkpoint(&self, _snap: CheckpointSnapshot) -> Result<()> {
+    fn sync_checkpoint(&self) -> Result<()> {
         let result = self.sync_checkpoint_data();
         self.checkpoint_retry_needed
             .store(result.is_err(), Ordering::Release);
@@ -568,9 +798,17 @@ impl StoreInner {
             data_file.sync_to_current()?;
         }
 
+        // Hold all logical list/queue locks before freezing the index rows so
+        // compound list/queue mutations cannot be split across a checkpoint.
+        let _logical_guards = self
+            .list_meta_locks
+            .iter()
+            .map(|lock| lock.write())
+            .collect::<Vec<_>>();
+
         // Holding the rows write lock blocks every append/publish, so after this
         // point used_bytes is a true durable frontier once synced.
-        let rows_table = self.index_file.rows_table_mut();
+        let mut rows_table = self.index_file.rows_table_mut();
         let _rotation_lock = self.rotation_lock.lock();
         let files = self.data_files.read();
         let active_idx = self.active_file_idx.load(Ordering::Acquire);
@@ -581,8 +819,9 @@ impl StoreInner {
         for data_file in files.values() {
             data_file.sync_to_current()?;
         }
+        self.purge_pending_deletions(&mut rows_table);
 
-        let (checkpoint_ordinal, checkpoint_offset, _, completed_before_seq) =
+        let (checkpoint_ordinal, checkpoint_offset, _, completed_before_seq, _) =
             self.inflight_tracker.checkpoint_progress(active_file);
         let drained_delta = self
             .inflight_tracker
@@ -607,11 +846,6 @@ impl StoreInner {
     }
 
     fn perform_checkpoint_with_logical_locks(&self) -> Result<()> {
-        let _logical_guards = self
-            .list_meta_locks
-            .iter()
-            .map(|lock| lock.write())
-            .collect::<Vec<_>>();
         self.perform_checkpoint()
     }
     fn _split_row(&self, hc: HashCoord, sl: u64, gsl: u64) -> Result<()> {
@@ -621,6 +855,31 @@ impl StoreInner {
         }
         let low_row_idx = hc.row_index(sl);
         let high_row_idx = low_row_idx | (1 << sl);
+
+        if self.has_pending_deletions.load(Ordering::Acquire) {
+            let rows = self.index_file.rows_table();
+            let mut row = rows.row_mut(low_row_idx);
+            if row.split_level.load(Ordering::Acquire) != sl {
+                return Ok(());
+            }
+            if self
+                .index_file
+                .header_ref()
+                .global_split_level
+                .load(Ordering::Acquire)
+                == sl
+                && (0..ROW_WIDTH).any(|col| {
+                    row.entry_belongs_to_row(col, low_row_idx, sl)
+                        && self.is_pending_deletion(row.pointers[col])
+                })
+            {
+                for file in self.data_files.read().values() {
+                    file.sync_to_current()?;
+                }
+                self.purge_pending_row(&mut row, low_row_idx);
+                return Ok(());
+            }
+        }
 
         if nsl > gsl
             && let Some(remap_dur) = self.index_file.grow(nsl)?
@@ -878,45 +1137,75 @@ impl CandyStore {
         self.inner.list_meta_locks[self.inner.logical_lock_index(ns, key)].write()
     }
 
-    fn try_heal_range_head<GetMeta, SetMeta>(
+    fn try_heal_range_head<GetMeta, SetMeta, HasItem>(
         &self,
         meta_ns: KeyNamespace,
         range_key: &[u8],
-        initial_next_idx: u64,
-        new_head: u64,
+        through_idx: u64,
         mut get_meta: GetMeta,
         mut set_meta: SetMeta,
+        mut has_item: HasItem,
     ) -> Result<()>
     where
         GetMeta: FnMut(&CandyStore, &[u8]) -> Result<RangeMetadata>,
         SetMeta: FnMut(&CandyStore, &[u8], RangeMetadata) -> Result<()>,
+        HasItem: FnMut(&CandyStore, &[u8], u64) -> Result<bool>,
     {
-        let _lock = self.list_write_guard(meta_ns, range_key);
+        let Some(_lock) = self.inner.list_meta_locks
+            [self.inner.logical_lock_index(meta_ns, range_key)]
+        .try_write() else {
+            return Ok(());
+        };
         let mut meta = get_meta(self, range_key)?;
-        if meta.head >= initial_next_idx && meta.head < new_head {
-            meta.head = new_head;
+        let original_meta = meta;
+        while meta.head <= through_idx && meta.head <= meta.tail {
+            if has_item(self, range_key, meta.head)? {
+                break;
+            }
+            if meta.head == meta.tail {
+                meta = RangeMetadata::new();
+                break;
+            }
+            meta.head += 1;
+        }
+        if meta != original_meta {
             set_meta(self, range_key, meta)?;
         }
         Ok(())
     }
 
-    fn try_heal_range_tail<GetMeta, SetMeta>(
+    fn try_heal_range_tail<GetMeta, SetMeta, HasItem>(
         &self,
         meta_ns: KeyNamespace,
         range_key: &[u8],
-        initial_end_idx: u64,
-        new_tail: u64,
+        through_idx: u64,
         mut get_meta: GetMeta,
         mut set_meta: SetMeta,
+        mut has_item: HasItem,
     ) -> Result<()>
     where
         GetMeta: FnMut(&CandyStore, &[u8]) -> Result<RangeMetadata>,
         SetMeta: FnMut(&CandyStore, &[u8], RangeMetadata) -> Result<()>,
+        HasItem: FnMut(&CandyStore, &[u8], u64) -> Result<bool>,
     {
-        let _lock = self.list_write_guard(meta_ns, range_key);
+        let Some(_lock) = self.inner.list_meta_locks
+            [self.inner.logical_lock_index(meta_ns, range_key)]
+        .try_write() else {
+            return Ok(());
+        };
         let mut meta = get_meta(self, range_key)?;
-        if meta.tail <= initial_end_idx && meta.tail > new_tail {
-            meta.tail = new_tail;
+        let original_meta = meta;
+        while meta.tail >= through_idx && meta.head <= meta.tail {
+            if has_item(self, range_key, meta.tail)? {
+                break;
+            }
+            if meta.head == meta.tail {
+                meta = RangeMetadata::new();
+                break;
+            }
+            meta.tail -= 1;
+        }
+        if meta != original_meta {
             set_meta(self, range_key, meta)?;
         }
         Ok(())
@@ -959,6 +1248,9 @@ impl CandyStore {
         self._immut_op(ns, key, |hc, row, key| {
             let files = self.inner.data_files.read();
             for (_, entry) in row.iter_matches(hc) {
+                if self.inner.is_pending_deletion(entry) {
+                    continue;
+                }
                 let Some(file) = files.get(&entry.file_idx()) else {
                     continue;
                 };
@@ -1014,7 +1306,12 @@ impl CandyStore {
                     return Ok(GetOrCreateStatus::ExistingValue(kv.into_value()));
                 }
 
-                if let Some(col) = row.find_free_slot() {
+                let slot = self
+                    .inner
+                    .pending_insert_slot(&row, &files, hc, key)?
+                    .or_else(|| row.find_free_slot());
+                if let Some(col) = slot {
+                    let previous = row.pointers[col];
                     let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
                     let active_file = files
                         .get(&active_idx)
@@ -1028,11 +1325,13 @@ impl CandyStore {
                         &self.inner.inflight_tracker,
                     )?;
                     self.inner.record_write(file_off, size as u64);
-                    row.insert(
-                        col,
-                        hc.sig,
-                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
-                    );
+                    let pointer =
+                        EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector());
+                    if self.inner.is_pending_deletion(previous) {
+                        row.replace_pointer(col, pointer);
+                    } else {
+                        row.insert(col, hc.sig, pointer);
+                    }
                     self.record_write_stats(key.len(), val.len());
                     inflight_guard.complete();
                     Ok(GetOrCreateStatus::CreatedNew(val.to_vec()))
@@ -1063,6 +1362,7 @@ impl CandyStore {
 
     fn record_write_stats(&self, klen: usize, vlen: usize) {
         let entry_size = aligned_data_entry_size(klen, vlen);
+        self.inner.insert_generation.fetch_add(1, Ordering::Release);
         self.inner.add_uncommitted_num_entries(1);
         self.inner
             .stats
@@ -1150,7 +1450,12 @@ impl CandyStore {
                 return Ok(Some(old_val));
             }
 
-            if let Some(col) = row.find_free_slot() {
+            let slot = self
+                .inner
+                .pending_insert_slot(&row, &files, hc, key)?
+                .or_else(|| row.find_free_slot());
+            if let Some(col) = slot {
+                let previous = row.pointers[col];
                 let active_idx = self.inner.active_file_idx.load(Ordering::Acquire);
                 let active_file = files
                     .get(&active_idx)
@@ -1165,11 +1470,13 @@ impl CandyStore {
                 )?;
                 self.inner.record_write(file_off, size as u64);
                 crate::crash_point("set_after_write_before_insert");
-                row.insert(
-                    col,
-                    hc.sig,
-                    EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector()),
-                );
+                let pointer =
+                    EntryPointer::new(active_idx, file_off, size, hc.masked_row_selector());
+                if self.inner.is_pending_deletion(previous) {
+                    row.replace_pointer(col, pointer);
+                } else {
+                    row.insert(col, hc.sig, pointer);
+                }
                 self.record_write_stats(key.len(), val.len());
                 inflight_guard.complete();
                 Ok(None)
@@ -1303,7 +1610,13 @@ impl CandyStore {
             )?;
             self.inner.record_write(file_off, tombstone_size as u64);
 
-            row.remove(col);
+            self.inner
+                .pending_deletions
+                .write()
+                .insert(row.pointers[col].0, hc);
+            self.inner
+                .has_pending_deletions
+                .store(true, Ordering::Release);
             self.track_tombstone_waste(src_file_idx, klen, vlen);
             self.record_remove_stats();
             inflight_guard.complete();
@@ -1319,22 +1632,18 @@ impl CandyStore {
     /// Iterates over all currently live user key/value pairs.
     pub fn iter_items(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
         let mut row_idx = 0usize;
-        let mut row_entries: Vec<EntryPointer> = Vec::with_capacity(ROW_WIDTH);
-        let mut batch_files = None::<RwLockReadGuard<'_, HashMap<u16, Arc<DataFile>>>>;
+        let mut row_entries: Vec<(EntryPointer, Arc<DataFile>)> = Vec::with_capacity(ROW_WIDTH);
         let mut scratch_buf = Vec::new();
         let mut ptr_idx = 0usize;
 
         std::iter::from_fn(move || {
             loop {
                 if ptr_idx < row_entries.len() {
-                    let ptr = row_entries[ptr_idx];
+                    let (ptr, file) = &row_entries[ptr_idx];
                     ptr_idx += 1;
-                    let files = batch_files
-                        .as_ref()
-                        .expect("row entries should only be drained with a file map guard");
-                    let Some(file) = files.get(&ptr.file_idx()) else {
+                    if self.inner.is_pending_deletion(*ptr) {
                         continue;
-                    };
+                    }
                     self.inner.record_read(ptr.size_hint() as u64);
                     let kv = match file.read_kv_into(
                         ptr.file_offset(),
@@ -1359,7 +1668,6 @@ impl CandyStore {
                 }
 
                 row_entries.clear();
-                batch_files = None;
                 ptr_idx = 0;
 
                 loop {
@@ -1384,18 +1692,20 @@ impl CandyStore {
                     if sl == 0 {
                         continue;
                     }
+                    let files = self.inner.data_files.read();
                     for col in 0..ROW_WIDTH {
                         if row.signatures[col] != HashCoord::INVALID_SIG
                             && row.pointers[col].is_valid()
                             && row.entry_belongs_to_row(col, idx, sl)
+                            && !self.inner.is_pending_deletion(row.pointers[col])
+                            && let Some(file) = files.get(&row.pointers[col].file_idx())
                         {
-                            row_entries.push(row.pointers[col]);
+                            row_entries.push((row.pointers[col], file.clone()));
                         }
                     }
                     if row_entries.is_empty() {
                         continue;
                     }
-                    batch_files = Some(self.inner.data_files.read());
                     break;
                 }
 
@@ -1471,7 +1781,13 @@ impl CandyStore {
             .iter()
             .map(|lock| lock.write())
             .collect::<Vec<_>>();
-        let row_table = self.inner.index_file.rows_table_mut();
+        let mut row_table = self.inner.index_file.rows_table_mut();
+        if self.inner.has_pending_deletions.load(Ordering::Acquire) {
+            for file in self.inner.data_files.read().values() {
+                file.sync_to_current()?;
+            }
+            self.inner.purge_pending_deletions(&mut row_table);
+        }
 
         let min_wasted_ratio = min_wasted_ratio.clamp(0.0, 1.0);
         let current_rows = row_table.row_guard.len() / std::mem::size_of::<RowLayout>();

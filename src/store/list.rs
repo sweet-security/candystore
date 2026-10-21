@@ -43,25 +43,37 @@ pub struct ListIterator<'a> {
 type ListMetadata = RangeMetadata;
 
 impl ListIterator<'_> {
-    fn try_heal_head(&self, new_head: u64) -> Result<()> {
+    fn has_item_at(&self, idx: u64) -> Result<bool> {
+        let idx_key = make_list_index_key(&self.list, idx);
+        let Some(key) = self.store.get_ns(self.ns.index, &idx_key)? else {
+            return Ok(false);
+        };
+        let data_key = make_list_data_key(&self.list, &key);
+        Ok(self
+            .store
+            .get_ns(self.ns.data, &data_key)?
+            .is_some_and(|value| extract_idx_suffix(&value) == idx))
+    }
+
+    fn try_heal_head(&self, through_idx: u64) -> Result<()> {
         self.store.try_heal_range_head(
             self.ns.meta,
             &self.list,
-            self.initial_next_idx,
-            new_head,
+            through_idx,
             |store, list| get_list_meta(store, self.ns, list),
             |store, list, meta| set_list_meta(store, self.ns, list, meta),
+            |_, _, idx| self.has_item_at(idx),
         )
     }
 
-    fn try_heal_tail(&self, new_tail: u64) -> Result<()> {
+    fn try_heal_tail(&self, through_idx: u64) -> Result<()> {
         self.store.try_heal_range_tail(
             self.ns.meta,
             &self.list,
-            self.initial_end_idx,
-            new_tail,
+            through_idx,
             |store, list| get_list_meta(store, self.ns, list),
             |store, list, meta| set_list_meta(store, self.ns, list, meta),
+            |_, _, idx| self.has_item_at(idx),
         )
     }
 }
@@ -77,7 +89,7 @@ impl Iterator for ListIterator<'_> {
             let idx = self.next_idx;
             self.next_idx += 1;
 
-            if idx > self.initial_next_idx + 1000 {
+            if idx.saturating_sub(self.initial_next_idx) > 1000 {
                 let _ = self.try_heal_head(idx);
                 self.initial_next_idx = idx;
             }
@@ -96,7 +108,9 @@ impl Iterator for ListIterator<'_> {
                 Err(err) => return Some(Err(err)),
             };
 
-            return Some(Ok((key, strip_idx_suffix(value))));
+            if extract_idx_suffix(&value) == idx {
+                return Some(Ok((key, strip_idx_suffix(value))));
+            }
         }
 
         None
@@ -116,7 +130,7 @@ impl DoubleEndedIterator for ListIterator<'_> {
                 self.end_idx -= 1;
             }
 
-            if idx + 1000 < self.initial_end_idx {
+            if self.initial_end_idx.saturating_sub(idx) > 1000 {
                 let _ = self.try_heal_tail(idx);
                 self.initial_end_idx = idx;
             }
@@ -135,7 +149,9 @@ impl DoubleEndedIterator for ListIterator<'_> {
                 Err(err) => return Some(Err(err)),
             };
 
-            return Some(Ok((key, strip_idx_suffix(value))));
+            if extract_idx_suffix(&value) == idx {
+                return Some(Ok((key, strip_idx_suffix(value))));
+            }
         }
 
         None
@@ -322,6 +338,10 @@ impl CandyStore {
                     stale_indexes.push(idx);
                     continue;
                 };
+                if extract_idx_suffix(&value_with_idx) != idx {
+                    stale_indexes.push(idx);
+                    continue;
+                }
                 let value = strip_idx_suffix(value_with_idx.clone());
                 items.push((idx, key, value_with_idx, value));
             }
@@ -353,32 +373,33 @@ impl CandyStore {
         }
 
         let mut meta = original_meta;
-        let original_tail = meta.tail;
-        let mut new_tail = meta.tail;
         let mut retained_count = 0u64;
         for ((idx, key, _, value), retain) in items.into_iter().zip(retain) {
             let idx_key = make_list_index_key(list_key, idx);
             let data_key = make_list_data_key(list_key, &key);
-            self.remove_ns(ns.index, &idx_key)?;
 
             if retain {
-                new_tail += 1;
-                let new_value = append_idx_suffix(&value, new_tail);
-                self.set_ns(ns.data, &data_key, &new_value)?;
-
-                let new_idx_key = make_list_index_key(list_key, new_tail);
+                let new_idx = meta.head + retained_count;
+                let new_idx_key = make_list_index_key(list_key, new_idx);
                 self.set_ns(ns.index, &new_idx_key, &key)?;
+                crate::crash_point("retain_after_index_before_data");
+                let new_value = append_idx_suffix(&value, new_idx);
+                self.set_ns(ns.data, &data_key, &new_value)?;
+                crate::crash_point("retain_after_data_before_unlink");
+                if idx != new_idx {
+                    self.remove_ns(ns.index, &idx_key)?;
+                }
                 retained_count += 1;
             } else {
                 self.remove_ns(ns.data, &data_key)?;
+                self.remove_ns(ns.index, &idx_key)?;
             }
         }
 
         if retained_count == 0 {
             meta = ListMetadata::new();
         } else {
-            meta.head = original_tail + 1;
-            meta.tail = new_tail;
+            meta.tail = meta.head + retained_count - 1;
             meta.count = retained_count;
         }
 
@@ -514,35 +535,37 @@ impl CandyStore {
         let _lock = self.list_write_guard(ns.meta, list);
         let mut meta = get_list_meta(self, ns, list)?;
         let data_key = make_list_data_key(list, key);
-
-        let mut old_value = None;
-        let mut old_idx_key = None;
-        if let Some(existing) = self.get_ns(ns.data, &data_key)? {
-            let idx = extract_idx_suffix(&existing);
-            old_idx_key = Some(make_list_index_key(list, idx));
-            old_value = Some(strip_idx_suffix(existing));
-        } else {
-            meta.count += 1;
-        }
-
         let new_idx = meta.tail + 1;
-        let value_with_idx = append_idx_suffix(value, new_idx);
-        self.set_ns(ns.data, &data_key, &value_with_idx)?;
-
         let idx_key = make_list_index_key(list, new_idx);
+
+        let Some(existing) = self.get_ns(ns.data, &data_key)? else {
+            let value_with_idx = append_idx_suffix(value, new_idx);
+            self.set_ns(ns.data, &data_key, &value_with_idx)?;
+            self.set_ns(ns.index, &idx_key, key)?;
+            meta.count += 1;
+            if meta.count == 1 {
+                meta.head = new_idx;
+            }
+            meta.tail = new_idx;
+            set_list_meta(self, ns, list, meta)?;
+            return Ok(None);
+        };
+
+        // The data suffix is the commit point; publish its target position first.
+        let old_idx = extract_idx_suffix(&existing);
         self.set_ns(ns.index, &idx_key, key)?;
-
-        if let Some(old_idx_key) = old_idx_key {
-            self.remove_ns(ns.index, &old_idx_key)?;
-        }
-
-        if meta.count == 1 {
-            meta.head = new_idx;
-        }
         meta.tail = new_idx;
         set_list_meta(self, ns, list, meta)?;
+        self.set_ns(ns.data, &data_key, &append_idx_suffix(value, new_idx))?;
+        if old_idx != new_idx {
+            self.remove_ns(ns.index, &make_list_index_key(list, old_idx))?;
+        }
+        if meta.count == 1 {
+            meta.head = new_idx;
+            set_list_meta(self, ns, list, meta)?;
+        }
 
-        Ok(old_value)
+        Ok(Some(strip_idx_suffix(existing)))
     }
 
     pub(super) fn list_get_with_ns(
@@ -706,29 +729,26 @@ impl CandyStore {
 
         let limit = meta.tail;
         while meta.head <= limit {
-            let idx_key = make_list_index_key(list, meta.head);
+            let idx = meta.head;
+            let idx_key = make_list_index_key(list, idx);
             if let Some(key) = self.get_ns(ns.index, &idx_key)? {
                 let data_key = make_list_data_key(list, &key);
-                if let Some(value_with_idx) = self.get_ns(ns.data, &data_key)? {
+                if let Some(value_with_idx) = self.get_ns(ns.data, &data_key)?
+                    && extract_idx_suffix(&value_with_idx) == idx
+                {
+                    // The data suffix is the commit point; publish its target position first.
+                    let new_idx = meta.tail + 1;
+                    self.set_ns(ns.index, &make_list_index_key(list, new_idx), &key)?;
+                    meta.tail = new_idx;
+                    set_list_meta(self, ns, list, meta)?;
                     let value = strip_idx_suffix(value_with_idx);
-
-                    meta.tail += 1;
-                    let new_idx = meta.tail;
-                    let new_value_with_idx = append_idx_suffix(&value, new_idx);
-                    // Overwrite data in-place (not remove+set) to avoid data
-                    // loss if a crash occurs between the two operations
-                    self.set_ns(ns.data, &data_key, &new_value_with_idx)?;
-
-                    // Write new index before removing old so the entry is
-                    // always reachable via at least one index position
-                    let new_idx_key = make_list_index_key(list, new_idx);
-                    self.set_ns(ns.index, &new_idx_key, &key)?;
+                    self.set_ns(ns.data, &data_key, &append_idx_suffix(&value, new_idx))?;
                 }
                 self.remove_ns(ns.index, &idx_key)?;
             }
             meta.head += 1;
-            set_list_meta(self, ns, list, meta)?;
         }
+        set_list_meta(self, ns, list, meta)?;
 
         Ok(true)
     }
@@ -906,6 +926,69 @@ mod tests {
     use super::*;
 
     use crate::Config;
+
+    #[test]
+    fn list_iteration_heals_boundary_holes() -> Result<()> {
+        for reverse in [false, true] {
+            let dir = tempfile::tempdir().map_err(Error::IOError)?;
+            let db = CandyStore::open(
+                dir.path(),
+                Config {
+                    max_data_file_size: 1024 * 1024,
+                    checkpoint_interval: None,
+                    checkpoint_delta_bytes: None,
+                    compaction_throughput_bytes_per_sec: 0,
+                    ..Config::default()
+                },
+            )?;
+            let list = b"holes";
+            db.set_in_list(list, "live", "value")?;
+            let original = get_list_meta(&db, LIST_NS, list)?;
+            let mut sparse = original;
+            sparse.head -= 1002;
+            sparse.tail += 1002;
+            db.set_ns(
+                LIST_NS.index,
+                &make_list_index_key(list, sparse.head),
+                b"missing-head",
+            )?;
+            db.set_ns(
+                LIST_NS.index,
+                &make_list_index_key(list, sparse.tail),
+                b"missing-tail",
+            )?;
+            set_list_meta(&db, LIST_NS, list, sparse)?;
+
+            let expected = Some((b"live".to_vec(), b"value".to_vec()));
+            let item = if reverse {
+                db.iter_list(list).next_back().transpose()?
+            } else {
+                db.iter_list(list).next().transpose()?
+            };
+            assert_eq!(item, expected);
+            let healed = get_list_meta(&db, LIST_NS, list)?;
+            if reverse {
+                assert_eq!(healed.tail, original.tail);
+                assert_eq!(healed.head, sparse.head);
+                assert_eq!(db.iter_list(list).next().transpose()?, expected);
+            } else {
+                assert_eq!(healed.head, original.head);
+                assert_eq!(healed.tail, sparse.tail);
+                assert_eq!(db.iter_list(list).next_back().transpose()?, expected);
+            }
+            assert_eq!(get_list_meta(&db, LIST_NS, list)?, original);
+
+            set_list_meta(&db, LIST_NS, list, sparse)?;
+            let popped = if reverse {
+                db.pop_list_tail(list)?
+            } else {
+                db.pop_list_head(list)?
+            };
+            assert_eq!(popped, expected);
+            assert_eq!(db.list_len(list)?, 0);
+        }
+        Ok(())
+    }
 
     #[test]
     fn list_iterator_surfaces_invalid_metadata() -> Result<()> {

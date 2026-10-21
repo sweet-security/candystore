@@ -1,7 +1,7 @@
-use memmap2::MmapMut;
+use memmap2::MmapRaw;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use simd_itertools::PositionSimd;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::{
     fs::File,
@@ -243,34 +243,13 @@ fn row_offset(idx: usize) -> usize {
     idx * size_of::<RowLayout>()
 }
 
-fn row_bytes(bytes: &[u8], idx: usize) -> &[u8] {
-    let start = row_offset(idx);
-    let end = start + size_of::<RowLayout>();
-    &bytes[start..end]
-}
-
-fn row_bytes_mut(bytes: &mut [u8], idx: usize) -> &mut [u8] {
-    let start = row_offset(idx);
-    let end = start + size_of::<RowLayout>();
-    &mut bytes[start..end]
-}
-
-fn row_ref_bytes(bytes: &[u8], idx: usize) -> &RowLayout {
-    unsafe { &*(row_bytes(bytes, idx).as_ptr() as *const RowLayout) }
-}
-
-fn row_mut_bytes(bytes: &mut [u8], idx: usize) -> &mut RowLayout {
-    RowLayout::try_mut_from_bytes(row_bytes_mut(bytes, idx))
-        .expect("row bytes should contain an aligned row")
-}
-
-unsafe fn row_mut_ptr(base_ptr: *const u8, idx: usize) -> *mut RowLayout {
+unsafe fn row_mut_ptr(base_ptr: *mut u8, idx: usize) -> *mut RowLayout {
     unsafe { base_ptr.add(row_offset(idx)) as *mut RowLayout }
 }
 
 pub(crate) struct RowsTableReadGuard<'a> {
     index_file: &'a IndexFile,
-    pub(crate) row_guard: RwLockReadGuard<'a, MmapMut>,
+    pub(crate) row_guard: RwLockReadGuard<'a, MmapRaw>,
 }
 
 impl<'a> RowsTableReadGuard<'a> {
@@ -281,7 +260,7 @@ impl<'a> RowsTableReadGuard<'a> {
             idx < row_count,
             "row index out of bounds: {idx} >= {row_count}"
         );
-        let row = row_ref_bytes(&self.row_guard[..], idx);
+        let row = unsafe { &*row_mut_ptr(self.row_guard.as_mut_ptr(), idx) };
         RowReadGuard {
             _row_guard: row_guard,
             row,
@@ -304,7 +283,7 @@ impl<'a> RowsTableReadGuard<'a> {
             idx < row_count,
             "row index out of bounds: {idx} >= {row_count}"
         );
-        let row = unsafe { &mut *row_mut_ptr(self.row_guard.as_ptr(), idx) };
+        let row = unsafe { &mut *row_mut_ptr(self.row_guard.as_mut_ptr(), idx) };
         RowWriteGuard {
             _row_guard: row_guard,
             row,
@@ -318,22 +297,22 @@ impl<'a> RowsTableReadGuard<'a> {
             idx < row_count,
             "row index out of bounds: {idx} >= {row_count}"
         );
-        unsafe { row_mut_ptr(self.row_guard.as_ptr(), idx) }
+        unsafe { row_mut_ptr(self.row_guard.as_mut_ptr(), idx) }
     }
 }
 
 pub(crate) struct RowsTableWriteGuard<'a> {
-    pub(crate) row_guard: RwLockWriteGuard<'a, MmapMut>,
+    pub(crate) row_guard: RwLockWriteGuard<'a, MmapRaw>,
 }
 
 impl RowsTableWriteGuard<'_> {
-    fn row_mut(&mut self, idx: usize) -> &mut RowLayout {
+    pub(crate) fn row_mut(&mut self, idx: usize) -> &mut RowLayout {
         let row_count = row_count_for_len(self.row_guard.len());
         assert!(
             idx < row_count,
             "row index out of bounds: {idx} >= {row_count}"
         );
-        row_mut_bytes(&mut self.row_guard[..], idx)
+        unsafe { &mut *row_mut_ptr(self.row_guard.as_mut_ptr(), idx) }
     }
 }
 
@@ -378,9 +357,9 @@ pub(crate) struct IndexFile {
     rows_file: File,
     /// Fixed mapping covering the header + waste-level pages. Never remapped,
     /// so `header_ref()` / `layout_prefix_ref()` are always stable without a lock.
-    header_mmap: MmapMut,
+    header_mmap: MmapRaw,
     /// Growable mapping covering only the row pages. Remapped on grow/shrink/reset.
-    rows_mmap: RwLock<MmapMut>,
+    rows_mmap: RwLock<MmapRaw>,
     row_locks: Vec<RwLock<()>>,
     row_locks_mask: usize,
     config: Arc<Config>,
@@ -467,14 +446,14 @@ impl IndexFile {
     }
 
     #[cfg(target_os = "linux")]
-    fn maybe_lock_mmap(config: &Config, mmap: &MmapMut) {
+    fn maybe_lock_mmap(config: &Config, mmap: &MmapRaw) {
         if config.mlock_index {
             let _ = mmap.lock();
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn maybe_lock_mmap(_config: &Config, _mmap: &MmapMut) {}
+    fn maybe_lock_mmap(_config: &Config, _mmap: &MmapRaw) {}
 
     fn read_existing_header(header_file: &File, header_len: usize) -> Result<((u64, u64), u64)> {
         if header_len < size_of::<IndexFileLayout>() {
@@ -605,20 +584,16 @@ impl IndexFile {
 
         let actual_rows_size = if new_file { rows_size } else { rows_len };
 
-        let header_mmap = unsafe {
-            memmap2::MmapOptions::new()
-                .len(header_size)
-                .map_mut(&header_file)
-        }
-        .map_err(Error::IOError)?;
+        let header_mmap = memmap2::MmapOptions::new()
+            .len(header_size)
+            .map_raw(&header_file)
+            .map_err(Error::IOError)?;
         Self::maybe_lock_mmap(config.as_ref(), &header_mmap);
 
-        let rows_mmap = unsafe {
-            memmap2::MmapOptions::new()
-                .len(actual_rows_size)
-                .map_mut(&rows_file)
-        }
-        .map_err(Error::IOError)?;
+        let rows_mmap = memmap2::MmapOptions::new()
+            .len(actual_rows_size)
+            .map_raw(&rows_file)
+            .map_err(Error::IOError)?;
         Self::maybe_lock_mmap(config.as_ref(), &rows_mmap);
 
         if new_file {
@@ -644,6 +619,16 @@ impl IndexFile {
             *inst.cached_checkpoint.write() = Some(cursor);
         }
 
+        {
+            let global_level = inst.header_ref().global_split_level.load(Ordering::Acquire);
+            let mut rows = inst.rows_table_mut();
+            for row_idx in 0..inst.num_rows() {
+                let row = rows.row_mut(row_idx);
+                if row.split_level.load(Ordering::Acquire) > global_level {
+                    row.set_split_level(global_level);
+                }
+            }
+        }
         Ok(inst)
     }
 
@@ -702,6 +687,10 @@ impl IndexFile {
             + waste
     }
 
+    pub(crate) fn set_file_waste(&self, file_idx: u16, waste: u32) {
+        self.full_header_ref().waste_levels[file_idx as usize].store(waste, Ordering::Relaxed);
+    }
+
     pub(crate) fn file_waste(&self, file_idx: u16) -> u32 {
         self.full_header_ref().waste_levels[file_idx as usize].load(Ordering::Relaxed)
     }
@@ -729,6 +718,7 @@ impl IndexFile {
         }
 
         let mut remap_dur = None;
+        let previous_rows = row_count_for_len(layout_mut.row_guard.len());
         let required_rows_size = (1usize << nsl) * size_of::<RowLayout>();
         if layout_mut.row_guard.len() < required_rows_size {
             let remap_start = Instant::now();
@@ -749,16 +739,24 @@ impl IndexFile {
 
             #[cfg(not(target_os = "linux"))]
             {
-                *layout_mut.row_guard = unsafe {
-                    memmap2::MmapOptions::new()
-                        .len(new_rows_size)
-                        .map_mut(&self.rows_file)
-                }
-                .map_err(Error::IOError)?;
+                *layout_mut.row_guard = memmap2::MmapOptions::new()
+                    .len(new_rows_size)
+                    .map_raw(&self.rows_file)
+                    .map_err(Error::IOError)?;
             }
 
             Self::maybe_lock_mmap(self.config.as_ref(), &layout_mut.row_guard);
             remap_dur = Some(remap_start.elapsed());
+        }
+
+        // An interrupted shrink can leave published rows above the global level.
+        for row_idx in (1usize << gsl)..(1usize << nsl).min(previous_rows) {
+            let row = layout_mut.row_mut(row_idx);
+            if row.split_level.load(Ordering::Acquire) != 0 {
+                row.signatures.fill(HashCoord::INVALID_SIG);
+                row.pointers.fill(EntryPointer::INVALID_POINTER);
+                row.set_split_level(0);
+            }
         }
 
         self.header_ref()
@@ -791,15 +789,38 @@ impl IndexFile {
             let next_level = global_split_level - 1;
             let half_count = 1usize << next_level;
 
+            for idx in 0..half_count {
+                if row_table
+                    .row_mut(idx + half_count)
+                    .split_level
+                    .load(Ordering::Acquire)
+                    != 0
+                {
+                    row_table.row_mut(idx).set_split_level(global_split_level);
+                }
+            }
+            for idx in 0..current_rows {
+                let row = row_table.row_mut(idx);
+                let level = row.split_level.load(Ordering::Acquire);
+                for col in 0..ROW_WIDTH {
+                    if !row.pointers[col].is_valid()
+                        || (level != 0 && !row.entry_belongs_to_row(col, idx, level))
+                    {
+                        row.remove(col);
+                    }
+                }
+            }
+
             let mut can_merge = true;
             for idx in 0..half_count {
-                let row1 = row_ref_bytes(&row_table.row_guard[..], idx);
+                let row1 = unsafe { &*row_mut_ptr(row_table.row_guard.as_mut_ptr(), idx) };
                 let row1_split = row1.split_level.load(Ordering::Acquire);
                 if row1_split != global_split_level {
                     continue;
                 }
 
-                let row2 = row_ref_bytes(&row_table.row_guard[..], idx + half_count);
+                let row2 =
+                    unsafe { &*row_mut_ptr(row_table.row_guard.as_mut_ptr(), idx + half_count) };
                 let count1 = row1
                     .signatures
                     .iter()
@@ -821,9 +842,10 @@ impl IndexFile {
             }
 
             for idx in 0..half_count {
-                let row1 = unsafe { &mut *row_mut_ptr(row_table.row_guard.as_ptr(), idx) };
-                let row2 =
-                    unsafe { &mut *row_mut_ptr(row_table.row_guard.as_ptr(), idx + half_count) };
+                let row1 = unsafe { &mut *row_mut_ptr(row_table.row_guard.as_mut_ptr(), idx) };
+                let row2 = unsafe {
+                    &mut *row_mut_ptr(row_table.row_guard.as_mut_ptr(), idx + half_count)
+                };
 
                 if row1.split_level.load(Ordering::Acquire) != global_split_level {
                     continue;
@@ -846,16 +868,30 @@ impl IndexFile {
                     }
 
                     row1.insert(dest_idx, row2.signatures[src_idx], row2.pointers[src_idx]);
-                    row2.remove(src_idx);
                 }
-
-                row2.set_split_level(0);
-                row1.set_split_level(next_level);
             }
 
+            row_table.row_guard.flush().map_err(Error::IOError)?;
+            self.rows_file.sync_all().map_err(Error::IOError)?;
+            crate::crash_point("shrink_after_copy_before_publish");
             self.header_ref()
                 .global_split_level
                 .store(next_level, Ordering::Release);
+            if let Err(err) = self.sync_header() {
+                self.header_ref()
+                    .global_split_level
+                    .store(global_split_level, Ordering::Release);
+                return Err(err);
+            }
+            crate::crash_point("shrink_after_publish_before_row_levels");
+            for idx in 0..half_count {
+                let row = row_table.row_mut(idx);
+                if row.split_level.load(Ordering::Acquire) > next_level {
+                    row.set_split_level(next_level);
+                }
+            }
+            row_table.row_guard.flush().map_err(Error::IOError)?;
+            self.rows_file.sync_all().map_err(Error::IOError)?;
         }
 
         let final_level = self.header_ref().global_split_level.load(Ordering::Acquire);
@@ -885,18 +921,17 @@ impl IndexFile {
                     *row_table.row_guard = memmap2::MmapOptions::new()
                         .len(1)
                         .map_anon()
-                        .map_err(Error::IOError)?;
+                        .map_err(Error::IOError)?
+                        .into();
                 }
 
                 self.rows_file
                     .set_len(new_rows_size as u64)
                     .map_err(Error::IOError)?;
-                *row_table.row_guard = unsafe {
-                    memmap2::MmapOptions::new()
-                        .len(new_rows_size)
-                        .map_mut(&self.rows_file)
-                }
-                .map_err(Error::IOError)?;
+                *row_table.row_guard = memmap2::MmapOptions::new()
+                    .len(new_rows_size)
+                    .map_raw(&self.rows_file)
+                    .map_err(Error::IOError)?;
             }
 
             Self::maybe_lock_mmap(self.config.as_ref(), &row_table.row_guard);
@@ -910,21 +945,21 @@ impl IndexFile {
         mut rows_table: RowsTableWriteGuard,
         hash_key: (u64, u64),
     ) -> Result<()> {
+        *self.cached_checkpoint.write() = None;
         // Zero both mmaps first, then populate.
-        rows_table.row_guard.fill(0);
-        // Safety: header_mmap is a contiguous MmapMut that we own; no other &mut exists yet.
         unsafe {
             std::ptr::write_bytes(
-                self.header_mmap.as_ptr() as *mut u8,
+                rows_table.row_guard.as_mut_ptr(),
                 0,
-                self.header_mmap.len(),
+                rows_table.row_guard.len(),
             );
+            std::ptr::write_bytes(self.header_mmap.as_mut_ptr(), 0, self.header_mmap.len());
         }
 
         // Now create the mutable reference after zeroing is complete.
         // Safety: only called during init (open) or reset, both single-threaded
         // w.r.t. this store instance.
-        let layout = unsafe { &mut *(self.header_mmap.as_ptr() as *mut IndexFileLayout) };
+        let layout = unsafe { &mut *(self.header_mmap.as_mut_ptr() as *mut IndexFileLayout) };
 
         layout.header.signature = *INDEX_FILE_SIGNATURE;
         layout.header.version = INDEX_FILE_VERSION;
@@ -970,22 +1005,93 @@ impl IndexFile {
                 *row_table.row_guard = memmap2::MmapOptions::new()
                     .len(1)
                     .map_anon()
-                    .map_err(Error::IOError)?;
+                    .map_err(Error::IOError)?
+                    .into();
             }
 
             self.rows_file
                 .set_len(min_rows_size as u64)
                 .map_err(Error::IOError)?;
-            *row_table.row_guard = unsafe {
-                memmap2::MmapOptions::new()
-                    .len(min_rows_size)
-                    .map_mut(&self.rows_file)
-            }
-            .map_err(Error::IOError)?;
+            *row_table.row_guard = memmap2::MmapOptions::new()
+                .len(min_rows_size)
+                .map_raw(&self.rows_file)
+                .map_err(Error::IOError)?;
         }
 
         Self::maybe_lock_mmap(self.config.as_ref(), &row_table.row_guard);
 
         self.init_header_and_rows(row_table, self.config.hash_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anonymous_index() -> Result<IndexFile> {
+        Ok(IndexFile {
+            #[cfg(windows)]
+            header_file: tempfile::tempfile().map_err(Error::IOError)?,
+            rows_file: tempfile::tempfile().map_err(Error::IOError)?,
+            header_mmap: memmap2::MmapMut::map_anon(size_of::<IndexFileLayout>())
+                .map_err(Error::IOError)?
+                .into(),
+            rows_mmap: RwLock::new(
+                memmap2::MmapMut::map_anon(2 * MIN_INITIAL_ROWS * size_of::<RowLayout>())
+                    .map_err(Error::IOError)?
+                    .into(),
+            ),
+            row_locks: (0..MIN_INITIAL_ROWS).map(|_| RwLock::new(())).collect(),
+            row_locks_mask: MIN_INITIAL_ROWS - 1,
+            config: Arc::new(Config::default()),
+            cached_checkpoint: RwLock::new(None),
+        })
+    }
+
+    #[test]
+    fn mapped_rows_allow_disjoint_borrows() -> Result<()> {
+        let index = anonymous_index()?;
+        let rows = index.rows_table();
+        let mut first = rows.row_mut(0);
+        first.signatures[0] = 7;
+        let second = rows.row(1);
+        let mut third = rows.row_mut(2);
+        third.signatures[0] = 11;
+        first.signatures[0] += 1;
+        assert_eq!(first.signatures[0], 8);
+        assert_eq!(second.signatures[0], 0);
+        assert_eq!(third.signatures[0], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_split_rows_allow_disjoint_mutation() -> Result<()> {
+        let index = anonymous_index()?;
+        let rows = index.rows_table();
+        assert_eq!(rows.shard_id(0), rows.shard_id(MIN_INITIAL_ROWS));
+        let mut low = rows.row_mut(0);
+        let high = unsafe { &mut *rows.unlocked_row_ptr(MIN_INITIAL_ROWS) };
+        low.signatures[0] = 7;
+        high.signatures[0] = low.signatures[0];
+        low.remove(0);
+        assert_eq!(low.signatures[0], HashCoord::INVALID_SIG);
+        assert_eq!(high.signatures[0], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_header_supports_shared_atomic_updates() -> Result<()> {
+        let index = anonymous_index()?;
+        let header = index.header_ref();
+        index.add_file_waste(0, 16);
+        header.committed_num_entries.store(2, Ordering::Relaxed);
+        let other_header = index.header_ref();
+        header.committed_num_entries.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(
+            other_header.committed_num_entries.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(index.file_waste(0), 16);
+        Ok(())
     }
 }

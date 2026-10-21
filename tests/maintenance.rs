@@ -6,6 +6,36 @@ use candystore::{CandyStore, Config, Error};
 use tempfile::tempdir;
 
 #[test]
+fn test_clear_resets_byte_checkpoint_trigger() -> Result<(), Error> {
+    use std::time::{Duration, Instant};
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: Some(512),
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("old", vec![1; 32 * 1024])?;
+    db.checkpoint()?;
+    db.clear()?;
+    assert_eq!(db.stats().checkpoint_generation, 0);
+    db.set("fresh", vec![2; 1024])?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.stats().checkpoint_generation == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(db.stats().checkpoint_generation > 0);
+    assert_eq!(db.stats().uncheckpointed_bytes, 0);
+    db._abort_for_testing();
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("fresh")?, Some(vec![2; 1024]));
+    assert_eq!(db.get("old")?, None);
+    Ok(())
+}
+
+#[test]
 fn test_clear_resets_store_files_and_contents() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let config = Config {

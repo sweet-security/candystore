@@ -9,6 +9,49 @@ use std::thread;
 use tempfile::tempdir;
 
 #[test]
+fn test_pending_deletions_reclaim_full_rows() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    let capacity = db.capacity();
+    let mut inserted = 0;
+    let mut candidate = 0u64;
+    while inserted < candystore::internal::ROW_WIDTH * 2 {
+        let key = candidate.to_le_bytes();
+        candidate += 1;
+        if candystore::internal::HashCoord::new(
+            candystore::internal::KeyNamespace::User,
+            &key,
+            config.hash_key,
+        )
+        .row_index(candystore::internal::MIN_SPLIT_LEVEL as u64)
+            != 0
+        {
+            continue;
+        }
+        assert!(matches!(db.set(key, "value")?, SetStatus::CreatedNew));
+        assert_eq!(db.remove(key)?, Some(b"value".to_vec()));
+        assert_eq!(db.get(key)?, None);
+        assert_eq!(db.num_items(), 0);
+        assert!(db.iter_items().next().is_none());
+        inserted += 1;
+    }
+    assert_eq!(db.capacity(), capacity);
+    db.checkpoint()?;
+    drop(db);
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key")?, None);
+    assert_eq!(db.num_items(), 0);
+    Ok(())
+}
+
+#[test]
 fn test_basic() -> Result<(), Error> {
     let dir = tempdir().unwrap();
     let db = CandyStore::open(dir.path(), Config::default())?;

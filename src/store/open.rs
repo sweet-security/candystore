@@ -109,7 +109,7 @@ impl CandyStore {
             _lockfile: lockfile,
             compaction_thd: parking_lot::Mutex::new(None),
             checkpoint_thd: parking_lot::Mutex::new(None),
-            allow_clean_shutdown: std::sync::atomic::AtomicBool::new(true),
+            allow_clean_shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -282,6 +282,9 @@ impl CandyStore {
         let store = Self::build_store(base_path.clone(), config.clone(), lockfile)?;
         match store.recover_index() {
             Ok(()) => {
+                store
+                    .allow_clean_shutdown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 store.start_checkpoint_worker();
                 store.start_compaction();
                 Ok(store)
@@ -301,6 +304,9 @@ impl CandyStore {
 
                 let recovered = Self::build_store(base_path, config, lockfile)?;
                 recovered.recover_index()?;
+                recovered
+                    .allow_clean_shutdown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 recovered.start_checkpoint_worker();
                 recovered.start_compaction();
                 Ok(recovered)

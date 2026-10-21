@@ -17,6 +17,146 @@ use tempfile::tempdir;
 
 use crate::common::{active_file_ordinal, read_data_file_ordinal};
 
+#[test]
+fn test_reinsert_after_damaged_tombstone_has_one_index_entry() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("victim", "old")?;
+    db.checkpoint()?;
+    db.set("keeper", "healthy")?;
+    let tombstone_offset = db.stats().total_bytes;
+    db.remove("victim")?;
+    assert!(matches!(
+        db.set("victim", "new")?,
+        candystore::SetStatus::CreatedNew
+    ));
+    db._abort_for_testing();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(active_data_file_path(dir.path())?)
+        .map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_HEADER_LEN + tombstone_offset))
+        .map_err(Error::IOError)?;
+    file.write_all(&[0; 16]).map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("victim")?, Some(b"new".to_vec()));
+    assert_eq!(db.get("keeper")?, Some(b"healthy".to_vec()));
+    assert_eq!(db.num_items(), 2);
+    assert_eq!(db.iter_items().count(), 2);
+    Ok(())
+}
+
+#[test]
+fn test_lost_tombstone_stays_consistent_after_index_rebuild() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("victim", "durable-old")?;
+    db.set("keeper", "healthy")?;
+    db.checkpoint()?;
+    let committed_extent = db.stats().total_bytes;
+    db.remove("victim")?;
+    db._abort_for_testing();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(active_data_file_path(dir.path())?)
+        .map_err(Error::IOError)?;
+    file.set_len(DATA_FILE_HEADER_LEN + committed_extent)
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    let recovered_value = db.get("victim")?;
+    db.checkpoint()?;
+    assert_eq!(db.get("keeper")?, Some(b"healthy".to_vec()));
+    drop(db);
+    rewrite_index_version(dir.path(), read_index_version(dir.path())? ^ 1)?;
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("victim")?, recovered_value);
+    Ok(())
+}
+
+#[test]
+fn test_lost_overwrite_restores_checkpointed_value() -> Result<(), Error> {
+    for rotate in [false, true] {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            max_data_file_size: 128,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        db.set("key", "durable-old")?;
+        if rotate {
+            db.set("filler", vec![1; 64])?;
+        }
+        db.checkpoint()?;
+        let committed_extent = db.stats().total_bytes;
+        db.set("key", vec![2; 64])?;
+        db._abort_for_testing();
+        let path = active_data_file_path(dir.path())?;
+        let retained_bytes = if rotate { 0 } else { committed_extent };
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(Error::IOError)?;
+        file.set_len(DATA_FILE_HEADER_LEN + retained_bytes)
+            .map_err(Error::IOError)?;
+        file.sync_all().map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(
+            db.get("key")?,
+            Some(b"durable-old".to_vec()),
+            "rotate={rotate}"
+        );
+        if rotate {
+            assert_eq!(db.get("filler")?, Some(vec![1; 64]));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_failed_open_does_not_checkpoint_unrecovered_tail() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("bad", "value")?;
+    db.set("keeper", "healthy")?;
+    db._abort_for_testing();
+    rewrite_first_data_entry_header(dir.path(), |header| (header & !(63 << 24)) | (63 << 24))?;
+    fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+    fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+    assert!(CandyStore::open(dir.path(), config).is_err());
+    assert!(CandyStore::open(dir.path(), config).is_err());
+    rewrite_first_data_entry_header(dir.path(), |header| (header & !(63 << 24)) | (1 << 24))?;
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("keeper")?, Some(b"healthy".to_vec()));
+    Ok(())
+}
+
 fn patterned_bytes_with_seed(len: usize, seed: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| (((idx * 31) + (seed * 17)) % 251) as u8)
@@ -1722,5 +1862,192 @@ fn test_recovery_ignores_missing_compacted_files_before_checkpoint_cursor() -> R
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_recovery_waste_is_idempotent_for_deleted_keys() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 4096,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("key", "value")?;
+    db.remove("key")?;
+    let expected_waste = db.stats().waste_bytes;
+    assert_eq!(expected_waste, db.stats().total_bytes);
+    db._abort_for_testing();
+
+    for replay in 0..3 {
+        if replay != 0 {
+            write_commit_cursor(dir.path(), 0)?;
+        }
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(db.get("key")?, None);
+        assert_eq!(db.num_items(), 0);
+        assert_eq!(db.stats().waste_bytes, expected_waste);
+        assert_eq!(db.stats().data_bytes(), 0);
+        db._abort_for_testing();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_checkpointed_reopen_avoids_per_entry_reads() -> Result<(), Error> {
+    fn read_syscalls() -> u64 {
+        fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("syscr: "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 64 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    for idx in 0..8192u32 {
+        db.set(idx.to_le_bytes(), vec![1; 16])?;
+    }
+    for idx in 0..32u32 {
+        db.set(idx.to_le_bytes(), vec![2; 33])?;
+    }
+    for idx in 0..17u32 {
+        db.remove(idx.to_le_bytes())?;
+    }
+    db.checkpoint()?;
+    let expected_waste = db.stats().waste_bytes;
+    drop(db);
+
+    let before = read_syscalls();
+    let db = CandyStore::open(dir.path(), config)?;
+    let reads = read_syscalls() - before;
+    assert!(reads < 1024, "checkpointed reopen issued {reads} reads");
+    assert_eq!(db.num_items(), 8192 - 17);
+    assert_eq!(db.stats().num_rebuilt_entries, 0);
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    assert_eq!(db.get(31u32.to_le_bytes())?, Some(vec![2; 33]));
+    assert_eq!(db.get(0u32.to_le_bytes())?, None);
+    Ok(())
+}
+
+#[test]
+fn test_recovery_recounts_waste_when_only_rows_survive() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 4096,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("key", "old")?;
+    db.set("key", "new")?;
+    let expected_waste = db.stats().waste_bytes;
+    assert!(expected_waste > 0);
+    db._abort_for_testing();
+
+    let mut index = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("index"))
+        .map_err(Error::IOError)?;
+    index
+        .seek(SeekFrom::Start(candystore::internal::PAGE_SIZE as u64))
+        .map_err(Error::IOError)?;
+    index
+        .write_all(&0u32.to_le_bytes())
+        .map_err(Error::IOError)?;
+    index.sync_all().map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key")?, Some(b"new".to_vec()));
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    drop(db);
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.stats().num_rebuilt_entries, 0);
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    Ok(())
+}
+
+#[test]
+fn test_full_file_recovery_recounts_waste_for_newer_pointers() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 4096,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("key", "old")?;
+    let mut filler = 0usize;
+    while db.stats().num_data_files < 2 {
+        db.set(format!("filler-{filler}"), vec![b'f'; 512])?;
+        filler += 1;
+    }
+    db.set("key", "new")?;
+    let expected_waste = db.stats().waste_bytes;
+    let expected_items = db.num_items();
+    assert!(expected_waste > 0);
+    drop(db);
+
+    let first_ordinal = data_file_records_by_ordinal(dir.path())?[0].1;
+    write_commit_cursor_for_ordinal(dir.path(), first_ordinal, u64::MAX)?;
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("key")?, Some(b"new".to_vec()));
+    assert_eq!(db.num_items(), expected_items);
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    drop(db);
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    Ok(())
+}
+
+#[test]
+fn test_index_recreation_preserves_waste_accounting_for_compaction() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 4096,
+        compaction_min_threshold: u32::MAX,
+        compaction_throughput_bytes_per_sec: 0,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        ..Config::default()
+    };
+
+    let original_index_version;
+    let expected_waste;
+    {
+        let db = CandyStore::open(dir.path(), config)?;
+        for idx in 0..20 {
+            db.set("hot", format!("hot-val-{idx:02}-{}", "x".repeat(64)))?;
+        }
+        db.set("deleted", format!("del-val-{}", "y".repeat(64)))?;
+        db.remove("deleted")?;
+        expected_waste = db.stats().waste_bytes;
+        assert!(expected_waste > 0);
+        original_index_version = read_index_version(dir.path())?;
+    }
+
+    // Trigger port_to_current_format, which deletes index/rows and rebuilds from data files.
+    rewrite_index_version(dir.path(), original_index_version ^ 1)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.stats().waste_bytes, expected_waste);
+    assert_eq!(db.num_items(), 1);
     Ok(())
 }

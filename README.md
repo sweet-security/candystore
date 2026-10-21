@@ -1,6 +1,10 @@
 <div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=main"></div>
 
 > [!NOTE]
+> v1.2.2 fixes checkpoint durability, crash recovery, interrupted index shrinking, mmap aliasing,
+> iterator healing, and list-item moves. It also corrects tombstone retention and makes compaction
+> cancellation responsive. The on-disk format is unchanged.
+>
 > v1.2 adds corrupt-entry cleanup and failure-tolerant compaction, and fixes concurrency bugs;
 > file format is unchanged.
 >
@@ -9,12 +13,6 @@
 >
 > 😸 v1.0 brings true crash-consistency, improved compaction and an overall simpler design,
 > as well as a stable file format.
->
-> The append-only data files are the compatibility boundary. The index format
-> may still evolve, and when the data-file format is recognized but the index
-> format is outdated, Candy recreates the index on open by default.
->
-> Pre-v1.0 stores are not covered by this compatibility promise.
 
 # CandyStore
 
@@ -49,7 +47,7 @@ See [how to interpret the results\*](#how-to-interpret-the-performance-results).
 
 Candy offers
 * A simple key-value API (`get`, `set`, `remove` and atomic operations like `replace`)
-* A typed interface on top (`get<K,V>`, `set<K,V>`, etc.)
+* A typed interface on top (`CandyTypedStore<K, V>` with `get`, `set`, etc.)
 * Double-ended queues (`push_to_queue_tail`, `pop_queue_head`, etc.) as well as a typed interface on top of them
 * Lists (`get_from_list`, `set_in_list`, etc.) as well as a typed interface on top of them
 * The DB is completely thread-safe in idiomatic Rust (just `Arc<>` it)
@@ -105,10 +103,12 @@ Note: the chances of a collision (meaning we fetch a wrong entry from the file) 
 virtually zero, about 1 in 20 billion according to the birthday paradox (a collision in 336 
 uniformly-distributed 50-bits numbers). 
 
-Candy supports up to 4096 files, each up to 1GB in size (a span of 4TB). In terms of key-space,
-Candy allows 2^21 rows, each with 336 keys, so a total of 704M keys. The maximum size of a key
-is 16KB and the maximum size of a value is 64KB. Of course these are theoretical limits, 
-it would be wise to halve them in practice due to imbalances.
+Candy supports up to 4096 files, each slightly less than 1 GiB in size (a span of roughly
+4 TiB). In terms of key-space, Candy allows 2^21 rows, each with 336 keys, so a total of
+704M keys. The maximum user key size is `MAX_USER_KEY_SIZE` (16,367 bytes), and the maximum
+inline value size is `MAX_USER_VALUE_SIZE` (65,471 bytes). The configured data-file size
+and collection overhead can impose smaller limits. These are theoretical limits; it would
+be wise to leave headroom in practice due to imbalances.
 
 ### Splitting
 
@@ -136,23 +136,55 @@ Data is always written (appended) to the *active data file*. When a file reaches
 Candy rotates the active files and creates a new one. The old file becomes an *immutable data 
 file*. 
 
-As data is created, updated and removed, the store accumulates waste. To handle it we have 
-*background compaction*: a thread that iterates over the rows table, finds all entries that
-belong to files that should be compacted and rewrites them to the active file. After such
-a pass, it simply deletes the old immutable file since no entry points to it. 
+As data is created, updated and removed, the store accumulates waste. To handle it we have
+*background compaction*: a thread that selects checkpointed immutable files whose reclaimable
+waste exceeds `compaction_min_threshold`, finds their live entries in the rows table, and
+rewrites them to the active file. After making the rewritten data and index rows durable,
+it deletes the old immutable files, oldest first. When an older file remains, deletion
+markers for absent keys are preserved so an index rebuild cannot resurrect older values.
+Files containing only still-needed markers are deferred rather than repeatedly rewritten;
+markers for reinserted keys become reclaimable. If a required scan fails, its source files
+are retained rather than risking the loss of valid deletion markers.
 
-You can configure the throughput (bytes per second) of compaction.
+Corrupt-entry cleanup searches checksum-verified history for keys matching the damaged index
+slot, then writes and synchronizes deletion markers before retiring the pointer. This exceptional
+path can scan older data files and wait for synchronization. `compaction_max_read_failures` controls when cleanup is attempted after read
+failures; if the relevant history cannot be read safely, compaction reports an error and keeps
+the source file instead of dropping an unidentified entry.
+
+You can configure the throughput (bytes per second) with `compaction_throughput_bytes_per_sec`;
+setting it to `0` disables background compaction. File scans and pacing waits can be cancelled
+during shutdown.
 
 ### Checkpointing & Rebuild
 
-We trust the operating system to flush the data files and mmap'ed rows table to storage,
-which means that even if your process crashes, your data will be fully consistent. However,
-this is not true on a power failure or a kernel panic — in which case the state of the
-index file is unknown relative to the data files.
+Ordinary writes append to the operating system's page cache and update the mmap'ed index;
+they do not synchronize every mutation to storage. A process crash can interrupt an operation,
+and a power failure or kernel panic can persist index pages and data files out of order.
 
 To handle this gracefully, Candy employs **background checkpointing**. Instead of synchronously `fsync`ing index and data files on every write (which would block the writer), a background worker asynchronously persists a consistent snapshot of the current state at user-defined intervals or after a configured amount of bytes have been written.
 
-On an unexpected crash or an unclean shutdown, Candy features an efficient rebuild mechanism. It resumes from the latest successful checkpoint and rapidly replays only the recent mutating operations, restoring the full, robust state from the append-only data files.
+Checkpointing synchronizes data files before index rows and publishes the recovery cursor last.
+Collection locks are held through the final synchronization pass, so a completed checkpoint
+does not split a compound list or queue mutation. These operations are not multi-record
+transactions, however: interruption before a checkpoint can leave an operation partially applied.
+
+Removals become invisible immediately, but their old index pointers are retained in an
+in-memory pending-deletion set until the tombstones are synchronized. Checkpointing,
+compaction, and row-space reclamation then unlink those pointers safely. Keeping background
+checkpointing enabled bounds this temporary memory use; applications that disable it should
+call `checkpoint()` periodically.
+
+On an unexpected crash or an unclean shutdown, Candy normally resumes from the latest successful
+checkpoint and replays recent operations from the append-only data files. If a surviving index
+pointer refers to a lost data tail, or replay encounters a damaged region, recovery restarts from
+the earliest remaining file so older valid values can be restored consistently. Recovered data
+and rebuilt rows are synchronized before publishing a new checkpoint.
+
+Opening also traverses the live index and temporarily maps data files to read record headers
+for entry counts and per-file waste. It does not issue a separate read or scan each live payload
+for this accounting. Startup still scales with the live index and header pages, as well as any
+operations that need replay.
 
 The durability guarantee is therefore checkpoint-granular: a write is guaranteed to survive power loss
 once a checkpoint (or an explicit `flush()`) completes after it. Writes made after the last checkpoint
@@ -176,8 +208,8 @@ Example use cases for Candy are
   and perform them) 
 * A caching layer for your application logic
 
-It is designed to be fully consistent across process crashes (where the kernel will flush everything
-properly). Under power failure or kernel panic, durability is bounded by the last completed checkpoint
+Durability is bounded by the last completed checkpoint. Recovery replays surviving writes beyond
+that point, but interrupted compound operations may be partially applied
 (see [Checkpointing & Rebuild](#checkpointing--rebuild)).
 
 ## How to Interpret the Performance Results

@@ -5,8 +5,8 @@ use crate::{
     data_file::DataFile,
     index_file::{EntryPointer, RowWriteGuard},
     internal::{
-        EntryType, FILE_OFFSET_ALIGNMENT, HashCoord, KVRef, KeyNamespace, ROW_WIDTH,
-        aligned_data_entry_size, aligned_tombstone_entry_waste, invalid_data_error,
+        EntryType, FILE_OFFSET_ALIGNMENT, HashCoord, KVRef, KeyNamespace, MAX_DATA_FILES,
+        ROW_WIDTH, aligned_data_entry_size, aligned_tombstone_entry_waste, invalid_data_error,
         is_corrupt_entry_error,
     },
     types::{Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result},
@@ -30,6 +30,14 @@ impl CandyStore {
             return Ok(());
         };
 
+        for data_file in &ordered_files {
+            data_file.sync_to_current()?;
+        }
+
+        if self.has_truncated_index_entries() {
+            self.persist_rebuild_checkpoint(ordered_files[0].file_ordinal, 0, 0)?;
+        }
+
         let (commit_file_ordinal, commit_offset) = self.inner.index_file.checkpoint_cursor();
 
         let start_idx = ordered_files
@@ -42,6 +50,11 @@ impl CandyStore {
         } else {
             RebuildMode::TailFrom(0)
         };
+        let replaying_from_start = start_idx == 0
+            && matches!(
+                rebuild_mode,
+                RebuildMode::TailFrom(0) | RebuildMode::FullFile
+            );
 
         // Recompute the runtime-only delta from the persisted replay cursor.
         self.inner
@@ -58,19 +71,28 @@ impl CandyStore {
             } else {
                 RebuildMode::TailFrom(0)
             };
-            let durable_extent = self.rebuild_file_from(
+            let Some(durable_extent) = self.rebuild_file_from(
                 data_file,
                 file_mode,
+                replaying_from_start,
                 &mut bytes_since_checkpoint,
                 &mut pending_committed_delta,
                 &mut match_scratch,
-            )?;
+            )?
+            else {
+                self.persist_rebuild_checkpoint(
+                    ordered_files[0].file_ordinal,
+                    0,
+                    pending_committed_delta,
+                )?;
+                return self.recover_index();
+            };
             final_cursor = (data_file.file_ordinal, durable_extent);
         }
 
         // The header count and the rows mmap are flushed independently, so after
         // a crash they can disagree; the rebuilt rows are the only source of truth.
-        self.reset_live_count_from_rows();
+        self.reset_recovery_stats_from_rows()?;
         self.persist_rebuild_checkpoint(final_cursor.0, final_cursor.1, 0)?;
         debug_assert_eq!(
             self.inner.uncommitted_entries_delta.load(Ordering::Relaxed),
@@ -80,14 +102,40 @@ impl CandyStore {
         Ok(())
     }
 
+    fn has_truncated_index_entries(&self) -> bool {
+        let files = self.inner.data_files.read();
+        let rows = self.inner.index_file.rows_table();
+        for row_idx in 0..self.inner.index_file.num_rows() {
+            let row = rows.row(row_idx);
+            let split_level = row.split_level.load(Ordering::Acquire);
+            if split_level == 0 {
+                continue;
+            }
+            for col in 0..ROW_WIDTH {
+                let ptr = row.pointers[col];
+                if row.signatures[col] != HashCoord::INVALID_SIG
+                    && ptr.is_valid()
+                    && row.entry_belongs_to_row(col, row_idx, split_level)
+                    && files
+                        .get(&ptr.file_idx())
+                        .is_some_and(|file| ptr.file_offset() >= file.used_bytes())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn rebuild_file_from(
         &self,
         data_file: &Arc<DataFile>,
         rebuild_mode: RebuildMode,
+        replaying_from_start: bool,
         bytes_since_checkpoint: &mut u64,
         pending_committed_delta: &mut i64,
         match_scratch: &mut Vec<u8>,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         let start_offset = match rebuild_mode {
             RebuildMode::TailFrom(offset) => offset,
             RebuildMode::FullFile => 0,
@@ -120,6 +168,15 @@ impl CandyStore {
         while let Some((kv, entry_offset, next_offset)) =
             data_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
         {
+            if entry_offset != offset.next_multiple_of(FILE_OFFSET_ALIGNMENT) {
+                if !replaying_from_start {
+                    return Ok(None);
+                }
+                self.apply_recovery_delta(
+                    self.purge_uncommitted_file_entries(data_file.file_idx, offset)?,
+                    pending_committed_delta,
+                );
+            }
             let entry_bytes = next_offset - offset;
             offset = next_offset;
 
@@ -153,6 +210,9 @@ impl CandyStore {
         let durable_extent = last_durable_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
         if durable_extent < pre_rebuild_tail_upper_bound {
+            if !replaying_from_start {
+                return Ok(None);
+            }
             self.inner.stats.num_rebuild_purged_bytes.fetch_add(
                 pre_rebuild_tail_upper_bound - durable_extent,
                 Ordering::Relaxed,
@@ -164,7 +224,7 @@ impl CandyStore {
             self.purge_uncommitted_file_entries(data_file.file_idx, durable_extent)?,
             pending_committed_delta,
         );
-        Ok(durable_extent)
+        Ok(Some(durable_extent))
     }
 
     fn validated_commit_offset(
@@ -201,20 +261,23 @@ impl CandyStore {
     fn persist_rebuild_checkpoint(&self, ordinal: u64, offset: u64, delta: i64) -> Result<()> {
         let resume_offset = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
+        self.inner
+            .index_file
+            .sync_rows(self.inner.index_file.rows_table_mut())?;
         self.inner.fold_checkpointed_num_entries(delta);
         self.inner
             .persist_checkpoint_cursor(ordinal, resume_offset)?;
 
-        self.inner.index_file.sync_all()
+        self.inner.index_file.sync_header()
     }
 
-    /// Counts pointers that are live (published row, matching selector bits,
-    /// backing file present) and makes that the authoritative entry count.
-    fn reset_live_count_from_rows(&self) {
+    /// Rebuilds entry counts and per-file waste from the final live index.
+    fn reset_recovery_stats_from_rows(&self) -> Result<()> {
         let files = self.inner.data_files.read();
         let row_table = self.inner.index_file.rows_table();
         let num_rows = self.inner.index_file.num_rows();
         let mut live = 0u64;
+        let mut live_entries = vec![Vec::new(); MAX_DATA_FILES as usize];
 
         for row_idx in 0..num_rows {
             let row = row_table.row(row_idx);
@@ -230,8 +293,22 @@ impl CandyStore {
                     && files.contains_key(&ptr.file_idx())
                 {
                     live += 1;
+                    live_entries[ptr.file_idx() as usize].push(ptr);
                 }
             }
+        }
+
+        for (file_idx, entries) in live_entries.into_iter().enumerate() {
+            let file_idx = file_idx as u16;
+            let waste = match files.get(&file_idx) {
+                Some(file) => file
+                    .used_bytes()
+                    .saturating_sub(file.indexed_live_bytes(&entries)?),
+                None => 0,
+            };
+            self.inner
+                .index_file
+                .set_file_waste(file_idx, waste.min(u32::MAX as u64) as u32);
         }
 
         self.inner
@@ -242,6 +319,7 @@ impl CandyStore {
         self.inner
             .uncommitted_entries_delta
             .store(0, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Remove index entries pointing to the active file at or beyond `durable_extent`.

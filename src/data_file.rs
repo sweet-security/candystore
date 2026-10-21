@@ -14,10 +14,11 @@ use std::{
 };
 
 use crate::internal::{
-    DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION, EntryType,
+    DATA_ENTRY_OFFSET_MASK, DATA_FILE_SIGNATURE, DATA_FILE_VERSION, EntryPointer, EntryType,
     FILE_OFFSET_ALIGNMENT, KEY_NAMESPACE_BITS, KVBuf, KVRef, KeyNamespace, MAX_KEY_NAMESPACE,
-    PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, data_file_path, entry_magic_offset,
-    invalid_data_error, read_available_at, read_into_at, sync_dir, write_all_at,
+    PAGE_SIZE, READ_BUFFER_SIZE, SIZE_HINT_UNIT, aligned_data_entry_size, data_file_path,
+    entry_magic_offset, invalid_data_error, read_available_at, read_into_at, sync_dir,
+    write_all_at,
 };
 use crate::types::{Config, Error, MAX_USER_KEY_SIZE, MAX_USER_VALUE_SIZE, Result};
 
@@ -100,7 +101,35 @@ impl InflightTracker {
         ))
     }
 
-    pub(crate) fn checkpoint_progress(&self, active_file: &DataFile) -> (u64, u64, i64, u64) {
+    #[cfg(test)]
+    pub(crate) fn reserve_for_test<'a>(
+        &'a self,
+        data_file: &DataFile,
+        shard_idx: usize,
+        offset: u64,
+        delta: i8,
+    ) -> Result<(u64, InflightGuard<'a>)> {
+        let _barrier = self.snapshot_barrier.read();
+        let ordinal = data_file.file_ordinal;
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[shard_idx];
+        slot.ordinal.store(ordinal, Ordering::Relaxed);
+        slot.offset.store(offset, Ordering::Relaxed);
+        slot.seq.store(seq, Ordering::Release);
+
+        Ok((
+            offset,
+            InflightGuard {
+                tracker: self,
+                shard_idx,
+                seq,
+                delta,
+                armed: true,
+            },
+        ))
+    }
+
+    pub(crate) fn checkpoint_progress(&self, active_file: &DataFile) -> (u64, u64, i64, u64, bool) {
         let _barrier = self.snapshot_barrier.write();
 
         let mut checkpoint = None::<(u64, u64)>;
@@ -120,9 +149,11 @@ impl InflightTracker {
         let checkpoint =
             checkpoint.unwrap_or_else(|| (active_file.file_ordinal, active_file.used_bytes()));
         let completed_before_seq = earliest_active_seq.unwrap_or(u64::MAX);
+        let mut has_pending_work = earliest_active_seq.is_some();
         let mut committed_delta = 0i64;
         for queue in &self.completed_deltas {
             let queue = queue.lock();
+            has_pending_work |= !queue.is_empty();
             for &(seq, delta) in queue.iter() {
                 if seq >= completed_before_seq {
                     break;
@@ -136,6 +167,7 @@ impl InflightTracker {
             checkpoint.1,
             committed_delta,
             completed_before_seq,
+            has_pending_work,
         )
     }
 
@@ -237,6 +269,8 @@ pub(crate) struct DataFile {
     config: Arc<Config>,
     pub(crate) file_idx: u16,
     pub(crate) file_ordinal: u64,
+    pub(crate) retained_tombstone_bytes: AtomicU64,
+    pub(crate) tombstone_retention_generation: AtomicU64,
     preallocated: bool,
     recovery_tail_upper_bound: u64,
 }
@@ -456,12 +490,14 @@ impl DataFile {
         let inst = Self {
             file,
             file_offset: AtomicU64::new(physical_data_len),
-            dirty: AtomicBool::new(false),
+            dirty: AtomicBool::new(true),
             sync_lock: Mutex::new(()),
             sealed_for_rotation: AtomicBool::new(false),
             config,
             file_idx,
             file_ordinal: header.ordinal,
+            retained_tombstone_bytes: AtomicU64::new(0),
+            tombstone_retention_generation: AtomicU64::new(u64::MAX),
             preallocated,
             recovery_tail_upper_bound,
         };
@@ -509,6 +545,8 @@ impl DataFile {
             config,
             file_idx,
             file_ordinal: ordinal,
+            retained_tombstone_bytes: AtomicU64::new(0),
+            tombstone_retention_generation: AtomicU64::new(u64::MAX),
             preallocated: true,
             recovery_tail_upper_bound: 0,
         })
@@ -632,6 +670,39 @@ impl DataFile {
             shard_idx,
             inflight_tracker,
         )
+    }
+
+    pub(crate) fn indexed_live_bytes(&self, entries: &[EntryPointer]) -> Result<u64> {
+        if entries.is_empty() || self.used_bytes() == 0 {
+            return Ok(0);
+        }
+        let map_len = size_of::<DataFileHeader>() + self.used_bytes() as usize;
+        let mapping = memmap2::MmapOptions::new()
+            .len(map_len)
+            .map_raw_read_only(&self.file)
+            .map_err(Error::IOError)?;
+        let mut live_bytes = 0;
+        for entry in entries {
+            let offset = entry.file_offset() as usize;
+            let start = size_of::<DataFileHeader>() + offset;
+            if start + 8 > mapping.len() {
+                continue;
+            }
+            let header_bytes =
+                unsafe { std::ptr::read_unaligned(mapping.as_ptr().add(start).cast::<[u8; 8]>()) };
+            let header = u32::from_le_bytes(header_bytes[..4].try_into().unwrap());
+            let klen = u16::from_le_bytes(header_bytes[4..6].try_into().unwrap()) as usize;
+            let vlen = u16::from_le_bytes(header_bytes[6..8].try_into().unwrap()) as usize;
+            let size = aligned_data_entry_size(klen, vlen);
+            if header & DATA_ENTRY_OFFSET_MASK == entry_magic_offset(offset as u64)
+                && header >> 30 <= EntryType::Update as u32
+                && size <= entry.size_hint() as u64
+                && entry.file_offset() + size <= self.used_bytes()
+            {
+                live_bytes += size;
+            }
+        }
+        Ok(live_bytes)
     }
 
     pub(crate) fn read_kv_into<'a>(
@@ -845,6 +916,70 @@ mod tests {
     use crate::types::INITIAL_DATA_FILE_ORDINAL;
 
     #[test]
+    fn indexed_live_bytes_uses_headers_and_checks_bounds() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Arc::new(Config {
+            max_data_file_size: 16 * 1024,
+            ..Config::default()
+        });
+        let data_file = DataFile::create(dir.path(), config, 0, INITIAL_DATA_FILE_ORDINAL)?;
+        let mut entries = Vec::new();
+        let mut expected = 0;
+        assert_eq!(data_file.indexed_live_bytes(&entries)?, 0);
+        for len in [0, 1, 500, 512, 1024, 4096] {
+            let size = aligned_data_entry_size(3, len) as usize;
+            let offset = data_file.allocate(size as u64)?;
+            let mut header = [0; 8];
+            header[..4].copy_from_slice(
+                &(entry_magic_offset(offset) | ((KeyNamespace::User as u32) << 24)).to_le_bytes(),
+            );
+            header[4..6].copy_from_slice(&3u16.to_le_bytes());
+            header[6..8].copy_from_slice(&(len as u16).to_le_bytes());
+            write_all_at(
+                &data_file.file,
+                &header,
+                size_of::<DataFileHeader>() as u64 + offset,
+            )
+            .map_err(Error::IOError)?;
+            entries.push(EntryPointer::new(0, offset, size, 0));
+            expected += size as u64;
+        }
+        entries.push(EntryPointer::new(0, data_file.used_bytes() + 16, 16, 0));
+        assert_eq!(data_file.indexed_live_bytes(&entries)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn reopened_file_requires_sync() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Arc::new(Config {
+            max_data_file_size: 4096,
+            ..Config::default()
+        });
+        let data_file = DataFile::create(dir.path(), config.clone(), 0, INITIAL_DATA_FILE_ORDINAL)?;
+        let tracker = InflightTracker::new(1);
+        let (_, _, guard) = data_file.append_kv(
+            EntryType::Insert,
+            KeyNamespace::User,
+            b"key",
+            b"value",
+            0,
+            &tracker,
+        )?;
+        guard.complete();
+        drop(data_file);
+        let reopened = DataFile::open(dir.path(), config, 0, true)?;
+        let mut synced = false;
+        reopened.sync_to_current_with(|file| {
+            synced = true;
+            file.sync_data()
+        })?;
+        assert!(synced);
+        assert!(!reopened.is_dirty());
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_sync_waits_for_in_progress_sync() -> Result<()> {
         let dir = tempfile::tempdir().map_err(Error::IOError)?;
         let data_file = Arc::new(DataFile::create(
@@ -959,7 +1094,7 @@ mod tests {
 
         assert_eq!(
             tracker.checkpoint_progress(&data_file),
-            (INITIAL_DATA_FILE_ORDINAL, 64, 0, 1)
+            (INITIAL_DATA_FILE_ORDINAL, 64, 0, 1, true)
         );
         Ok(())
     }
@@ -979,11 +1114,55 @@ mod tests {
 
         assert_eq!(
             tracker.checkpoint_progress(&data_file),
-            (INITIAL_DATA_FILE_ORDINAL, 0, 0, u64::MAX)
+            (INITIAL_DATA_FILE_ORDINAL, 0, 0, u64::MAX, true)
         );
         assert_eq!(tracker.completed_deltas[0].lock().len(), 2);
         assert_eq!(tracker.drain_completed_before(u64::MAX), 0);
         assert!(tracker.completed_deltas[0].lock().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_progress_keeps_pending_updates_in_the_same_snapshot() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let data_file = DataFile::create(
+            dir.path(),
+            Arc::new(Config::default()),
+            0,
+            INITIAL_DATA_FILE_ORDINAL,
+        )?;
+        let tracker = InflightTracker::new(2);
+        let cursor = (data_file.file_ordinal, data_file.used_bytes());
+        let (_, _, slow_guard) = data_file.append_kv(
+            EntryType::Update,
+            KeyNamespace::User,
+            b"slow",
+            b"new",
+            0,
+            &tracker,
+        )?;
+        let (_, _, fast_guard) = data_file.append_kv(
+            EntryType::Update,
+            KeyNamespace::User,
+            b"fast",
+            b"new",
+            1,
+            &tracker,
+        )?;
+        fast_guard.complete();
+
+        let (ordinal, offset, delta, _, has_pending_work) = tracker.checkpoint_progress(&data_file);
+        slow_guard.complete();
+
+        assert_eq!((ordinal, offset), cursor);
+        assert_eq!(delta, 0);
+        assert!(has_pending_work);
+        assert!(data_file.is_dirty());
+        let (ordinal, offset, delta, _, has_pending_work) = tracker.checkpoint_progress(&data_file);
+        assert_eq!(ordinal, cursor.0);
+        assert!(offset > cursor.1);
+        assert_eq!(delta, 0);
+        assert!(!has_pending_work);
         Ok(())
     }
 }
