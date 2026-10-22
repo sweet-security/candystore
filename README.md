@@ -177,8 +177,8 @@ call `checkpoint()` periodically.
 
 On an unexpected crash or an unclean shutdown, Candy normally resumes from the latest successful
 checkpoint and replays recent operations from the append-only data files. If a surviving index
-pointer refers to a lost data tail, or replay encounters a damaged region, recovery restarts from
-the earliest remaining file so older valid values can be restored consistently. Recovered data
+pointer refers to a lost data tail or a damaged region, recovery restarts once from the earliest
+remaining file so older valid values can be restored consistently. Recovered data
 and rebuilt rows are synchronized before publishing a new checkpoint.
 
 Opening also traverses the live index and temporarily maps data files to read record headers

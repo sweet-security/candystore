@@ -251,6 +251,7 @@ fn mutation_crash_child() {
     )
     .unwrap();
     match std::env::var("CANDYSTORE_TEST_MUTATION").unwrap().as_str() {
+        "open" => {}
         "shrink" => {
             db.shrink_to_fit_blocking(0.0).unwrap();
         }
@@ -272,6 +273,76 @@ fn mutation_crash_child() {
         }
         _ => panic!("unknown mutation"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_interrupted_corruption_rewind_makes_progress() -> Result<(), Error> {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempdir().unwrap();
+    let config = mutation_crash_config();
+    let db = CandyStore::open(dir.path(), config)?;
+    db.set("victim", "old")?;
+    db.set("keeper", "healthy")?;
+    db.checkpoint()?;
+    for idx in 0..3000u32 {
+        db.set(idx.to_le_bytes(), vec![1; 192])?;
+    }
+    let corrupt_offset = db.stats().total_bytes;
+    db.set("victim", "bad")?;
+    db.set("after-corruption", "healthy")?;
+    db._abort_for_testing();
+
+    let path = dir.path().join("data_0000");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(Error::IOError)?;
+    let checksum_offset = PAGE_SIZE as u64 + corrupt_offset + 8 + 6 + 3;
+    let mut checksum = [0; 2];
+    file.read_exact_at(&mut checksum, checksum_offset)
+        .map_err(Error::IOError)?;
+    checksum[0] ^= 1;
+    file.write_all_at(&checksum, checksum_offset)
+        .map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+
+    let mut completed = false;
+    for _ in 0..12 {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mutation_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CANDYSTORE_TEST_PATH", dir.path())
+            .env("CANDYSTORE_TEST_MUTATION", "open")
+            .env("CANDYSTORE_CRASH_POINT", "rebuild_entry")
+            .env("CANDYSTORE_CRASH_AFTER", "1500")
+            .output()
+            .unwrap();
+        if output.status.success() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "recovery restarted without making progress");
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("victim")?, Some(b"old".to_vec()));
+    assert_eq!(db.get("after-corruption")?, Some(b"healthy".to_vec()));
+    assert_eq!(db.get(2999u32.to_le_bytes())?, Some(vec![1; 192]));
+    assert_eq!(db.num_items(), 3003);
+    drop(db);
+    std::fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+    std::fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+    let db = CandyStore::open(dir.path(), config)?;
+    assert_eq!(db.get("victim")?, Some(b"old".to_vec()));
+    assert_eq!(db.num_items(), 3003);
+    Ok(())
 }
 
 #[cfg(unix)]

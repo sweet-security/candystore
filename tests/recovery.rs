@@ -91,6 +91,46 @@ fn test_lost_tombstone_stays_consistent_after_index_rebuild() -> Result<(), Erro
 }
 
 #[test]
+fn test_unreferenced_gap_does_not_force_full_replay() -> Result<(), Error> {
+    let dir = tempdir().unwrap();
+    let config = Config {
+        max_data_file_size: 1024 * 1024,
+        checkpoint_interval: None,
+        checkpoint_delta_bytes: None,
+        compaction_throughput_bytes_per_sec: 0,
+        ..Config::default()
+    };
+    let db = CandyStore::open(dir.path(), config)?;
+    for idx in 0..3000u32 {
+        db.set(idx.to_le_bytes(), "prefix")?;
+    }
+    db.checkpoint()?;
+    db.set("before-gap", "value")?;
+    let gap_offset = db.stats().total_bytes;
+    db.set("key", "first")?;
+    db.set("key", "second")?;
+    db.set("after-gap", "value")?;
+    db._abort_for_testing();
+
+    // Models an append reserved by a killed writer while later appends completed.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(active_data_file_path(dir.path())?)
+        .map_err(Error::IOError)?;
+    file.seek(SeekFrom::Start(DATA_FILE_HEADER_LEN + gap_offset))
+        .map_err(Error::IOError)?;
+    file.write_all(&[0; 32]).map_err(Error::IOError)?;
+    file.sync_all().map_err(Error::IOError)?;
+
+    let db = CandyStore::open(dir.path(), config)?;
+    assert!(db.stats().num_rebuilt_entries < 10);
+    assert_eq!(db.get("key")?, Some(b"second".to_vec()));
+    assert_eq!(db.get("after-gap")?, Some(b"value".to_vec()));
+    assert_eq!(db.num_items(), 3003);
+    Ok(())
+}
+
+#[test]
 fn test_lost_overwrite_restores_checkpointed_value() -> Result<(), Error> {
     for rotate in [false, true] {
         let dir = tempdir().unwrap();

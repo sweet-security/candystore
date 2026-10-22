@@ -36,6 +36,10 @@ impl CandyStore {
 
         if self.has_truncated_index_entries() {
             self.persist_rebuild_checkpoint(ordered_files[0].file_ordinal, 0, 0)?;
+            // Purge only after the rewind is durable so an interrupted replay cannot rewind again.
+            for data_file in &ordered_files {
+                self.purge_file_range(data_file.file_idx, data_file.used_bytes(), u64::MAX)?;
+            }
         }
 
         let (commit_file_ordinal, commit_offset) = self.inner.index_file.checkpoint_cursor();
@@ -50,11 +54,12 @@ impl CandyStore {
         } else {
             RebuildMode::TailFrom(0)
         };
-        let replaying_from_start = start_idx == 0
-            && matches!(
+        let rewind_ordinal = (start_idx != 0
+            || !matches!(
                 rebuild_mode,
                 RebuildMode::TailFrom(0) | RebuildMode::FullFile
-            );
+            ))
+        .then_some(ordered_files[0].file_ordinal);
 
         // Recompute the runtime-only delta from the persisted replay cursor.
         self.inner
@@ -74,17 +79,12 @@ impl CandyStore {
             let Some(durable_extent) = self.rebuild_file_from(
                 data_file,
                 file_mode,
-                replaying_from_start,
+                rewind_ordinal,
                 &mut bytes_since_checkpoint,
                 &mut pending_committed_delta,
                 &mut match_scratch,
             )?
             else {
-                self.persist_rebuild_checkpoint(
-                    ordered_files[0].file_ordinal,
-                    0,
-                    pending_committed_delta,
-                )?;
                 return self.recover_index();
             };
             final_cursor = (data_file.file_ordinal, durable_extent);
@@ -131,7 +131,7 @@ impl CandyStore {
         &self,
         data_file: &Arc<DataFile>,
         rebuild_mode: RebuildMode,
-        replaying_from_start: bool,
+        rewind_ordinal: Option<u64>,
         bytes_since_checkpoint: &mut u64,
         pending_committed_delta: &mut i64,
         match_scratch: &mut Vec<u8>,
@@ -148,7 +148,7 @@ impl CandyStore {
         let pre_rebuild_tail_upper_bound = data_file.recovery_tail_upper_bound();
         let pre_purge_extent = pre_rebuild_tail_upper_bound.next_multiple_of(FILE_OFFSET_ALIGNMENT);
         self.apply_recovery_delta(
-            self.purge_uncommitted_file_entries(data_file.file_idx, pre_purge_extent)?,
+            self.purge_file_range(data_file.file_idx, pre_purge_extent, u64::MAX)?,
             pending_committed_delta,
         );
 
@@ -156,7 +156,7 @@ impl CandyStore {
             // The saved checkpoint within this file is no longer trustworthy.
             // Remove every pointer into it and rebuild its contribution from 0.
             self.apply_recovery_delta(
-                self.purge_uncommitted_file_entries(data_file.file_idx, 0)?,
+                self.purge_file_range(data_file.file_idx, 0, u64::MAX)?,
                 pending_committed_delta,
             );
         }
@@ -168,14 +168,17 @@ impl CandyStore {
         while let Some((kv, entry_offset, next_offset)) =
             data_file.read_next_entry_ref(offset, &mut read_buf, &mut buf_file_offset)?
         {
-            if entry_offset != offset.next_multiple_of(FILE_OFFSET_ALIGNMENT) {
-                if !replaying_from_start {
-                    return Ok(None);
-                }
-                self.apply_recovery_delta(
-                    self.purge_uncommitted_file_entries(data_file.file_idx, offset)?,
+            let expected_offset = offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
+            if entry_offset != expected_offset
+                && self.rewind_for_damaged_range(
+                    data_file,
+                    expected_offset,
+                    entry_offset,
+                    rewind_ordinal,
                     pending_committed_delta,
-                );
+                )?
+            {
+                return Ok(None);
             }
             let entry_bytes = next_offset - offset;
             offset = next_offset;
@@ -210,7 +213,13 @@ impl CandyStore {
         let durable_extent = last_durable_offset.next_multiple_of(FILE_OFFSET_ALIGNMENT);
 
         if durable_extent < pre_rebuild_tail_upper_bound {
-            if !replaying_from_start {
+            if self.rewind_for_damaged_range(
+                data_file,
+                durable_extent,
+                u64::MAX,
+                rewind_ordinal,
+                pending_committed_delta,
+            )? {
                 return Ok(None);
             }
             self.inner.stats.num_rebuild_purged_bytes.fetch_add(
@@ -221,10 +230,47 @@ impl CandyStore {
         }
 
         self.apply_recovery_delta(
-            self.purge_uncommitted_file_entries(data_file.file_idx, durable_extent)?,
+            self.purge_file_range(data_file.file_idx, durable_extent, u64::MAX)?,
             pending_committed_delta,
         );
         Ok(Some(durable_extent))
+    }
+
+    /// Purges index pointers into a damaged range; returns true if replay must restart from the oldest file.
+    fn rewind_for_damaged_range(
+        &self,
+        data_file: &DataFile,
+        start: u64,
+        end: u64,
+        rewind_ordinal: Option<u64>,
+        pending_committed_delta: &mut i64,
+    ) -> Result<bool> {
+        let rewind = rewind_ordinal
+            .filter(|_| self.has_index_entries_in_range(data_file.file_idx, start, end));
+        if let Some(ordinal) = rewind {
+            self.persist_rebuild_checkpoint(ordinal, 0, *pending_committed_delta)?;
+            *pending_committed_delta = 0;
+        }
+        self.apply_recovery_delta(
+            self.purge_file_range(data_file.file_idx, start, end)?,
+            pending_committed_delta,
+        );
+        Ok(rewind.is_some())
+    }
+
+    fn has_index_entries_in_range(&self, file_idx: u16, start: u64, end: u64) -> bool {
+        let rows = self.inner.index_file.rows_table();
+        (0..self.inner.index_file.num_rows()).any(|row_idx| {
+            let row = rows.row(row_idx);
+            row.split_level.load(Ordering::Acquire) != 0
+                && (0..ROW_WIDTH).any(|col| {
+                    let ptr = row.pointers[col];
+                    row.signatures[col] != HashCoord::INVALID_SIG
+                        && ptr.is_valid()
+                        && ptr.file_idx() == file_idx
+                        && (start..end).contains(&ptr.file_offset())
+                })
+        })
     }
 
     fn validated_commit_offset(
@@ -322,8 +368,8 @@ impl CandyStore {
         Ok(())
     }
 
-    /// Remove index entries pointing to the active file at or beyond `durable_extent`.
-    fn purge_uncommitted_file_entries(&self, file_idx: u16, min_offset: u64) -> Result<i64> {
+    /// Removes index entries pointing into `[start, end)` of `file_idx`.
+    fn purge_file_range(&self, file_idx: u16, start: u64, end: u64) -> Result<i64> {
         let row_table = self.inner.index_file.rows_table();
         let num_rows = self.inner.index_file.num_rows();
         let mut removed = 0i64;
@@ -341,7 +387,7 @@ impl CandyStore {
                 if !ptr.is_valid() {
                     continue;
                 }
-                if ptr.file_idx() == file_idx && ptr.file_offset() >= min_offset {
+                if ptr.file_idx() == file_idx && (start..end).contains(&ptr.file_offset()) {
                     row.remove(col);
                     removed += 1;
                 }
