@@ -214,24 +214,39 @@ mod tests {
     fn test_rate_accuracy() {
         let mut pacer = Pacer::new(10, Duration::from_millis(10), 10);
         pacer.consume(10);
+        let mut requested = Duration::ZERO;
         let t0 = Instant::now();
-        pacer.consume(50);
+        pacer.consume_with_sleep_fn(50, |duration| {
+            requested += duration;
+            std::thread::sleep(duration);
+        });
         let d = t0.elapsed();
         assert!(d >= Duration::from_millis(40), "Too fast: {d:?}");
-        assert!(d < Duration::from_millis(150), "Too slow: {d:?}");
+        // CI schedulers may oversleep arbitrarily, so bound what the pacer asked for
+        assert!(
+            requested <= Duration::from_millis(55),
+            "Too slow: {requested:?}"
+        );
     }
 
     #[test]
     fn test_many_small_consumes() {
         let mut pacer = Pacer::new(10, Duration::from_millis(10), 10);
         pacer.consume(10);
+        let mut requested = Duration::ZERO;
         let t0 = Instant::now();
         for _ in 0..30 {
-            pacer.consume(1);
+            pacer.consume_with_sleep_fn(1, |duration| {
+                requested += duration;
+                std::thread::sleep(duration);
+            });
         }
         let d = t0.elapsed();
         assert!(d >= Duration::from_millis(20), "Too fast: {d:?}");
-        assert!(d < Duration::from_millis(150), "Too slow: {d:?}");
+        assert!(
+            requested <= Duration::from_millis(35),
+            "Too slow: {requested:?}"
+        );
     }
 
     #[test]
