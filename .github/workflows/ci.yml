@@ -90,6 +90,46 @@ jobs:
         if: matrix.profile == 'release'
         run: cargo test --release --test crasher -- --nocapture
 
+  test-macos:
+    name: Test (macOS, ${{ matrix.profile }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Print runner info
+        run: |
+          echo "cores: $(sysctl -n hw.ncpu)"
+          echo "cpu model: $(sysctl -n machdep.cpu.brand_string)"
+          echo "ram: $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GB"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-macos-${{ matrix.profile }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo test --release -- --skip test_crash_recovery --test-threads=1
+          else
+            cargo test -- --skip test_crash_recovery --test-threads=1
+          fi
+      - name: Run whitebox tests
+        run: cargo test --features whitebox-testing --test whitebox
+      - name: Run examples
+        run: |
+          cargo run --example simple
+          cargo run --example multithreaded
+          cargo run --example atomics
+          cargo run --example lists
+          cargo run --example typed
+      - name: Run perf
+        if: matrix.profile == 'release'
+        run: cargo run --release --example perf
+
   test-windows:
     name: Test (Windows, ${{ matrix.profile }})
     runs-on: windows-latest
