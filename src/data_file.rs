@@ -269,8 +269,12 @@ pub(crate) struct DataFile {
     config: Arc<Config>,
     pub(crate) file_idx: u16,
     pub(crate) file_ordinal: u64,
+    /// Tombstones found by the last compaction scan that an older file forces us to keep.
     pub(crate) retained_tombstone_bytes: AtomicU64,
-    pub(crate) tombstone_retention_generation: AtomicU64,
+    /// The largest of them, bounding what a single re-created key releases.
+    pub(crate) largest_retained_tombstone: AtomicU64,
+    /// `insert_generation` at the time of that scan.
+    pub(crate) tombstone_scan_generation: AtomicU64,
     preallocated: bool,
     recovery_tail_upper_bound: u64,
 }
@@ -497,7 +501,8 @@ impl DataFile {
             file_idx,
             file_ordinal: header.ordinal,
             retained_tombstone_bytes: AtomicU64::new(0),
-            tombstone_retention_generation: AtomicU64::new(u64::MAX),
+            largest_retained_tombstone: AtomicU64::new(0),
+            tombstone_scan_generation: AtomicU64::new(0),
             preallocated,
             recovery_tail_upper_bound,
         };
@@ -546,7 +551,8 @@ impl DataFile {
             file_idx,
             file_ordinal: ordinal,
             retained_tombstone_bytes: AtomicU64::new(0),
-            tombstone_retention_generation: AtomicU64::new(u64::MAX),
+            largest_retained_tombstone: AtomicU64::new(0),
+            tombstone_scan_generation: AtomicU64::new(0),
             preallocated: true,
             recovery_tail_upper_bound: 0,
         })

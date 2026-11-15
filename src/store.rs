@@ -358,6 +358,8 @@ impl StoreInner {
         let files = self.data_files.read();
         let oldest_ordinal = files.values().map(|file| file.file_ordinal).min();
         let insert_generation = self.insert_generation.load(Ordering::Acquire);
+        let mut pinned_tombstone_bytes = 0u64;
+        let mut live_bytes = 0u64;
         let mut candidates = files
             .iter()
             .filter_map(|(&file_idx, data_file)| {
@@ -367,17 +369,27 @@ impl StoreInner {
                     } else {
                         0
                     };
+                pinned_tombstone_bytes = pinned_tombstone_bytes.saturating_add(retained);
                 let total_waste = u64::from(self.index_file.file_waste(file_idx));
+                live_bytes =
+                    live_bytes.saturating_add(data_file.used_bytes().saturating_sub(total_waste));
                 let waste = total_waste.saturating_sub(retained);
-                let needs_rescan = data_file
-                    .tombstone_retention_generation
-                    .load(Ordering::Acquire)
-                    != insert_generation;
+                // A retained tombstone is only released by its key being created again, so
+                // the inserts since the file was scanned bound how much of what it retained
+                // may be reclaimable by now. Scanning it again before that could add up to
+                // the threshold is wasted work (and used to happen on every single insert).
+                // This assumes one tombstone per key: a key deleted several times within the
+                // file releases more at once, in which case the rescan just comes later.
+                let inserts_since_scan = insert_generation
+                    .saturating_sub(data_file.tombstone_scan_generation.load(Ordering::Acquire));
+                let maybe_released =
+                    retained.min(inserts_since_scan.saturating_mul(
+                        data_file.largest_retained_tombstone.load(Ordering::Relaxed),
+                    ));
                 if file_idx == active_file_idx
                     || data_file.file_ordinal >= commit_file_ordinal
-                    || (waste <= u64::from(self.config.compaction_min_threshold)
-                        && (!needs_rescan
-                            || total_waste <= u64::from(self.config.compaction_min_threshold)))
+                    || waste.saturating_add(maybe_released)
+                        <= u64::from(self.config.compaction_min_threshold)
                 {
                     return None;
                 }
@@ -391,6 +403,38 @@ impl StoreInner {
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.0.cmp(&right.0))
         });
+        // A run of the oldest files is compacted without retaining (or even scanning for)
+        // tombstones, since nothing older than them survives the compaction.
+        let mut by_age = files
+            .iter()
+            .map(|(&file_idx, data_file)| (file_idx, data_file.file_ordinal))
+            .collect::<Vec<_>>();
+        by_age.sort_by_key(|&(_, file_ordinal)| file_ordinal);
+        // Tombstones are retained as long as any older file exists, so a cold oldest file
+        // (little waste, never over the threshold) would pin them forever and delete churn
+        // would grow the store without bound. Once the pinned tombstones outweigh the cost of
+        // moving all live data forward, compact the oldest files regardless of their waste.
+        // Repeating this walks the oldest file forward and releases the tombstones, keeping
+        // the rewrite cost below the space it frees.
+        let walk_oldest = pinned_tombstone_bytes > u64::from(self.config.compaction_min_threshold)
+            && pinned_tombstone_bytes >= live_bytes;
+        // Otherwise prefer that run while each file in it is over the threshold anyway: a
+        // backlog of tombstone-only files then drains oldest-first, without first scanning
+        // every file to learn what it retains.
+        let oldest_run = by_age
+            .into_iter()
+            .take_while(|&(file_idx, file_ordinal)| {
+                file_idx != active_file_idx
+                    && file_ordinal < commit_file_ordinal
+                    && (walk_oldest
+                        || self.index_file.file_waste(file_idx)
+                            > self.config.compaction_min_threshold)
+            })
+            .take(max_candidates)
+            .collect::<Vec<_>>();
+        if !oldest_run.is_empty() {
+            return oldest_run;
+        }
         candidates
             .into_iter()
             .take(max_candidates)

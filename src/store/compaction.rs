@@ -71,17 +71,20 @@ impl StoreInner {
         pacer: &mut Pacer,
         read_buf: &mut Vec<u8>,
     ) -> Result<Option<CompactionSources>> {
-        let oldest_ordinal = self
+        // A source older than every file that stays can only hide values in sources removed
+        // alongside it (oldest-first), so its tombstones need no retention and no scan.
+        let oldest_retained = self
             .data_files
             .read()
-            .values()
-            .map(|file| file.file_ordinal)
+            .iter()
+            .filter(|(idx, _)| !sources.iter().any(|(source_idx, _)| source_idx == *idx))
+            .map(|(_, file)| file.file_ordinal)
             .min();
         let mut reclaimable = Vec::new();
         for (idx, source_file) in sources {
-            if oldest_ordinal.is_some_and(|ordinal| ordinal < source_file.file_ordinal) {
+            if oldest_retained.is_some_and(|ordinal| ordinal < source_file.file_ordinal) {
                 let generation = self.insert_generation.load(Ordering::Acquire);
-                let Some(retained) =
+                let Some((retained, largest)) =
                     self.scan_compaction_tombstones(&source_file, pacer, read_buf, false)?
                 else {
                     return Ok(None);
@@ -90,9 +93,16 @@ impl StoreInner {
                     .retained_tombstone_bytes
                     .store(retained, Ordering::Relaxed);
                 source_file
-                    .tombstone_retention_generation
+                    .largest_retained_tombstone
+                    .store(largest, Ordering::Relaxed);
+                source_file
+                    .tombstone_scan_generation
                     .store(generation, Ordering::Release);
-                if retained > 0 && u64::from(self.index_file.file_waste(idx)) <= retained {
+                // Rewriting a file moves its retained tombstones along, so it only pays off
+                // when what is actually reclaimed (the rest of the waste) is over the threshold.
+                let reclaimable =
+                    u64::from(self.index_file.file_waste(idx)).saturating_sub(retained);
+                if retained > 0 && reclaimable <= u64::from(self.config.compaction_min_threshold) {
                     continue;
                 }
             }
@@ -101,16 +111,19 @@ impl StoreInner {
         Ok(Some(reclaimable))
     }
 
+    /// Returns the total and the largest size of the tombstones that must be retained, or
+    /// `None` when interrupted by shutdown.
     fn scan_compaction_tombstones(
         &self,
         source_file: &DataFile,
         pacer: &mut Pacer,
         read_buf: &mut Vec<u8>,
         preserve: bool,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, u64)>> {
         let mut offset = 0;
         let mut buf_file_offset = 0;
         let mut tombstone_bytes = 0;
+        let mut largest_tombstone = 0;
         read_buf.clear();
         loop {
             if self.compaction_shutting_down.load(Ordering::Acquire) {
@@ -119,7 +132,7 @@ impl StoreInner {
             let Some((kv, _, next_offset)) =
                 source_file.read_next_entry_ref(offset, read_buf, &mut buf_file_offset)?
             else {
-                return Ok(Some(tombstone_bytes));
+                return Ok(Some((tombstone_bytes, largest_tombstone)));
             };
             if !pacer.consume_interruptibly(next_offset - offset, || {
                 self.compaction_shutting_down.load(Ordering::Acquire)
@@ -131,7 +144,9 @@ impl StoreInner {
                 && let Some(ns) = KeyNamespace::from_u8(kv.ns)
                 && self.process_compaction_tombstone(ns, kv.key(), preserve)?
             {
-                tombstone_bytes += u64::from(aligned_tombstone_entry_waste(kv.key().len()));
+                let waste = u64::from(aligned_tombstone_entry_waste(kv.key().len()));
+                tombstone_bytes += waste;
+                largest_tombstone = largest_tombstone.max(waste);
             }
         }
     }
@@ -799,6 +814,8 @@ mod tests {
 
         let dir = tempfile::tempdir().map_err(Error::IOError)?;
         let config = Config {
+            // compact the explicit candidates no matter how little they reclaim
+            compaction_min_threshold: 0,
             max_data_file_size: 64 * 1024,
             checkpoint_interval: None,
             checkpoint_delta_bytes: None,
@@ -1079,8 +1096,14 @@ mod tests {
             let db = CandyStore::open(dir.path(), config)?;
             db.stop_compaction();
             db.set("cold", vec![1; 128])?;
+            // enough live data that the retained tombstones never justify rewriting it,
+            // so only the reinsert can release them
+            for idx in 0..8 {
+                db.set(format!("cold-{idx}"), vec![1; 128])?;
+            }
             db.inner
                 ._rotate_data_file(db.inner.active_file_idx.load(Ordering::Acquire))?;
+            let cold_files = db.inner.data_files.read().len() - 1;
             let key = "v".repeat(96);
             for _ in 0..8 {
                 db.set(&key, vec![2; 128])?;
@@ -1117,7 +1140,7 @@ mod tests {
                 assert!(db.inner.next_compaction_candidates(4).is_empty());
                 assert_eq!(
                     db.inner.data_files.read().len(),
-                    if inserted { 2 } else { 10 }
+                    cold_files + if inserted { 1 } else { 9 }
                 );
             }
             drop(db);
@@ -1126,6 +1149,9 @@ mod tests {
             let db = CandyStore::open(dir.path(), config)?;
             assert_eq!(db.get(&key)?, Some(vec![3; 128]));
             assert_eq!(db.get("cold")?, Some(vec![1; 128]));
+            for idx in 0..8 {
+                assert_eq!(db.get(format!("cold-{idx}"))?, Some(vec![1; 128]));
+            }
         }
         Ok(())
     }
@@ -1183,6 +1209,8 @@ mod tests {
     fn test_compaction_preserves_tombstones_across_source_files() -> Result<()> {
         let dir = tempfile::tempdir().map_err(Error::IOError)?;
         let config = Config {
+            // compact the explicit candidates no matter how little they reclaim
+            compaction_min_threshold: 0,
             max_data_file_size: 4096,
             checkpoint_interval: None,
             checkpoint_delta_bytes: None,
@@ -1234,6 +1262,8 @@ mod tests {
 
         let dir = tempfile::tempdir().map_err(Error::IOError)?;
         let config = Config {
+            // compact the explicit candidates no matter how little they reclaim
+            compaction_min_threshold: 0,
             max_data_file_size: 4096,
             checkpoint_interval: None,
             checkpoint_delta_bytes: None,
@@ -1368,6 +1398,398 @@ mod tests {
         assert!(db.inner.next_compaction_candidates(4).is_empty());
         assert_eq!(db.inner.data_files.read().len(), 1);
         assert_eq!(db.num_items(), 0);
+        Ok(())
+    }
+
+    /// Regression: a cold oldest file whose waste never crosses the threshold pinned every
+    /// newer tombstone forever, so delete churn of distinct keys grew the store without bound.
+    #[test]
+    fn test_cold_oldest_file_does_not_pin_tombstones_forever() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Config {
+            max_data_file_size: 4096,
+            compaction_min_threshold: 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        db.stop_compaction();
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        // long-lived data that is never overwritten, so its file never accumulates waste
+        for idx in 0..24 {
+            db.set(format!("cold-{idx:02}"), vec![1; 96])?;
+        }
+        let cold_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        let cold_ordinal = db.inner.data_file(cold_idx)?.file_ordinal;
+        db.inner._rotate_data_file(cold_idx)?;
+
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        let mut max_files = 0;
+        for round in 0..300 {
+            // delete churn of distinct keys: every removal leaves a tombstone for a dead key
+            for idx in 0..8 {
+                let key = format!("churn-{round:04}-{idx}");
+                db.set(&key, vec![2; 64])?;
+                db.remove(&key)?;
+            }
+            db.checkpoint()?;
+            for _ in 0..100 {
+                let candidates = db.inner.next_compaction_candidates(4);
+                if candidates.is_empty() {
+                    break;
+                }
+                db.inner.compact_files(&candidates, &mut pacer)?;
+                db.checkpoint()?;
+            }
+            max_files = max_files.max(db.inner.data_files.read().len());
+        }
+
+        let files = db.inner.data_files.read().len();
+        let total_waste: u64 = db
+            .inner
+            .data_files
+            .read()
+            .keys()
+            .map(|&idx| u64::from(db.inner.index_file.file_waste(idx)))
+            .sum();
+        // ~600KB of churn went through the store; it must not stay around as pinned
+        // tombstones (without the fix this grows linearly, reaching 20 files here)
+        assert!(max_files <= 6, "data files grew to {max_files}");
+        assert!(files <= 6, "{files} data files left after churn");
+        assert!(total_waste <= 4 * 4096, "{total_waste} bytes of waste left");
+        // the cold file had to be rewritten to release the tombstones it pinned
+        assert!(
+            db.inner
+                .data_files
+                .read()
+                .get(&cold_idx)
+                .is_none_or(|file| file.file_ordinal != cold_ordinal)
+        );
+
+        drop(db);
+        std::fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+        std::fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), config)?;
+        assert_eq!(db.num_items(), 24);
+        for idx in 0..24 {
+            assert_eq!(db.get(format!("cold-{idx:02}"))?, Some(vec![1; 96]));
+        }
+        for round in 0..300 {
+            for idx in 0..8 {
+                assert_eq!(db.get(format!("churn-{round:04}-{idx}"))?, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Regression: with writes interleaving with compaction, a file that receives re-appended
+    /// tombstones also holds some fresh waste. Such files used to be rewritten for any gain at
+    /// all, so the retained tombstones were copied around endlessly (and, with a paced
+    /// compactor, never settled into files that candidate selection could see as pinned).
+    #[test]
+    fn test_pinned_tombstones_stay_bounded_under_concurrent_churn() -> Result<()> {
+        const OPS: u64 = 12_000;
+        const OPS_PER_COMPACTION_PASS: u64 = 6;
+
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Config {
+            max_data_file_size: 16 * 1024,
+            compaction_min_threshold: 4 * 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = Arc::new(CandyStore::open(dir.path(), config)?);
+        db.stop_compaction();
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        for idx in 0..1500 {
+            db.set(format!("cold-{idx:04}"), vec![1; 96])?;
+        }
+        db.checkpoint()?;
+        let cold_files = db.inner.data_files.read().len();
+
+        // the writer is throttled by compaction passes rather than by the clock, so the two
+        // genuinely interleave regardless of how fast the machine is
+        let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db = db.clone();
+            let passes = passes.clone();
+            thread::spawn(move || -> Result<()> {
+                for op in 0..OPS {
+                    while op >= (passes.load(Ordering::Acquire) + 1) * OPS_PER_COMPACTION_PASS {
+                        thread::yield_now();
+                    }
+                    let key = format!("churn-{op:08}");
+                    db.set(&key, vec![2; 64])?;
+                    db.remove(&key)?;
+                }
+                Ok(())
+            })
+        };
+
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        let mut max_files = 0;
+        let mut compacted_files = 0;
+        loop {
+            let writer_done = writer.is_finished();
+            db.checkpoint()?;
+            let candidates = db.inner.next_compaction_candidates(4);
+            if !candidates.is_empty() {
+                compacted_files += db
+                    .inner
+                    .compact_files(&candidates, &mut pacer)?
+                    .compacted_files;
+            }
+            max_files = max_files.max(db.inner.data_files.read().len());
+            passes.fetch_add(1, Ordering::Release);
+            if writer_done && candidates.is_empty() {
+                break;
+            }
+        }
+        writer.join().unwrap()?;
+
+        // The churn wrote ~95 files worth of data. Pinned tombstones may add up to about as
+        // much as the live data before the oldest files get rewritten, but no more than that
+        // (29 files here; 43 and climbing without the oldest-file walk).
+        assert!(
+            max_files <= 3 * cold_files,
+            "data files grew to {max_files} (cold data takes {cold_files})"
+        );
+        // Retained tombstones must not be rewritten time and again for negligible gains
+        // (~150 files compacted here; ~2000 when any gain at all justified a rewrite).
+        assert!(
+            compacted_files <= 600,
+            "{compacted_files} files compacted for ~95 files of churn"
+        );
+        assert_eq!(db.num_items(), 1500);
+        Ok(())
+    }
+
+    /// A file skipped for holding retained tombstones used to be scanned again after every
+    /// single insert. It must only be scanned again once enough keys were created that the
+    /// verdict can change, and re-creating its keys must still get it reclaimed.
+    #[test]
+    fn test_retained_tombstones_are_rescanned_only_when_it_can_pay_off() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(Error::IOError)?;
+        let config = Config {
+            max_data_file_size: 4096,
+            compaction_min_threshold: 1024,
+            checkpoint_interval: None,
+            checkpoint_delta_bytes: None,
+            compaction_throughput_bytes_per_sec: 0,
+            ..Config::default()
+        };
+        let db = CandyStore::open(dir.path(), config)?;
+        db.stop_compaction();
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        let rotate = || {
+            db.inner
+                ._rotate_data_file(db.inner.active_file_idx.load(Ordering::Acquire))
+        };
+        // enough cold data that the retained tombstones never justify rewriting it
+        for idx in 0..60 {
+            db.set(format!("cold-{idx:02}"), vec![1; 96])?;
+        }
+        rotate()?;
+        for idx in 0..60 {
+            db.set(format!("victim-{idx:02}"), vec![2; 16])?;
+        }
+        rotate()?;
+        let tombstone_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+        for idx in 0..60 {
+            db.remove(format!("victim-{idx:02}"))?;
+        }
+        rotate()?;
+        db.checkpoint()?;
+
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        // returns how many compaction passes had something to look at
+        let mut compact = || -> Result<u32> {
+            let mut passes = 0;
+            loop {
+                let candidates = db.inner.next_compaction_candidates(4);
+                if candidates.is_empty() {
+                    return Ok(passes);
+                }
+                db.inner.compact_files(&candidates, &mut pacer)?;
+                passes += 1;
+                assert!(passes < 100, "compaction does not settle");
+            }
+        };
+
+        // the victims' values are reclaimed; their 60 tombstones (32 bytes each) stay, pinned
+        // by the cold data, in a file that is skipped: nothing but those is waste in it
+        assert!(compact()? > 0);
+        let tombstone_file = db.inner.data_file(tombstone_idx)?;
+        let retained = || {
+            tombstone_file
+                .retained_tombstone_bytes
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(retained(), 60 * 32);
+        assert_eq!(db.inner.index_file.file_waste(tombstone_idx), 60 * 32);
+
+        // getting over the 1024-byte threshold takes 33 released tombstones, hence at least
+        // 33 inserts: unrelated inserts short of that must not trigger a scan
+        for idx in 0..32 {
+            db.set(format!("fresh-{idx:02}"), "x")?;
+            assert_eq!(compact()?, 0, "rescanned after {} inserts", idx + 1);
+        }
+        // the 33rd insert makes a rescan worthwhile in principle; it finds nothing released
+        db.set("fresh-32", "x")?;
+        assert_eq!(compact()?, 1);
+        assert_eq!(retained(), 60 * 32);
+        assert!(db.inner.data_files.read().contains_key(&tombstone_idx));
+
+        // re-creating the deleted keys releases their tombstones for real
+        let mut passes = 0;
+        for idx in 0..33 {
+            db.set(format!("victim-{idx:02}"), vec![3; 16])?;
+            passes += compact()?;
+        }
+        assert_eq!(passes, 1, "one rescan, once 33 keys were re-created");
+        assert!(!db.inner.data_files.read().contains_key(&tombstone_idx));
+
+        db.checkpoint()?;
+        drop(db);
+        std::fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+        std::fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+        let db = CandyStore::open(dir.path(), config)?;
+        for idx in 0..60 {
+            let expected = (idx < 33).then(|| vec![3; 16]);
+            assert_eq!(
+                db.get(format!("victim-{idx:02}"))?,
+                expected,
+                "victim {idx}"
+            );
+            assert_eq!(db.get(format!("cold-{idx:02}"))?, Some(vec![1; 96]));
+        }
+        Ok(())
+    }
+
+    /// Builds the on-disk state left behind by the tombstone-pinning bug: a cold oldest file,
+    /// followed by many files holding nothing but tombstones whose values were compacted away.
+    fn build_pinned_tombstone_backlog(dir: &std::path::Path, config: Config) -> Result<usize> {
+        let db = CandyStore::open(dir, config)?;
+        db.stop_compaction();
+        db.inner
+            .compaction_shutting_down
+            .store(false, Ordering::Release);
+        for idx in 0..24 {
+            db.set(format!("cold-{idx:02}"), vec![1; 96])?;
+        }
+        db.inner
+            ._rotate_data_file(db.inner.active_file_idx.load(Ordering::Acquire))?;
+        let mut pacer = Pacer::new(u64::MAX / 4, Duration::from_secs(1), u64::MAX / 4);
+        for batch in 0..10 {
+            // the active file is empty at this point and receives the first of the batch's values
+            let active_idx = db.inner.active_file_idx.load(Ordering::Acquire);
+            let before = db
+                .inner
+                .data_files
+                .read()
+                .keys()
+                .copied()
+                .filter(|&idx| idx != active_idx)
+                .collect::<Vec<_>>();
+            for idx in 0..200 {
+                db.set(format!("victim-{batch:02}-{idx:04}"), vec![2; 32])?;
+            }
+            db.inner
+                ._rotate_data_file(db.inner.active_file_idx.load(Ordering::Acquire))?;
+            let value_files = db
+                .inner
+                .data_files
+                .read()
+                .iter()
+                .filter(|(idx, _)| !before.contains(idx))
+                .filter(|(idx, _)| **idx != db.inner.active_file_idx.load(Ordering::Acquire))
+                .map(|(&idx, file)| (idx, file.file_ordinal))
+                .collect::<Vec<_>>();
+            for idx in 0..200 {
+                db.remove(format!("victim-{batch:02}-{idx:04}"))?;
+            }
+            db.inner
+                ._rotate_data_file(db.inner.active_file_idx.load(Ordering::Acquire))?;
+            db.checkpoint()?;
+            // what the pre-fix compactor did: reclaim the values, keep the tombstones
+            let outcome = db.inner.compact_files(&value_files, &mut pacer)?;
+            assert_eq!(outcome.compacted_files, value_files.len() as u64);
+            db.checkpoint()?;
+        }
+        let files = db.inner.data_files.read().len();
+        let total_waste = db.inner.index_file.total_waste();
+        let used_bytes = (db.inner.data_files.read().values())
+            .map(|file| file.used_bytes())
+            .sum::<u64>();
+        // nothing but the cold data is live; everything else is tombstones
+        assert_eq!(db.num_items(), 24);
+        assert_eq!(used_bytes - total_waste, 24 * 128);
+        Ok(files)
+    }
+
+    /// Stores already bloated by the tombstone-pinning bug must drain on their own once
+    /// opened by a fixed build, whether the index survived or has to be rebuilt.
+    #[test]
+    fn test_existing_pinned_tombstone_backlog_drains_after_upgrade() -> Result<()> {
+        for lose_index in [false, true] {
+            let dir = tempfile::tempdir().map_err(Error::IOError)?;
+            let config = Config {
+                max_data_file_size: 4096,
+                compaction_min_threshold: 1024,
+                checkpoint_interval: None,
+                checkpoint_delta_bytes: None,
+                compaction_throughput_bytes_per_sec: 0,
+                ..Config::default()
+            };
+            let bloated_files = build_pinned_tombstone_backlog(dir.path(), config)?;
+            assert!(bloated_files >= 15, "backlog too small: {bloated_files}");
+            if lose_index {
+                std::fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+                std::fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+            }
+
+            let config = Config {
+                compaction_throughput_bytes_per_sec: 1 << 30,
+                checkpoint_interval: Some(Duration::from_millis(10)),
+                ..config
+            };
+            let db = CandyStore::open(dir.path(), config)?;
+            let started = std::time::Instant::now();
+            while db.stats().num_data_files > 3 && started.elapsed() < Duration::from_secs(20) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let files = db.stats().num_data_files;
+            assert!(
+                files <= 3,
+                "backlog did not drain: {bloated_files} -> {files} files (lose_index={lose_index})"
+            );
+            assert_eq!(db.inner.stats.compaction_errors.load(Ordering::Relaxed), 0);
+            assert_eq!(db.num_items(), 24);
+
+            drop(db);
+            std::fs::remove_file(dir.path().join("index")).map_err(Error::IOError)?;
+            std::fs::remove_file(dir.path().join("rows")).map_err(Error::IOError)?;
+            let db = CandyStore::open(dir.path(), config)?;
+            assert_eq!(db.num_items(), 24);
+            for idx in 0..24 {
+                assert_eq!(db.get(format!("cold-{idx:02}"))?, Some(vec![1; 96]));
+            }
+            for batch in 0..10 {
+                for idx in 0..200 {
+                    assert_eq!(db.get(format!("victim-{batch:02}-{idx:04}"))?, None);
+                }
+            }
+        }
         Ok(())
     }
 
