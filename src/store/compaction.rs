@@ -1515,12 +1515,18 @@ mod tests {
         db.checkpoint()?;
         let cold_files = db.inner.data_files.read().len();
 
-        // the writer is throttled by compaction passes rather than by the clock, so the two
-        // genuinely interleave regardless of how fast the machine is
+        // The writer and the compactor throttle each other rather than follow the clock, so
+        // the two genuinely interleave regardless of how fast the machine is: the writer gets
+        // OPS_PER_COMPACTION_PASS ops per pass, and a pass only starts once the ops of the
+        // previous ones were all issued. Throttling the writer alone is not enough: passes
+        // that find nothing to do are nearly free, so a writer that stalls even briefly would
+        // fall thousands of passes behind and then run unthrottled, outpacing the compactor.
         let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ops_done = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let writer = {
             let db = db.clone();
             let passes = passes.clone();
+            let ops_done = ops_done.clone();
             thread::spawn(move || -> Result<()> {
                 for op in 0..OPS {
                     while op >= (passes.load(Ordering::Acquire) + 1) * OPS_PER_COMPACTION_PASS {
@@ -1529,6 +1535,7 @@ mod tests {
                     let key = format!("churn-{op:08}");
                     db.set(&key, vec![2; 64])?;
                     db.remove(&key)?;
+                    ops_done.store(op + 1, Ordering::Release);
                 }
                 Ok(())
             })
@@ -1538,6 +1545,13 @@ mod tests {
         let mut max_files = 0;
         let mut compacted_files = 0;
         loop {
+            // `is_finished` also covers a writer that bailed out on an error
+            while !writer.is_finished()
+                && ops_done.load(Ordering::Acquire)
+                    < passes.load(Ordering::Acquire) * OPS_PER_COMPACTION_PASS
+            {
+                thread::yield_now();
+            }
             let writer_done = writer.is_finished();
             db.checkpoint()?;
             let candidates = db.inner.next_compaction_candidates(4);
