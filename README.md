@@ -1,15 +1,15 @@
 <div><img align="right" src="https://github.com/sweet-security/candystore/actions/workflows/ci.yml/badge.svg?branch=main"></div>
 
 > [!NOTE]
+> v1.2.3 fixes a v1.2.2 regression where compaction never released deletion tombstones, so stores
+> with many deletes kept growing on disk. Affected stores shrink back on their own after upgrading.
+>
 > v1.2.2 fixes checkpoint durability, crash recovery, interrupted index shrinking, mmap aliasing,
 > iterator healing, and list-item moves. It also corrects tombstone retention and makes compaction
 > cancellation responsive. The on-disk format is unchanged.
 >
 > v1.2 adds corrupt-entry cleanup and failure-tolerant compaction, and fixes concurrency bugs;
 > file format is unchanged.
->
-> v1.1 fixes durability issues in checkpointing (data files are now `fdatasync`ed) and some (very
-> rare) concurrency issues; file format is unchanged.
 >
 > 😸 v1.0 brings true crash-consistency, improved compaction and an overall simpler design,
 > as well as a stable file format.
